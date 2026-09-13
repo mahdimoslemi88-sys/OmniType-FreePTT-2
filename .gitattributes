@@ -1,0 +1,21 @@
+# Normalize line endings: store LF in the repository, let git handle the
+# working-tree conversion per platform. Binary formats are protected.
+* text=auto
+
+# Windows scripts keep CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts force LF
+*.sh text eol=lf
+
+# Binary assets — never touch
+*.png binary
+*.ico binary
+*.bin binary
+*.onnx binary
+*.dll binary
+*.exe binary
+*.zip binary
+*.ttf binary
