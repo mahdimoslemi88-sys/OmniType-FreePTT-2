@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+
+# Downloaded model weights (never commit)
+models/*.bin
+models/*.part
+
+# Downloaded VAD model
+assets/*.onnx
+
+# Local config with user paths
+config.local.toml
+# Runtime config (may contain the cloud API key) — user config lives in %APPDATA%
+config.toml
+# Never commit keys
+*.key
+.env
