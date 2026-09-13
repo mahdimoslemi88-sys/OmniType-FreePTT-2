@@ -1,0 +1,127 @@
+# ============================================================================
+# OmniType-FreePTT-2 — root .gitignore
+# Only source, docs, and manifests enter the repo. Anything heavy, generated,
+# machine-local, or secret stays out.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Rust / Cargo — build artifacts (regenerable via `cargo build`)
+# ----------------------------------------------------------------------------
+target/
+**/*.rs.bk
+*.pdb
+*.lib
+*.exp
+*.rlib
+*.d
+
+# Local clones of native deps (whisper.cpp is built inside `target/` by
+# whisper-rs; a manual clone anywhere is local-only)
+**/whisper.cpp/
+
+# ----------------------------------------------------------------------------
+# ML model weights — downloaded at first run (75 MB – 1.6 GB), NEVER commit
+# ----------------------------------------------------------------------------
+# NOTE: `**/` is required — a pattern containing a slash is anchored to this
+# file's directory, and the real dirs live at voice-ptt/models & voice-ptt/assets.
+**/models/*.bin
+**/models/*.ggml
+**/models/*.gguf
+**/models/*.onnx
+**/models/*.part
+**/models/*.part-*
+**/assets/*.onnx
+**/assets/*.bin
+**/assets/*.ggml
+**/assets/*.part
+# Belt & suspenders: any whisper/silero weights anywhere in the tree
+**/ggml-*.bin
+**/*.gguf
+**/silero_vad*.onnx
+
+# ----------------------------------------------------------------------------
+# Secrets & machine-local config — NEVER commit
+# ----------------------------------------------------------------------------
+config.toml
+config.local.toml
+*.key
+.env
+.env.*
+cloud_usage.json
+
+# ----------------------------------------------------------------------------
+# Packaging / release output — regenerable (exe, DLLs, weights)
+# ----------------------------------------------------------------------------
+voice-ptt-dist/
+dist/
+release/
+build/
+*.zip
+*.7z
+*.tar.gz
+*.exe
+*.dll
+*.msi
+*.msix
+
+# ----------------------------------------------------------------------------
+# Python (v1 legacy tooling / local helper scripts)
+# ----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ----------------------------------------------------------------------------
+# Node (if local tooling appears)
+# ----------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ----------------------------------------------------------------------------
+# IDE / editors — keep personal editor state out
+# ----------------------------------------------------------------------------
+.vscode/
+.idea/
+.vs/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# ----------------------------------------------------------------------------
+# OS junk
+# ----------------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
+.directory
+
+# ----------------------------------------------------------------------------
+# Logs, temp, backups
+# ----------------------------------------------------------------------------
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+.cache/
+logs/
+
+# ----------------------------------------------------------------------------
+# Profiling / coverage / benchmarks
+# ----------------------------------------------------------------------------
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data*
