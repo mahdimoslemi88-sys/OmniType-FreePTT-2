@@ -1,0 +1,144 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 29851a8..87c1fe0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -48,6 +48,8 @@ pub struct Toasts {
+     font: Option<FontId>,
+     shadow: Option<Shadow>,
+     held: bool,
++    /// Optional width cap for every toast; `Toast::max_width` beats it.
++    max_width: Option<f32>,
+ }
+ 
+ impl Toasts {
+@@ -61,6 +63,7 @@ impl Toasts {
+             spacing: 8.,
+             padding: vec2(10., 10.),
+             held: false,
++            max_width: None,
+             speed: 4.,
+             reverse: false,
+             font: None,
+@@ -187,6 +190,15 @@ impl Toasts {
+     }
+ 
+     /// Changes the default font used for all toasts.
++    /// Sets an optional width cap applied to every toast; a per-toast
++    /// `Toast::max_width` takes precedence when both are set. Caps don't
++    /// change behavior when unset — toasts keep their fully automatic
++    /// content-based width.
++    pub const fn with_max_width(mut self, max_width: f32) -> Self {
++        self.max_width = Some(max_width);
++        self
++    }
++
+     pub fn with_default_font(mut self, font: FontId) -> Self {
+         self.font = Some(font);
+         self
+@@ -204,6 +216,7 @@ impl Toasts {
+             toasts,
+             held,
+             speed,
++            max_width,
+             ..
+         } = self;
+ 
+@@ -241,7 +254,12 @@ impl Toasts {
+                 }
+             }
+ 
+-            let caption_galley = toast.caption.clone().into_galley_impl(
++            // Width cap: measure unwrapped first so the icon size (derived
++            // from caption row height) stays identical to capless operation,
++            // then wrap the caption into the remaining width if needed.
++            let cap = toast.max_width.or(*max_width).filter(|cap| *cap > 0.);
++
++            let probe_galley = toast.caption.clone().into_galley_impl(
+                 ctx,
+                 ctx.global_style().as_ref(),
+                 TextWrapping::from_wrap_mode_and_width(TextWrapMode::Extend, f32::INFINITY),
+@@ -249,6 +267,27 @@ impl Toasts {
+                 Align::LEFT,
+             );
+ 
++            let wrapped = cap.is_some_and(|cap| {
++                let target = cap - padding.x * 2.
++                    - if toast.level != ToastLevel::None { padding.x } else { 0. }
++                    - if toast.closable { padding.x } else { 0. };
++                probe_galley.rect.width() > target
++            });
++            let caption_galley = if let (Some(cap), true) = (cap, wrapped) {
++                let target = cap - padding.x * 2.
++                    - if toast.level != ToastLevel::None { padding.x } else { 0. }
++                    - if toast.closable { padding.x } else { 0. };
++                toast.caption.clone().into_galley_impl(
++                    ctx,
++                    ctx.global_style().as_ref(),
++                    TextWrapping::from_wrap_mode_and_width(TextWrapMode::Wrap, target),
++                    FontSelection::Default,
++                    Align::LEFT,
++                )
++            } else {
++                probe_galley
++            };
++
+             let (caption_width, caption_height) =
+                 (caption_galley.rect.width(), caption_galley.rect.height());
+ 
+@@ -323,6 +362,9 @@ impl Toasts {
+             toast.width = padding
+                 .x
+                 .mul_add(2., icon_width_padded + caption_width + cross_width_padded);
++            if let Some(cap) = cap {
++                toast.width = toast.width.min(cap);
++            }
+             toast.height = padding
+                 .y
+                 .mul_add(2., action_height.max(caption_height).max(cross_height));
+diff --git a/src/toast.rs b/src/toast.rs
+index 751cd45..fbe8caa 100644
+--- a/src/toast.rs
++++ b/src/toast.rs
+@@ -71,6 +71,9 @@ pub struct Toast {
+ 
+     pub(crate) state: ToastState,
+     pub(crate) value: f32,
++    /// Optional per-toast width cap (beats the channel-level
++    /// `Toasts::with_max_width`); `None` = fully automatic width.
++    pub(crate) max_width: Option<f32>,
+ }
+ 
+ impl Default for ToastOptions {
+@@ -103,6 +106,7 @@ impl Toast {
+             level: options.level,
+             value: 0.,
+             state: ToastState::Appear,
++            max_width: None,
+         }
+     }
+ 
+@@ -210,12 +214,23 @@ impl Toast {
+         self
+     }
+ 
+-    /// Toast's box width
++    /// Sets the initial hint width of the card's first frame. The card is
++    /// re-measured from its real content every frame, so this value does
++    /// not cap anything — it only affects the slide-in animation start and
++    /// stack spacing before the first re-measure lands.
+     pub fn width(&mut self, width: f32) -> &mut Self {
+         self.width = width;
+         self
+     }
+ 
++    /// Caps the rendered card width; longer captions wrap. `None` (default)
++    /// keeps the fully automatic, content-based width. Overrides the
++    /// channel-level `Toasts::with_max_width` when both are set.
++    pub fn max_width(&mut self, max_width: impl Into<Option<f32>>) -> &mut Self {
++        self.max_width = max_width.into();
++        self
++    }
++
+     /// Dismiss this toast
+     pub fn dismiss(&mut self) {
+         self.state = ToastState::Disappear;
