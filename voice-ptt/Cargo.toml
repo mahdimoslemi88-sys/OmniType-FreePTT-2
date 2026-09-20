@@ -73,9 +73,17 @@ eframe = "0.28"
 egui-phosphor = "0.6"
 egui-notify = "0.15"
 
+# Vendored egui-notify 0.15 with an optional toast width cap
+# (Toasts::with_max_width / Toast::set_max_width) — our local port of the
+# upstream proposal in ItsEthra/egui-notify#54. Removable once a release
+# ships the feature.
+[patch.crates-io]
+egui-notify = { path = "../third_party/egui-notify" }
+
 [features]
 default = ["silero-vad"]
 silero-vad = ["dep:ort"]
+light-theme = []
 
 [build-dependencies]
 winres = "0.1"
