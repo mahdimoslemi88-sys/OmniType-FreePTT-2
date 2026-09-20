@@ -30,6 +30,9 @@ pub struct CloudEngine {
     config: CloudConfig,
     resolved_key: String,
     quota: Arc<DailyQuota>,
+    engine_id: String,
+    display_name: String,
+    engine_kind: &'static str,
 }
 
 impl CloudEngine {
@@ -62,6 +65,45 @@ impl CloudEngine {
             config,
             resolved_key,
             quota,
+            engine_id: "groq".to_string(),
+            display_name: "Groq Cloud".to_string(),
+            engine_kind: "Cloud",
+        }
+    }
+
+    /// Builds a custom cloud provider engine (e.g. user-added OpenAI-compatible endpoint).
+    pub fn new_custom(provider: &crate::config::settings::CustomProvider, usage_path: PathBuf) -> Self {
+        let config = CloudConfig {
+            enabled: true,
+            provider: provider.id.clone(),
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model: provider.model.clone(),
+            language: provider.language.clone(),
+            daily_limit: 10_000,
+            timeout_secs: provider.timeout_secs.max(5),
+            initial_prompt: None,
+        };
+        let resolved_key = config.api_key.trim().to_string();
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs.max(5)))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+
+        let quota = Arc::new(DailyQuota::new(usage_path, config.daily_limit));
+
+        Self {
+            client,
+            config,
+            resolved_key,
+            quota,
+            engine_id: provider.id.clone(),
+            display_name: provider.name.clone(),
+            engine_kind: "Cloud (Custom)",
         }
     }
 
@@ -88,6 +130,18 @@ impl CloudEngine {
 impl AsrEngine for CloudEngine {
     fn name(&self) -> &'static str {
         "cloud"
+    }
+
+    fn id(&self) -> String {
+        self.engine_id.clone()
+    }
+
+    fn display_name(&self) -> String {
+        self.display_name.clone()
+    }
+
+    fn kind(&self) -> &'static str {
+        self.engine_kind
     }
 
     fn health(&self) -> AsrHealth {
@@ -145,10 +199,14 @@ impl AsrEngine for CloudEngine {
             form = form.text("prompt", prompt.to_string());
         }
 
-        let url = format!(
-            "{}/audio/transcriptions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let url = if self.config.base_url.ends_with("/audio/transcriptions") {
+            self.config.base_url.clone()
+        } else {
+            format!(
+                "{}/audio/transcriptions",
+                self.config.base_url.trim_end_matches('/')
+            )
+        };
 
         let response = self
             .client

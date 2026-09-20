@@ -193,9 +193,14 @@ mod tests {
     use super::*;
 
     fn temp_quota(limit: u32) -> (DailyQuota, PathBuf) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        // Unique dir per call: tests run in parallel threads; a shared file
+        // made `requests_are_counted_and_persisted` flaky.
         let dir = std::env::temp_dir().join(format!(
-            "voice-ptt-quota-test-{}",
-            std::process::id()
+            "voice-ptt-quota-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cloud_usage.json");

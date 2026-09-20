@@ -27,6 +27,7 @@ pub struct CaptureConfig {
     /// Ring buffer duration in seconds (spec: 30 s).
     pub ring_seconds: u32,
     pub device_name: Option<String>,
+    pub gain_db: f32,
 }
 
 impl Default for CaptureConfig {
@@ -37,6 +38,7 @@ impl Default for CaptureConfig {
             buffer_frames: 256,
             ring_seconds: 30,
             device_name: None,
+            gain_db: 0.0,
         }
     }
 }
@@ -58,6 +60,7 @@ pub struct AudioCapture {
     channels: u16,
     /// The device's native sample rate (for upstream resampling decisions).
     native_sample_rate: u32,
+    gain_factor: f32,
 }
 
 impl AudioCapture {
@@ -120,6 +123,12 @@ impl AudioCapture {
             "capture stream running on audio thread"
         );
 
+        let gain_factor = if config.gain_db.abs() < 1e-4 {
+            1.0
+        } else {
+            10.0f32.powf(config.gain_db / 20.0)
+        };
+
         Ok(Self {
             ring_buffer,
             is_recording,
@@ -128,6 +137,7 @@ impl AudioCapture {
             sample_rate: config.sample_rate,
             channels: config.channels,
             native_sample_rate,
+            gain_factor,
         })
     }
 
@@ -152,11 +162,32 @@ impl AudioCapture {
         Ok(())
     }
 
-    /// Removes and returns everything currently buffered.
+    /// Removes and returns everything currently buffered, resampled to the
+    /// pipeline sample rate when the device runs at its native rate, with
+    /// software gain applied if configured.
+    ///
+    /// Why: the mic rejected our 16 kHz request and runs at 48 kHz, but the
+    /// whole downstream pipeline (Silero VAD chunking, whisper, duration
+    /// math) assumes 16 kHz. Resample here, at the boundary.
     pub fn take_audio(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.ring_buffer.available());
         self.ring_buffer.drain(&mut out);
-        out
+        let mut res = if self.native_sample_rate == self.sample_rate || out.is_empty() {
+            out
+        } else {
+            resample_linear(&out, self.native_sample_rate, self.sample_rate)
+        };
+        if (self.gain_factor - 1.0).abs() > 1e-4 && !res.is_empty() {
+            for s in &mut res {
+                *s = (*s * self.gain_factor).clamp(-1.0, 1.0);
+            }
+        }
+        res
+    }
+
+    /// Sample rate the pipeline receives from [`take_audio`](Self::take_audio).
+    pub fn pipeline_sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Samples currently waiting in the ring buffer.
@@ -200,6 +231,31 @@ impl Drop for AudioCapture {
     }
 }
 
+/// Resamples `input` from `from_hz` to `to_hz` with linear interpolation.
+///
+/// Good enough for speech (whisper is robust to minor interpolation error);
+/// avoids pulling in a heavy DSP crate for one narrow purpose.
+/// Duration is preserved: `len_out = len_in * to_hz / from_hz` (rounded).
+pub fn resample_linear(input: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
+    if input.is_empty() || from_hz == to_hz || from_hz == 0 {
+        return input.to_vec();
+    }
+    let ratio = f64::from(from_hz) / f64::from(to_hz);
+    let out_len = ((input.len() as f64) / ratio).round() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    // Step in input-sample units; clamp the last interpolation window.
+    let step = ratio;
+    for i in 0..out_len {
+        let pos = i as f64 * step;
+        let i0 = (pos.floor() as usize).min(input.len() - 1);
+        let i1 = (i0 + 1).min(input.len() - 1);
+        let frac = (pos - i0 as f64).clamp(0.0, 1.0);
+        let sample = input[i0] * (1.0 - frac as f32) + input[i1] * frac as f32;
+        out.push(sample);
+    }
+    out
+}
+
 /// Builds the input stream (runs on the audio thread).
 fn build_stream(
     config: &CaptureConfig,
@@ -225,12 +281,46 @@ fn build_stream(
     let make = |cfg: StreamConfig| -> Result<Stream> {
         let ring = ring.clone();
         let rec = rec.clone();
+        let channels = cfg.channels.max(1) as usize;
+        // Interleaved multi-channel (e.g. stereo fallback) → average each
+        // frame's channels into one mono sample. Without this, VAD/whisper
+        // receive half-rate interleaved garbage when the fallback config is
+        // stereo.
+        let downmix = move |data: &[f32]| -> Vec<f32> {
+            if channels == 1 {
+                data.to_vec()
+            } else {
+                data.chunks_exact(channels)
+                    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                    .collect()
+            }
+        };
+        let downmix_i16 = move |data: &[i16]| -> Vec<f32> {
+            let conv = |s: &i16| *s as f32 / 32_768.0;
+            if channels == 1 {
+                data.iter().map(conv).collect()
+            } else {
+                data.chunks_exact(channels)
+                    .map(|frame| frame.iter().map(conv).sum::<f32>() / channels as f32)
+                    .collect()
+            }
+        };
+        let downmix_u16 = move |data: &[u16]| -> Vec<f32> {
+            let conv = |s: &u16| (*s as f32 - 32_768.0) / 32_768.0;
+            if channels == 1 {
+                data.iter().map(conv).collect()
+            } else {
+                data.chunks_exact(channels)
+                    .map(|frame| frame.iter().map(conv).sum::<f32>() / channels as f32)
+                    .collect()
+            }
+        };
         match native.sample_format() {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &cfg,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if rec.load(Ordering::Relaxed) {
-                        ring.write(data);
+                        ring.write(&downmix(data));
                     }
                 },
                 err_cb,
@@ -240,8 +330,7 @@ fn build_stream(
                 &cfg,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     if rec.load(Ordering::Relaxed) {
-                        let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32_768.0).collect();
-                        ring.write(&f);
+                        ring.write(&downmix_i16(data));
                     }
                 },
                 err_cb,
@@ -251,11 +340,7 @@ fn build_stream(
                 &cfg,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     if rec.load(Ordering::Relaxed) {
-                        let f: Vec<f32> = data
-                            .iter()
-                            .map(|&s| (s as f32 - 32_768.0) / 32_768.0)
-                            .collect();
-                        ring.write(&f);
+                        ring.write(&downmix_u16(data));
                     }
                 },
                 err_cb,
@@ -271,10 +356,49 @@ fn build_stream(
     let stream = match make(requested) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(%e, "requested capture config rejected; retrying with native config");
+            tracing::warn!(
+                %e,
+                native_rate = native_sample_rate,
+                native_channels = native.channels(),
+                "requested capture config rejected; retrying with native config (downmix + resample on)"
+            );
             make(StreamConfig::from(native.clone()))?
         }
     };
 
     Ok((stream, native_sample_rate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resample_48k_to_16k_preserves_duration_and_shape() {
+        // 4800 samples at 48 kHz = 100 ms → 1600 samples at 16 kHz.
+        let input: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.01).sin()).collect();
+        let out = resample_linear(&input, 48_000, 16_000);
+        assert_eq!(out.len(), 1600);
+        // Every third input sample maps onto consecutive output samples.
+        assert!((out[100] - input[300]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn resample_same_rate_is_noop() {
+        let input = vec![0.25f32; 1000];
+        assert_eq!(resample_linear(&input, 16_000, 16_000), input);
+    }
+
+    #[test]
+    fn resample_empty_is_noop() {
+        assert!(resample_linear(&[], 48_000, 16_000).is_empty());
+    }
+
+    #[test]
+    fn resample_dc_signal_stays_constant() {
+        let input = vec![0.5f32; 9600]; // 200 ms @ 48 kHz
+        let out = resample_linear(&input, 48_000, 16_000);
+        assert_eq!(out.len(), 3200);
+        assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6));
+    }
 }

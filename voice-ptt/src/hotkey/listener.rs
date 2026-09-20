@@ -16,6 +16,8 @@ pub enum HotkeyEvent {
     RecordDown,
     /// Record key released.
     RecordUp,
+    /// Cancel active recording (discard audio without transcribing).
+    Cancel,
     /// Toggle overlay visibility.
     ToggleOverlay,
     /// Quit requested.

@@ -160,6 +160,18 @@ impl AsrEngine for WhisperEngine {
         "whisper.cpp"
     }
 
+    fn id(&self) -> String {
+        "local_whisper".to_string()
+    }
+
+    fn display_name(&self) -> String {
+        "Local Whisper".to_string()
+    }
+
+    fn kind(&self) -> &'static str {
+        "Local"
+    }
+
     fn health(&self) -> AsrHealth {
         match (&self.context, &self.load_error) {
             (Some(_), _) => AsrHealth::Ready,

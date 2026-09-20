@@ -70,6 +70,8 @@ pub struct Endpoint {
     saw_speech: bool,
     speech_samples: usize,
     silence_samples: usize,
+    /// Every sample fed, regardless of classification (utterance length).
+    all_samples: usize,
     sample_rate: u32,
 }
 
@@ -80,12 +82,14 @@ impl Endpoint {
             saw_speech: false,
             speech_samples: 0,
             silence_samples: 0,
+            all_samples: 0,
             sample_rate,
         }
     }
 
     /// Feeds one frame result into the state machine.
     pub fn feed(&mut self, frame: &FrameResult) {
+        self.all_samples += frame.samples;
         if frame.is_speech {
             self.saw_speech = true;
             self.speech_samples += frame.samples;
@@ -103,6 +107,12 @@ impl Endpoint {
     /// Total speech samples observed (ignoring trailing silence).
     pub fn speech_samples(&self) -> usize {
         self.speech_samples
+    }
+
+    /// Total samples fed since the last reset (speech + silence + leading
+    /// quiet). Approximates elapsed recording time.
+    pub fn total_samples(&self) -> usize {
+        self.all_samples
     }
 
     /// Whether we have enough speech to bother transcribing.
@@ -126,6 +136,7 @@ impl Endpoint {
         self.saw_speech = false;
         self.speech_samples = 0;
         self.silence_samples = 0;
+        self.all_samples = 0;
     }
 }
 
@@ -169,6 +180,16 @@ impl AnyVad {
                 }
             },
             AnyVad::Rms(r) => r.process(chunk),
+        }
+    }
+
+    /// Clears cross-utterance engine state (recurrent state + context for
+    /// Silero; no-op for the stateless RMS engine).
+    pub fn reset(&mut self) {
+        match self {
+            #[cfg(feature = "silero-vad")]
+            AnyVad::Silero(s) => s.reset(),
+            AnyVad::Rms(_) => {}
         }
     }
 }

@@ -31,6 +31,90 @@ pub fn resolve_assets_dir() -> PathBuf {
     resolve_dir("assets")
 }
 
+/// Resolves the dictionary.toml file location with portable exe-first priority.
+pub fn resolve_dictionary_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("dictionary.toml");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    let p = PathBuf::from("dictionary.toml");
+    if p.is_file() {
+        return p;
+    }
+    let p = dirs_or_cwd().join("dictionary.toml");
+    if p.is_file() {
+        return p;
+    }
+
+    // Default target for fresh creation: exe dir if writable, else AppData
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("dictionary.toml");
+            if std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&p).is_ok() {
+                return p;
+            }
+        }
+    }
+    let app_data = dirs_or_cwd();
+    let _ = std::fs::create_dir_all(&app_data);
+    app_data.join("dictionary.toml")
+}
+
+/// Resolves the config.toml file location with portable exe-first priority.
+pub fn resolve_config_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("config.toml");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    let p = PathBuf::from("config.toml");
+    if p.is_file() {
+        return p;
+    }
+    let p = dirs_or_cwd().join("config.toml");
+    if p.is_file() {
+        return p;
+    }
+
+    // Default target for fresh creation: exe dir if writable, else AppData
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("config.toml");
+            if std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&p).is_ok() {
+                return p;
+            }
+        }
+    }
+    let app_data = dirs_or_cwd();
+    let _ = std::fs::create_dir_all(&app_data);
+    app_data.join("config.toml")
+}
+
+/// Resolves the cloud_usage.json file location with portable exe-first priority.
+pub fn resolve_usage_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("cloud_usage.json");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    let p = PathBuf::from("cloud_usage.json");
+    if p.is_file() {
+        return p;
+    }
+    dirs_or_cwd().join("cloud_usage.json")
+}
+
+
 fn resolve_dir(dir_name: &str) -> PathBuf {
     // 1-3: reuse an existing directory (stable across launches).
     if let Ok(exe) = std::env::current_exe() {

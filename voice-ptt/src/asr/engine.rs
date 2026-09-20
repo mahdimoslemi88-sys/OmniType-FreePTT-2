@@ -46,9 +46,25 @@ pub trait AsrEngine: Send + Sync {
     /// Human-readable engine name for logs/UI.
     fn name(&self) -> &'static str;
 
+    /// Unique identifier for the engine (e.g. "google", "local_whisper", "groq", "custom_1").
+    fn id(&self) -> String {
+        self.name().to_string()
+    }
+
+    /// Display name for the UI.
+    fn display_name(&self) -> String {
+        self.name().to_string()
+    }
+
+    /// Kind of engine (e.g. "Cloud (Free)", "Local", "Cloud (Custom)").
+    fn kind(&self) -> &'static str {
+        "Cloud"
+    }
+
     /// Current health/availability.
     fn health(&self) -> AsrHealth;
 
     /// Transcribes an utterance. Blocking; keep it off async contexts.
     fn transcribe(&self, audio: &AudioUtterance) -> Result<String>;
 }
+

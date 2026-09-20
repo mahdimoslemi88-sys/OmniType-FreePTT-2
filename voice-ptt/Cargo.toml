@@ -18,12 +18,17 @@ toml = "0.8"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Rolling file logs (%APPDATA%\voice-ptt\logs\voice-ptt.log) that survive
+# console-less launches (double-click / tray) and capture panics.
+tracing-appender = "0.2"
 
 # Audio capture (WASAPI Shared Mode by default)
 cpal = "0.15"
 
 # Local ASR engine (whisper.cpp bindings)
-whisper-rs = "0.16"
+# (native whisper.cpp/ggml logs are redirected into `tracing` in logging.rs,
+# so they reach the log file instead of an invisible stderr)
+whisper-rs = { version = "0.16", features = ["raw-api"] }
 
 # Fast dictionary matching for technical terms
 aho-corasick = "1.1"
@@ -34,6 +39,13 @@ ndarray = "0.16"
 # Model downloader + optional cloud ASR (the only network use in the app)
 reqwest = { version = "0.12", features = ["stream", "blocking", "multipart", "json"] }
 futures-util = "0.3"
+
+# Pure-Rust in-memory FLAC encoder for Google Free Speech ASR
+flacenc = "0.5.1"
+
+# Persian/Arabic text reshaping and bidirectional layout for GUI
+ar-reshaper = "1.5.0"
+unicode-bidi = "0.3.18"
 
 # Silero VAD via ONNX Runtime (optional feature; RMS fallback is always available)
 ort = { version = "=2.0.0-rc.10", optional = true }
@@ -47,6 +59,8 @@ windows = { version = "0.58", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Graphics_Dwm",
 ] }
 
 # System tray + floating overlay GUI
@@ -56,6 +70,9 @@ eframe = "0.28"
 [features]
 default = ["silero-vad"]
 silero-vad = ["dep:ort"]
+
+[build-dependencies]
+winres = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -68,5 +85,8 @@ harness = false
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
-strip = true
+# Unwind instead of abort: the panic hook writes the message + backtrace to
+# the log file before the process dies. `panic = "abort"` discarded all of it.
+panic = "unwind"
+strip = false
+debug = "limited"

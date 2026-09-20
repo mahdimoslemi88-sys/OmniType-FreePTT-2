@@ -12,7 +12,7 @@
 //! Utterances with less speech than `min_speech_ms` are discarded (clicks,
 //! key taps), matching the VAD research's false-positive mitigation.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -37,7 +37,7 @@ pub enum AppState {
     Error(String),
 }
 
-/// Snapshot broadcast to the UI layer.
+/// External status packet emitted by the state machine on every transition.
 #[derive(Debug, Clone)]
 pub struct AppStatus {
     pub state: AppState,
@@ -75,7 +75,7 @@ pub struct AppServices {
     pub vad: Mutex<VadUnit>,
     pub router: AsrRouter,
     pub normalizer: Arc<Normalizer>,
-    pub dictionary: Arc<Dictionary>,
+    pub dictionary: Arc<RwLock<Dictionary>>,
     pub settings: Arc<Settings>,
 }
 
@@ -135,6 +135,7 @@ impl StateMachine {
     ) -> Result<()> {
         // Audio accumulated for the current utterance.
         let mut buffer: Vec<f32> = Vec::new();
+        let mut vad_cursor: usize = 0;
         let chunk = self.services.settings.vad.chunk_size;
 
         let mut tick = tokio::time::interval(Duration::from_millis(20));
@@ -152,14 +153,28 @@ impl StateMachine {
                         }
                         Some(HotkeyEvent::RecordDown) => {
                             if self.status_rx.borrow().state == AppState::Idle {
-                                self.begin_recording(&mut buffer);
+                                self.begin_recording(&mut buffer, &mut vad_cursor);
                             }
                         }
                         Some(HotkeyEvent::RecordUp) => {
                             if self.status_rx.borrow().state == AppState::Recording {
                                 // Hold-to-talk release: finalize immediately.
-                                let audio = self.take_and_stop(&mut buffer);
+                                let audio = self.take_and_stop(&mut buffer, &mut vad_cursor, chunk).await;
                                 self.finalize(audio).await;
+                            }
+                        }
+                        Some(HotkeyEvent::Cancel) => {
+                            if self.status_rx.borrow().state == AppState::Recording {
+                                // Cancel speech: discard buffer and stop capture without transcribing
+                                buffer.clear();
+                                vad_cursor = 0;
+                                let _ = self.services.capture.stop();
+                                if let Ok(mut unit) = self.services.vad.try_lock() {
+                                    unit.endpoint.reset();
+                                    unit.vad.reset();
+                                }
+                                self.set_state(AppState::Idle);
+                                tracing::info!("speech recording cancelled by user");
                             }
                         }
                         Some(HotkeyEvent::ToggleOverlay) => {
@@ -169,7 +184,7 @@ impl StateMachine {
                 }
                 _ = tick.tick() => {
                     if self.status_rx.borrow().state == AppState::Recording {
-                        if let Some(audio) = self.poll_vad(&mut buffer, chunk).await? {
+                        if let Some(audio) = self.poll_vad(&mut buffer, &mut vad_cursor, chunk).await? {
                             self.finalize(audio).await;
                         }
                     }
@@ -180,8 +195,9 @@ impl StateMachine {
         Ok(())
     }
 
-    fn begin_recording(&self, buffer: &mut Vec<f32>) {
+    fn begin_recording(&self, buffer: &mut Vec<f32>, vad_cursor: &mut usize) {
         buffer.clear();
+        *vad_cursor = 0;
         if let Err(e) = self.services.capture.start() {
             self.set_state(AppState::Error(format!("capture start failed: {e:#}")));
             return;
@@ -189,6 +205,9 @@ impl StateMachine {
         // Reset endpoint state for the new utterance.
         if let Ok(mut unit) = self.services.vad.try_lock() {
             unit.endpoint.reset();
+            // Also clear the engine's cross-utterance state (Silero recurrent
+            // state + context) so stale audio cannot bias the first frames.
+            unit.vad.reset();
         }
         self.set_state(AppState::Recording);
         tracing::info!("recording started");
@@ -196,30 +215,35 @@ impl StateMachine {
 
     /// Pulls newly buffered audio and feeds VAD frames.
     /// Returns `Some(full_audio)` when endpointing says finalize.
-    async fn poll_vad(&self, buffer: &mut Vec<f32>, chunk_size: usize) -> Result<Option<Vec<f32>>> {
+    async fn poll_vad(
+        &self,
+        buffer: &mut Vec<f32>,
+        vad_cursor: &mut usize,
+        chunk_size: usize,
+    ) -> Result<Option<Vec<f32>>> {
         let fresh = self.services.capture.take_audio();
-        if fresh.is_empty() {
-            return Ok(None);
+        if !fresh.is_empty() {
+            buffer.extend_from_slice(&fresh);
         }
-        buffer.extend_from_slice(&fresh);
 
-        // Feed whole 512-sample chunks to VAD + endpoint.
-        let frames: Vec<Vec<f32>> = buffer
-            .chunks(chunk_size)
-            .filter(|c| c.len() == chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
-
-        let mut unit = self.services.vad.lock().await;
-        for frame in &frames {
-            let result = unit.vad.process(frame);
-            unit.endpoint.feed(&result);
+        // Analyze every complete `chunk_size` window exactly once from `vad_cursor`:
+        // the read cursor advances by `chunk_size` after each window, so unconsumed
+        // tail stays for the next poll and nothing is ever re-fed. Re-feeding
+        // would corrupt the Silero recurrent state and quadratic-scale endpoint samples.
+        {
+            let mut unit = self.services.vad.lock().await;
+            while *vad_cursor + chunk_size <= buffer.len() {
+                let frame = &buffer[*vad_cursor..*vad_cursor + chunk_size];
+                let result = unit.vad.process(frame);
+                unit.endpoint.feed(&result);
+                *vad_cursor += chunk_size;
+            }
         }
-        drop(unit);
 
         let finalize = {
             let unit = self.services.vad.lock().await;
-            unit.endpoint.should_finalize()
+            let cutoff = self.services.settings.vad.cutoff_on_hold;
+            (cutoff && unit.endpoint.should_finalize())
                 || buffer.len() >= self.services.capture.capacity()
         };
         if finalize {
@@ -229,12 +253,30 @@ impl StateMachine {
         Ok(None)
     }
 
-    /// Stops capture and returns the accumulated audio.
-    fn take_and_stop(&self, buffer: &mut Vec<f32>) -> Vec<f32> {
+    /// Stops capture, feeds remaining complete frames to VAD, and returns the accumulated audio.
+    async fn take_and_stop(
+        &self,
+        buffer: &mut Vec<f32>,
+        vad_cursor: &mut usize,
+        chunk_size: usize,
+    ) -> Vec<f32> {
         // Flush anything still in the ring buffer.
         let fresh = self.services.capture.take_audio();
         buffer.extend_from_slice(&fresh);
         let _ = self.services.capture.stop();
+
+        // Feed any remaining complete frames to VAD so endpoint speech
+        // calculations are accurate before finalize checks has_enough_speech().
+        {
+            let mut unit = self.services.vad.lock().await;
+            while *vad_cursor + chunk_size <= buffer.len() {
+                let frame = &buffer[*vad_cursor..*vad_cursor + chunk_size];
+                let result = unit.vad.process(frame);
+                unit.endpoint.feed(&result);
+                *vad_cursor += chunk_size;
+            }
+        }
+
         std::mem::take(buffer)
     }
 
@@ -243,10 +285,35 @@ impl StateMachine {
     async fn finalize(&self, audio: Vec<f32>) {
         self.set_state(AppState::Processing);
 
+        // Audio-level diagnostics: distinguishes "mic delivered silence"
+        // (peak ≈ −∞ dBFS → wrong/muted device) from "audio arrived but VAD
+        // called it non-speech" (healthy levels, discarded). Full scale = 1.0.
+        let peak = audio.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        let rms = if audio.is_empty() {
+            0.0
+        } else {
+            (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt()
+        };
+        tracing::info!(
+            samples = audio.len(),
+            peak_dbfs = format!("{:.1}", 20.0 * peak.max(1e-6).log10()),
+            rms_dbfs = format!("{:.1}", 20.0 * rms.max(1e-6).log10()),
+            "utterance audio levels"
+        );
+
+        let sample_rate = self.services.capture.pipeline_sample_rate();
         let enough = {
             let mut unit = self.services.vad.lock().await;
             let ok = unit.endpoint.has_enough_speech();
+            let speech_secs = unit.endpoint.speech_samples() as f64 / f64::from(sample_rate);
+            let total_secs = unit.endpoint.total_samples() as f64 / f64::from(sample_rate);
+            tracing::info!(
+                speech_secs = format!("{speech_secs:.2}"),
+                total_secs = format!("{total_secs:.2}"),
+                "endpoint summary"
+            );
             unit.endpoint.reset();
+            unit.vad.reset();
             ok
         };
         if !enough {
@@ -257,7 +324,7 @@ impl StateMachine {
 
         let utterance = AudioUtterance {
             samples: audio,
-            sample_rate: self.services.settings.audio.sample_rate,
+            sample_rate,
         };
         tracing::info!(
             audio_secs = utterance.duration_secs(),
@@ -277,7 +344,10 @@ impl StateMachine {
             return;
         }
 
-        let processed = process_text(&raw, &self.services.normalizer, &self.services.dictionary);
+        let processed = {
+            let dict = self.services.dictionary.read().unwrap();
+            process_text(&raw, &self.services.normalizer, &dict)
+        };
         tracing::info!(raw = %raw, typed = %processed, "text ready");
 
         self.set_state(AppState::Typing);
@@ -308,5 +378,30 @@ mod tests {
         // 1.5 s of trailing silence (≥ default 1500 ms timeout).
         ep.feed(&crate::vad::FrameResult::from_bool(false, 24_001));
         assert!(ep.should_finalize());
+    }
+
+    /// Validates that the window cursor processes each chunk exactly once
+    /// with O(N) complexity instead of the quadratic O(N^2) re-feed bug.
+    #[test]
+    fn cursor_advances_without_refeeding() {
+        let mut buffer: Vec<f32> = Vec::new();
+        let mut vad_cursor = 0usize;
+        let chunk_size = 512;
+
+        let mut frames_fed = 0usize;
+        // Simulate 10 polls of 320 samples (20 ms at 16 kHz)
+        for _ in 0..10 {
+            buffer.extend_from_slice(&vec![0.1f32; 320]);
+            while vad_cursor + chunk_size <= buffer.len() {
+                frames_fed += 1;
+                vad_cursor += chunk_size;
+            }
+        }
+        // Total samples added = 3200.
+        // Complete 512-sample chunks = 3200 / 512 = 6 chunks (3072 samples).
+        // vad_cursor must be 3072, and frames_fed must be exactly 6 (not 1+2+3... = 21).
+        assert_eq!(vad_cursor, 3072);
+        assert_eq!(frames_fed, 6);
+        assert_eq!(buffer.len() - vad_cursor, 128); // unconsumed tail
     }
 }

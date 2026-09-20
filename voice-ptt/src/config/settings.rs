@@ -5,8 +5,35 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Custom cloud ASR provider (OpenAI-compatible speech-to-text API).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomProvider {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    pub model: String,
+    #[serde(default = "default_provider_language")]
+    pub language: String,
+    #[serde(default = "default_provider_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_provider_language() -> String {
+    "fa".into()
+}
+
+fn default_provider_timeout() -> u64 {
+    15
+}
+
+fn default_active_engine() -> String {
+    "auto".into()
+}
+
 /// Root configuration (mirrors the spec's `config.toml`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub audio: AudioSettings,
@@ -15,6 +42,50 @@ pub struct Settings {
     pub hotkey: HotkeySettings,
     pub gui: GuiSettings,
     pub cloud: CloudConfig,
+    pub google: GoogleConfig,
+    #[serde(default = "default_active_engine")]
+    pub active_engine: String,
+    #[serde(default)]
+    pub custom_providers: Vec<CustomProvider>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            audio: AudioSettings::default(),
+            asr: AsrSettings::default(),
+            vad: VadSettings::default(),
+            hotkey: HotkeySettings::default(),
+            gui: GuiSettings::default(),
+            cloud: CloudConfig::default(),
+            google: GoogleConfig::default(),
+            active_engine: "auto".into(),
+            custom_providers: Vec::new(),
+        }
+    }
+}
+
+/// Google Free Speech Recognition (Chromium v2 endpoint).
+/// Does not require an API key or account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoogleConfig {
+    /// Whether to use Google Free Speech Recognition. Defaults to true.
+    pub enabled: bool,
+    /// Language code (e.g. "fa-IR" or "en-US").
+    pub language: String,
+    /// Request timeout in seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for GoogleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            language: "fa-IR".into(),
+            timeout_secs: 10,
+        }
+    }
 }
 
 /// Optional cloud ASR engine (Groq or any OpenAI-compatible endpoint).
@@ -76,6 +147,8 @@ pub struct AudioSettings {
     pub ring_seconds: u32,
     /// "default" or a specific device name.
     pub device: String,
+    /// Software audio gain in dB (0.0 = unity gain, 6.0 = 2x, etc.).
+    pub gain_db: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +170,9 @@ pub struct VadSettings {
     pub silence_timeout_ms: u64,
     pub chunk_size: usize,
     pub min_speech_ms: u64,
+    /// Whether silence timeout stops recording even when the hotkey is held down.
+    /// Default false: holding hotkey continues recording until release or 30s cap.
+    pub cutoff_on_hold: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +198,7 @@ impl Default for AudioSettings {
             buffer_frames: 256,
             ring_seconds: 30,
             device: "default".into(),
+            gain_db: 0.0,
         }
     }
 }
@@ -145,6 +222,7 @@ impl Default for VadSettings {
             silence_timeout_ms: 1_500,
             chunk_size: 512,
             min_speech_ms: 150,
+            cutoff_on_hold: false,
         }
     }
 }
@@ -214,6 +292,25 @@ impl Settings {
     pub fn data_dir(&self) -> PathBuf {
         dirs_or_cwd()
     }
+
+    /// Adds or updates a custom provider in settings.
+    pub fn add_or_update_provider(&mut self, provider: CustomProvider) {
+        if let Some(existing) = self.custom_providers.iter_mut().find(|p| p.id == provider.id) {
+            *existing = provider;
+        } else {
+            self.custom_providers.push(provider);
+        }
+    }
+
+    /// Removes a custom provider by id.
+    pub fn remove_provider(&mut self, id: &str) -> bool {
+        if let Some(pos) = self.custom_providers.iter().position(|p| p.id == id) {
+            self.custom_providers.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// App data directory: `%APPDATA%\voice-ptt` on Windows, cwd elsewhere.
@@ -242,7 +339,11 @@ mod tests {
         assert_eq!(s.vad.threshold, 0.5);
         assert_eq!(s.vad.silence_timeout_ms, 1_500);
         assert_eq!(s.vad.chunk_size, 512);
+        assert!(!s.vad.cutoff_on_hold);
+        assert_eq!(s.audio.gain_db, 0.0);
         assert_eq!(s.hotkey.record, "CapsLock");
+        assert!(s.google.enabled);
+        assert_eq!(s.google.language, "fa-IR");
     }
 
     #[test]
