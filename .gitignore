@@ -125,3 +125,8 @@ logs/
 *.profdata
 flamegraph.svg
 perf.data*
+
+# ----------------------------------------------------------------------------
+# Installer build output (large setup binaries)
+# ----------------------------------------------------------------------------
+installer/Output/
