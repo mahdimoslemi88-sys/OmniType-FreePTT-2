@@ -66,19 +66,240 @@ pub fn format_persian_display(text: &str) -> String {
     visual
 }
 
-/// OmniType dark-card palette for notification cards. egui-notify reads
-/// `widgets.noninteractive.bg_fill` for the card background and
-/// `widgets.noninteractive.fg_stroke` for the caption, ✕ and progress bar;
-/// all three come straight from the app palette, with the accent carried by
-/// a Phosphor microphone glyph (same visual language as the capsule).
-const TOAST_CARD_BG: egui::Color32 = egui::Color32::from_rgb(20, 24, 34);
-const TOAST_TEXT: egui::Color32 = egui::Color32::from_rgb(240, 245, 255);
-const TOAST_ACCENT: egui::Color32 = egui::Color32::from_rgb(140, 205, 250);
+/// OmniType UI palette. Two complete themes behind identical role names,
+/// selected at compile time: `dark` (default) and `light`
+/// (`cargo build --features light-theme`). Every role is an OPAQUE fill —
+/// translucent fills were flattened to their blended-over-parent result
+/// (alpha compositing here happens in gamma space, see the theme-parity
+/// test) so both themes stay `const`-friendly without premultiplied math.
+/// Call sites never branch on the theme; they read role names only.
+mod palette {
+    use eframe::egui::Color32;
+
+    #[cfg(not(feature = "light-theme"))]
+    pub use self::dark::*;
+    #[cfg(feature = "light-theme")]
+    pub use self::light::*;
+
+    #[cfg(not(feature = "light-theme"))]
+    mod dark {
+        use super::Color32;
+
+        // Window & card surfaces
+        pub const WINDOW_BG: Color32 = Color32::from_rgb(18, 20, 28);
+        pub const TOAST_BG: Color32 = Color32::from_rgb(20, 24, 34);
+        pub const CARD_BG: Color32 = Color32::from_rgb(24, 26, 36);
+        pub const CARD_BG_ALT: Color32 = Color32::from_rgb(26, 30, 42);
+        pub const HEADER_PILL_BG: Color32 = Color32::from_rgb(30, 36, 52);
+        pub const ENGINE_PILL_BG: Color32 = Color32::from_rgb(30, 42, 60);
+        pub const CHIP_BG: Color32 = Color32::from_rgb(36, 42, 56);
+        pub const STROKE: Color32 = Color32::from_rgb(42, 48, 66);
+        pub const CARD_STROKE: Color32 = Color32::from_rgb(40, 44, 60);
+        pub const SELECTED_BG: Color32 = Color32::from_rgb(28, 42, 54);
+
+        // Text roles
+        pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(240, 245, 255);
+        pub const TEXT_SECTION: Color32 = Color32::from_rgb(220, 230, 248);
+        pub const TEXT_STRONG_SOFT: Color32 = Color32::from_rgb(210, 225, 250);
+        pub const TEXT_TABLE: Color32 = Color32::from_rgb(220, 225, 235);
+        pub const TEXT_LABEL: Color32 = Color32::from_rgb(180, 190, 210);
+        pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(150, 160, 180);
+        pub const TEXT_MUTED: Color32 = Color32::from_rgb(140, 155, 175);
+        pub const TEXT_FAINT: Color32 = Color32::from_rgb(120, 130, 150);
+
+        // Accent (info / interactive)
+        pub const ACCENT: Color32 = Color32::from_rgb(100, 220, 255);
+        pub const ACCENT_SOFT: Color32 = Color32::from_rgb(100, 200, 255);
+        pub const ACCENT_BADGE: Color32 = Color32::from_rgb(160, 190, 230);
+        /// Deep-blue fill of the primary action button in the engine window.
+        pub const ACCENT_ACTION: Color32 = Color32::from_rgb(32, 100, 180);
+
+        // Semantic status
+        pub const SUCCESS: Color32 = Color32::from_rgb(120, 240, 160);
+        pub const SUCCESS_OK: Color32 = Color32::from_rgb(100, 240, 160);
+        pub const SUCCESS_DOT: Color32 = Color32::from_rgb(60, 220, 130);
+        pub const SUCCESS_CHIPTXT: Color32 = Color32::from_rgb(80, 220, 140);
+        pub const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
+        pub const DANGER_SOFT: Color32 = Color32::from_rgb(255, 120, 120);
+        pub const DANGER_TEXT: Color32 = Color32::from_rgb(255, 80, 80);
+
+        // Fills derived from the semantic colors
+        pub const SUCCESS_FILL: Color32 = Color32::from_rgb(24, 48, 38);
+        pub const SUCCESS_PILL: Color32 = Color32::from_rgb(20, 80, 50);
+        pub const DANGER_FILL: Color32 = Color32::from_rgb(45, 25, 30);
+
+        // One-off role colors
+        pub const SELECT_STROKE: Color32 = Color32::from_rgb(60, 150, 240);
+        pub const AUTO_BG: Color32 = Color32::from_rgb(26, 44, 58);
+        pub const DOT_INACTIVE: Color32 = Color32::from_rgb(160, 160, 160);
+        pub const WARNING: Color32 = Color32::from_rgb(255, 180, 50);
+        pub const WHITE: Color32 = Color32::from_rgb(255, 255, 255);
+
+        /// History card surface (was translucent, flattened over WINDOW_BG).
+        pub const CARD_TRANSLUCENT: Color32 = Color32::from_rgb(26, 30, 42);
+        /// Barely-visible stroke for history cards.
+        pub const HAIRLINE: Color32 = Color32::from_rgb(40, 44, 55);
+
+        /// Recording capsule & visual-mode states (idle pill, recording,
+        /// processing). Fill roles; text/icon colors are separate roles so
+        /// the light theme can re-tune them independently.
+        pub mod pill {
+            use super::Color32;
+
+            /// Capsule surface shared by the awake/processing states.
+            pub const SURFACE: Color32 = super::TOAST_BG;
+            /// Dormant 3 px bar above the taskbar.
+            pub const DORMANT_BAR: Color32 = Color32::from_rgb(130, 142, 158);
+
+            // Idle (hover-awake) capsule
+            pub const IDLE_GLOW: Color32 = Color32::from_rgb(47, 66, 96);
+            pub const MIC_IDLE: Color32 = Color32::from_rgb(31, 51, 77);
+            pub const MIC_IDLE_HOVER: Color32 = Color32::from_rgb(42, 74, 120);
+            pub const BADGE_TEXT: Color32 = Color32::from_rgb(190, 210, 235);
+            pub const BADGE_BG: Color32 = Color32::from_rgb(33, 42, 61);
+            pub const HIST_ICON: Color32 = Color32::from_rgb(170, 230, 210);
+            pub const HIST_IDLE: Color32 = Color32::from_rgb(26, 42, 40);
+            pub const HIST_HOVER: Color32 = Color32::from_rgb(38, 70, 62);
+
+            // Recording capsule (red)
+            pub const REC_GLOW: Color32 = Color32::from_rgb(157, 58, 62);
+            pub const CANCEL_IDLE: Color32 = Color32::from_rgb(59, 24, 30);
+            pub const CANCEL_HOVER: Color32 = Color32::from_rgb(81, 25, 30);
+            pub const CANCEL_ICON: Color32 = Color32::from_rgb(255, 120, 120);
+            pub const REC_TEXT: Color32 = Color32::from_rgb(255, 145, 145);
+            pub const WAVE_STRONG: Color32 = Color32::from_rgb(255, 90, 90);
+            pub const WAVE_FAINT: Color32 = Color32::from_rgb(255, 230, 230);
+            pub const SUBMIT_IDLE: Color32 = Color32::from_rgb(22, 61, 41);
+            pub const SUBMIT_HOVER: Color32 = Color32::from_rgb(30, 84, 55);
+            pub const SUBMIT_ICON: Color32 = Color32::from_rgb(85, 250, 155);
+
+            // Processing capsule (amber)
+            pub const PROC_GLOW: Color32 = Color32::from_rgb(112, 87, 38);
+            pub const PROC_AMBER: Color32 = Color32::from_rgb(255, 185, 45);
+            pub const PROC_TEXT: Color32 = Color32::from_rgb(255, 215, 130);
+        }
+    }
+
+    /// Light theme — first-pass values; tune after a visual pass. Text and
+    /// semantic colors are darkened for contrast on light surfaces; capsule
+    /// fills become light tints (the pill floats over arbitrary desktops).
+    #[cfg(feature = "light-theme")]
+    mod light {
+        use super::Color32;
+
+        // Window & card surfaces
+        pub const WINDOW_BG: Color32 = Color32::from_rgb(244, 246, 250);
+        pub const TOAST_BG: Color32 = Color32::from_rgb(248, 250, 253);
+        pub const CARD_BG: Color32 = Color32::from_rgb(246, 249, 253);
+        pub const CARD_BG_ALT: Color32 = Color32::from_rgb(252, 253, 255);
+        pub const HEADER_PILL_BG: Color32 = Color32::from_rgb(232, 238, 248);
+        pub const ENGINE_PILL_BG: Color32 = Color32::from_rgb(226, 236, 248);
+        pub const CHIP_BG: Color32 = Color32::from_rgb(238, 242, 248);
+        pub const STROKE: Color32 = Color32::from_rgb(206, 214, 228);
+        pub const CARD_STROKE: Color32 = Color32::from_rgb(220, 226, 236);
+        pub const SELECTED_BG: Color32 = Color32::from_rgb(224, 238, 248);
+
+        // Text roles
+        pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(28, 32, 42);
+        pub const TEXT_SECTION: Color32 = Color32::from_rgb(45, 52, 66);
+        pub const TEXT_STRONG_SOFT: Color32 = Color32::from_rgb(55, 62, 78);
+        pub const TEXT_TABLE: Color32 = Color32::from_rgb(50, 55, 68);
+        pub const TEXT_LABEL: Color32 = Color32::from_rgb(85, 92, 108);
+        pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(105, 112, 128);
+        pub const TEXT_MUTED: Color32 = Color32::from_rgb(118, 125, 140);
+        pub const TEXT_FAINT: Color32 = Color32::from_rgb(135, 142, 156);
+
+        // Accent (darkened vs dark theme for contrast on light surfaces)
+        pub const ACCENT: Color32 = Color32::from_rgb(8, 120, 180);
+        pub const ACCENT_SOFT: Color32 = Color32::from_rgb(20, 140, 200);
+        pub const ACCENT_BADGE: Color32 = Color32::from_rgb(60, 100, 150);
+        pub const ACCENT_ACTION: Color32 = Color32::from_rgb(32, 100, 180);
+
+        // Semantic status
+        pub const SUCCESS: Color32 = Color32::from_rgb(16, 150, 88);
+        pub const SUCCESS_OK: Color32 = Color32::from_rgb(16, 150, 88);
+        pub const SUCCESS_DOT: Color32 = Color32::from_rgb(24, 176, 104);
+        pub const SUCCESS_CHIPTXT: Color32 = Color32::from_rgb(16, 140, 84);
+        pub const DANGER: Color32 = Color32::from_rgb(210, 50, 50);
+        pub const DANGER_SOFT: Color32 = Color32::from_rgb(220, 60, 60);
+        pub const DANGER_TEXT: Color32 = Color32::from_rgb(190, 35, 35);
+
+        // Fills derived from the semantic colors
+        pub const SUCCESS_FILL: Color32 = Color32::from_rgb(224, 244, 232);
+        pub const SUCCESS_PILL: Color32 = Color32::from_rgb(196, 236, 212);
+        pub const DANGER_FILL: Color32 = Color32::from_rgb(250, 228, 228);
+
+        // One-off role colors
+        pub const SELECT_STROKE: Color32 = Color32::from_rgb(50, 130, 230);
+        pub const AUTO_BG: Color32 = Color32::from_rgb(224, 238, 248);
+        pub const DOT_INACTIVE: Color32 = Color32::from_rgb(150, 150, 150);
+        pub const WARNING: Color32 = Color32::from_rgb(200, 130, 0);
+        pub const WHITE: Color32 = Color32::from_rgb(255, 255, 255);
+
+        pub const CARD_TRANSLUCENT: Color32 = Color32::from_rgb(252, 253, 255);
+        pub const HAIRLINE: Color32 = Color32::from_rgb(228, 233, 242);
+
+        pub mod pill {
+            use super::Color32;
+
+            pub const SURFACE: Color32 = super::TOAST_BG;
+            pub const DORMANT_BAR: Color32 = Color32::from_rgb(150, 158, 172);
+
+            pub const IDLE_GLOW: Color32 = Color32::from_rgb(226, 236, 252);
+            pub const MIC_IDLE: Color32 = Color32::from_rgb(206, 222, 248);
+            pub const MIC_IDLE_HOVER: Color32 = Color32::from_rgb(178, 202, 244);
+            pub const BADGE_TEXT: Color32 = Color32::from_rgb(70, 95, 135);
+            pub const BADGE_BG: Color32 = Color32::from_rgb(224, 232, 246);
+            pub const HIST_ICON: Color32 = Color32::from_rgb(20, 140, 104);
+            pub const HIST_IDLE: Color32 = Color32::from_rgb(220, 240, 230);
+            pub const HIST_HOVER: Color32 = Color32::from_rgb(198, 230, 214);
+
+            pub const REC_GLOW: Color32 = Color32::from_rgb(252, 206, 206);
+            pub const CANCEL_IDLE: Color32 = Color32::from_rgb(248, 212, 212);
+            pub const CANCEL_HOVER: Color32 = Color32::from_rgb(244, 190, 190);
+            pub const CANCEL_ICON: Color32 = Color32::from_rgb(200, 40, 40);
+            pub const REC_TEXT: Color32 = Color32::from_rgb(190, 45, 45);
+            pub const WAVE_STRONG: Color32 = Color32::from_rgb(220, 60, 60);
+            pub const WAVE_FAINT: Color32 = Color32::from_rgb(255, 225, 225);
+            pub const SUBMIT_IDLE: Color32 = Color32::from_rgb(212, 240, 224);
+            pub const SUBMIT_HOVER: Color32 = Color32::from_rgb(190, 232, 208);
+            pub const SUBMIT_ICON: Color32 = Color32::from_rgb(20, 150, 85);
+
+            pub const PROC_GLOW: Color32 = Color32::from_rgb(252, 232, 196);
+            pub const PROC_AMBER: Color32 = Color32::from_rgb(220, 140, 20);
+            pub const PROC_TEXT: Color32 = Color32::from_rgb(150, 95, 10);
+        }
+    }
+}
+
+// Toast card colors read from the shared palette. egui-notify reads
+// `widgets.noninteractive.bg_fill` for the card background and
+// `widgets.noninteractive.fg_stroke` for the caption, ✕ and progress bar;
+// all three come straight from the app palette, with the accent carried by
+// a Phosphor microphone glyph (same visual language as the capsule).
+const TOAST_CARD_BG: egui::Color32 = palette::TOAST_BG;
+const TOAST_TEXT: egui::Color32 = palette::TEXT_PRIMARY;
+const TOAST_ACCENT: egui::Color32 = palette::ACCENT;
 
 /// Height of the transparent glass host viewport; sized for two stacked
-/// 3-line cards so the countdown ticker never clips.
+/// compact cards (max 4 caption rows each: 3 text + footer) with headroom,
+/// so even the tallest preview never clips.
 const TOAST_HOST_HEIGHT: f32 = 190.0;
 const TOAST_TOTAL_SECS: u64 = 10;
+
+/// Width cap for a toast card (vendored egui-notify width-cap port of
+/// ItsEthra/egui-notify#54). Capped captions hard-wrap (even unbreakable
+/// tokens) and grow the card vertically instead of stretching; uncapped
+/// toasts keep the library's snug auto width. Fits the 380 px host
+/// viewport with margin.
+const TOAST_MAX_WIDTH: f32 = 320.0;
+
+// Compile-time sanity: the cap must fit the 380 px host viewport with room
+// to spare, and stay above the smallest useful card width.
+const _: () = {
+    assert!(TOAST_MAX_WIDTH < 380.0_f32);
+    assert!(TOAST_MAX_WIDTH > 90.0_f32);
+};
 
 /// Fresh `egui_notify` channel with the app's dark bottom-right layout.
 fn new_toast_channel() -> Toasts {
@@ -109,6 +330,10 @@ fn restore_toast_style(ctx: &egui::Context, original: std::sync::Arc<egui::Style
 /// Wraps the (already shaped) transcript into a compact multi-line caption
 /// with a live countdown footer (`⏱ Ns`). Only the preview is truncated —
 /// the full raw text is what click-to-copy puts on the clipboard.
+///
+/// No blank spacer row is emitted between body and footer: egui-notify
+/// measures each card from its laid-out galley every frame, so a tight
+/// caption directly shrinks short previews (1-line text => 2-row card).
 fn toast_caption(display: &str, remaining_secs: u64) -> String {
     const CHARS_PER_LINE: usize = 44;
     const MAX_LINES: usize = 3;
@@ -124,9 +349,164 @@ fn toast_caption(display: &str, remaining_secs: u64) -> String {
         }
         out.push(ch);
     }
-    out.push_str("\n\n");
+    out.push('\n');
     out.push_str(&format!("{} {}s", ic::TIMER, remaining_secs));
     out
+}
+
+/// Shared window chrome for the manager windows: dark central panel with
+/// the uniform 14 px margin. Single source so restyling all windows is a
+/// one-line change.
+fn manager_central_panel() -> egui::Frame {
+    egui::Frame::none()
+        .fill(palette::WINDOW_BG)
+        .inner_margin(egui::Margin::same(14.0))
+}
+
+/// Shared content-card frame for the manager windows: rounded 8 px panel,
+/// 1 px stroke and the standard 10 px padding — geometry lives here so
+/// chrome and cards theme from one source. `fill`/`stroke` stay parameters
+/// because they carry meaning (plain vs selected vs hairline variants).
+/// Call `.inner_margin(...)` on the result to override padding per card.
+fn manager_card(fill: egui::Color32, stroke: egui::Color32) -> egui::Frame {
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(egui::Rounding::same(8.0))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
+        .inner_margin(egui::Margin::same(10.0))
+}
+
+/// Shared header row: strong 16 pt title with an optional right-aligned
+/// badge pill (`(text, fill, text_color)`, already shaped for RTL display).
+fn manager_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    badge: Option<(&str, egui::Color32, egui::Color32)>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format_persian_display(title))
+                .size(16.0)
+                .strong()
+                .color(palette::TEXT_PRIMARY),
+        );
+
+        if let Some((text, bg, fg)) = badge {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                header_badge(ui, text, bg, fg);
+            });
+        }
+    });
+}
+
+/// Shared subtitle line under the manager header.
+fn manager_subtitle(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(format_persian_display(text))
+            .size(11.0)
+            .color(palette::TEXT_SECONDARY),
+    );
+}
+
+/// Shared transient success banner (`palette::SUCCESS_FILL` pill).
+fn success_banner(ui: &mut egui::Ui, msg: &str) {
+    ui.add_space(4.0);
+    status_chip(ui, msg, palette::SUCCESS_FILL, palette::SUCCESS, 11.0, ChipFamily::Tiny);
+}
+
+/// Geometry families for [`status_chip`].
+enum ChipFamily {
+    /// Inline micro-chip: 4 px corner, 5×1.5 px margin.
+    Small,
+    /// Tiny status label: 5 px corner, 6×2 px margin.
+    Tiny,
+}
+
+/// Aligns a small status chip with `text` (Persian display shaping applied) in
+/// `color` on a `bg` rounded pill. Geometry families: `SMALL` (4 px corner,
+/// 5×1.5 margin) for inline micro-chips, `TINY` (5 px corner, 6×2 margin) for
+/// status labels. Single source so chip restyling is one-line changes.
+fn status_chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    bg: egui::Color32,
+    color: egui::Color32,
+    size: f32,
+    family: ChipFamily,
+) {
+    let (rounding, margin) = match family {
+        ChipFamily::Small => (4.0_f32, egui::Margin::symmetric(5.0, 1.5)),
+        ChipFamily::Tiny => (5.0_f32, egui::Margin::symmetric(6.0, 2.0)),
+    };
+    egui::Frame::none()
+        .fill(bg)
+        .rounding(egui::Rounding::same(rounding))
+        .inner_margin(margin)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format_persian_display(text))
+                    .size(size)
+                    .color(color),
+            );
+        });
+}
+
+/// Header-badge pill geometry, shared by [`manager_header`].
+fn header_badge(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color32) {
+    egui::Frame::none()
+        .fill(bg)
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format_persian_display(text))
+                    .size(10.5)
+                    .color(fg),
+            );
+        });
+}
+
+/// Frame of the floating recording capsule for one visual mode. Single
+/// source for the capsule's fill/stroke/rounding per state — restyling a
+/// capsule state is a one-line change.
+fn capsule_frame(
+    fill: egui::Color32,
+    stroke: egui::Stroke,
+    rounding: f32,
+    margin: egui::Margin,
+) -> egui::Frame {
+    egui::Frame::none()
+        .fill(fill)
+        .stroke(stroke)
+        .rounding(egui::Rounding::same(rounding))
+        .inner_margin(margin)
+}
+
+/// Aligns the egui stock-widget colors of a manager-window context with the
+/// compiled palette. The windows use stock widgets (buttons, text edits,
+/// scroll areas) whose colors come from `ctx.style()`; without this a
+/// light-theme build would render egui's dark stock widgets inside light
+/// windows. Idempotent per pass; the main capsule draws only hand-styled
+/// frames from the palette, so it is unaffected.
+fn apply_theme_visuals(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let v = &mut style.visuals;
+    v.panel_fill = palette::WINDOW_BG;
+    v.extreme_bg_color = palette::CARD_BG_ALT; // text-edit interiors
+    v.faint_bg_color = palette::CHIP_BG; // alternate rows
+    v.window_stroke = egui::Stroke::new(1.0_f32, palette::STROKE);
+    v.widgets.noninteractive.bg_fill = palette::CARD_BG;
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
+    v.widgets.inactive.bg_fill = palette::CHIP_BG;
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
+    v.widgets.hovered.bg_fill = palette::HEADER_PILL_BG;
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
+    v.widgets.active.bg_fill = palette::SELECTED_BG;
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
+    v.selection.bg_fill = palette::SELECT_STROKE;
+    v.override_text_color = Some(palette::TEXT_PRIMARY);
+    ctx.set_style(style);
 }
 
 /// Historical voice transcription record.
@@ -501,79 +881,44 @@ impl OverlayApp {
                 if dict_ctx.input(|i| i.viewport().close_requested()) {
                     self.show_dict_window = false;
                 }
+                apply_theme_visuals(dict_ctx);
 
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(18, 20, 28))
-                            .inner_margin(egui::Margin::same(14.0)),
-                    )
+                    .frame(manager_central_panel())
                     .show(dict_ctx, |ui| {
                         // ── Header & Title ──
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format_persian_display("مدیریت دیکشنری کلمات تخصصی"))
-                                    .size(16.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(240, 245, 255)),
-                            );
+                        let total_rules = self.dictionary.read().map(|d| d.len()).unwrap_or(0);
+                        manager_header(
+                            ui,
+                            "مدیریت دیکشنری کلمات تخصصی",
+                            Some((
+                                &format!("{total_rules} قانون فعال"),
+                                palette::HEADER_PILL_BG,
+                                palette::ACCENT_SOFT,
+                            )),
+                        );
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let total_rules = self.dictionary.read().map(|d| d.len()).unwrap_or(0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(30, 36, 52))
-                                    .rounding(egui::Rounding::same(6.0))
-                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                    .show(ui, |ui| {
-                                        let text = format!("{total_rules} قانون فعال");
-                                        ui.label(
-                                            egui::RichText::new(format_persian_display(&text))
-                                                .size(10.5)
-                                                .color(egui::Color32::from_rgb(100, 200, 255)),
-                                        );
-                                    });
-                            });
-                        });
-
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(format_persian_display("تعریف و تصحیح خودکار واژگان فنی، مهندسی و گفتاری"))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 160, 180)),
+                        manager_subtitle(
+                            ui,
+                            "تعریف و تصحیح خودکار واژگان فنی، مهندسی و گفتاری",
                         );
 
                         // Feedback message if active
                         if let Some((ref msg, timestamp)) = self.dict_msg {
                             if timestamp.elapsed() < Duration::from_secs(4) {
-                                ui.add_space(4.0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(24, 48, 38))
-                                    .rounding(egui::Rounding::same(5.0))
-                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(msg)
-                                                .size(11.0)
-                                                .color(egui::Color32::from_rgb(120, 240, 160)),
-                                        );
-                                    });
+                                success_banner(ui, msg);
                             }
                         }
 
                         ui.add_space(10.0);
 
                         // ── Card 1: Add New Word ──
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(26, 30, 42))
-                            .rounding(egui::Rounding::same(8.0))
-                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 48, 66)))
-                            .inner_margin(egui::Margin::same(10.0))
-                            .show(ui, |ui| {
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new(format!("{} {}", ic::PLUS, format_persian_display("افزودن یا ویرایش کلمه جدید:")))
                                         .size(12.0)
                                         .strong()
-                                        .color(egui::Color32::from_rgb(220, 230, 248)),
+                                        .color(palette::TEXT_SECTION),
                                 );
                                 ui.add_space(6.0);
 
@@ -581,7 +926,7 @@ impl OverlayApp {
                                     ui.label(
                                         egui::RichText::new(format_persian_display("کلمه شنیده شده (از):"))
                                             .size(11.0)
-                                            .color(egui::Color32::from_rgb(180, 190, 210)),
+                                            .color(palette::TEXT_LABEL),
                                     );
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.new_from)
@@ -592,7 +937,7 @@ impl OverlayApp {
                                     ui.label(
                                         egui::RichText::new(format_persian_display("معادل صحیح (به):"))
                                             .size(11.0)
-                                            .color(egui::Color32::from_rgb(180, 190, 210)),
+                                            .color(palette::TEXT_LABEL),
                                     );
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.new_to)
@@ -606,7 +951,7 @@ impl OverlayApp {
                                     ui.label(
                                         egui::RichText::new(format_persian_display("دسته‌بندی (اختیاری):"))
                                             .size(11.0)
-                                            .color(egui::Color32::from_rgb(180, 190, 210)),
+                                            .color(palette::TEXT_LABEL),
                                     );
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.new_cat)
@@ -653,7 +998,7 @@ impl OverlayApp {
                             ui.label(
                                 egui::RichText::new(format!("{} {}", ic::MAGNIFYING_GLASS, format_persian_display("جستجو:")))
                                     .size(11.5)
-                                    .color(egui::Color32::from_rgb(190, 200, 220)),
+                                    .color(palette::TEXT_LABEL),
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.search_query)
@@ -700,24 +1045,24 @@ impl OverlayApp {
                                                 ui.label(
                                                     egui::RichText::new(format_persian_display(&r.from))
                                                         .size(11.0)
-                                                        .color(egui::Color32::from_rgb(220, 225, 235)),
+                                                        .color(palette::TEXT_TABLE),
                                                 );
                                                 ui.label(
                                                     egui::RichText::new("→")
                                                         .size(11.0)
-                                                        .color(egui::Color32::from_rgb(120, 130, 150)),
+                                                        .color(palette::TEXT_FAINT),
                                                 );
                                                 ui.label(
                                                     egui::RichText::new(format_persian_display(&r.to))
                                                         .size(11.0)
                                                         .strong()
-                                                        .color(egui::Color32::from_rgb(100, 220, 240)),
+                                                        .color(palette::ACCENT),
                                                 );
                                                 let cat_str = r.category.as_deref().unwrap_or("-");
                                                 ui.label(
                                                     egui::RichText::new(format_persian_display(cat_str))
                                                         .size(9.5)
-                                                        .color(egui::Color32::from_rgb(160, 170, 190)),
+                                                        .color(palette::TEXT_MUTED),
                                                 );
 
                                                 if ui.button(egui::RichText::new(ic::TRASH).size(10.5)).clicked() {
@@ -806,68 +1151,33 @@ impl OverlayApp {
                 if eng_ctx.input(|i| i.viewport().close_requested()) {
                     self.show_engine_window = false;
                 }
+                apply_theme_visuals(eng_ctx);
 
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(18, 20, 28))
-                            .inner_margin(egui::Margin::same(14.0)),
-                    )
+                    .frame(manager_central_panel())
                     .show(eng_ctx, |ui| {
                         // ── Header & Title ──
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format_persian_display("مدیریت مدل‌های صوتی و API"))
-                                    .size(16.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(240, 245, 255)),
-                            );
+                        let active = self.router.active_engine();
+                        let badge_text = if active == "auto" {
+                            "حالت فعال: خودکار (Auto)".to_string()
+                        } else {
+                            format!("فعال: {active}")
+                        };
+                        manager_header(
+                            ui,
+                            "مدیریت مدل‌های صوتی و API",
+                            Some((&badge_text, palette::ENGINE_PILL_BG, palette::ACCENT)),
+                        );
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let active = self.router.active_engine();
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(30, 42, 60))
-                                    .rounding(egui::Rounding::same(6.0))
-                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                    .show(ui, |ui| {
-                                        let text = if active == "auto" {
-                                            "حالت فعال: خودکار (Auto)".to_string()
-                                        } else {
-                                            format!("فعال: {active}")
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(format_persian_display(&text))
-                                                .size(10.5)
-                                                .color(egui::Color32::from_rgb(100, 220, 255)),
-                                        );
-                                    });
-                            });
-                        });
-
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(format_persian_display(
-                                "انتخاب موتور پیش‌فرض یا افزودن سرور و مدل‌های اختصاصی (سازگار با OpenAI)",
-                            ))
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(150, 160, 180)),
+                        manager_subtitle(
+                            ui,
+                            "انتخاب موتور پیش‌فرض یا افزودن سرور و مدل‌های اختصاصی (سازگار با OpenAI)",
                         );
 
                         // Feedback message
                         if let Some((ref msg, timestamp)) = self.engine_msg {
                             if timestamp.elapsed() < Duration::from_secs(4) {
-                                ui.add_space(4.0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(24, 48, 38))
-                                    .rounding(egui::Rounding::same(5.0))
-                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(msg)
-                                                .size(11.0)
-                                                .color(egui::Color32::from_rgb(120, 240, 160)),
-                                        );
-                                    });
+                                success_banner(ui, msg);
                             }
                         }
 
@@ -878,7 +1188,7 @@ impl OverlayApp {
                             egui::RichText::new(format_persian_display("موتورهای گفتار به متن ثبت‌شده:"))
                                 .size(12.5)
                                 .strong()
-                                .color(egui::Color32::from_rgb(210, 225, 250)),
+                                .color(palette::TEXT_STRONG_SOFT),
                         );
                         ui.add_space(4.0);
 
@@ -890,23 +1200,16 @@ impl OverlayApp {
                             .show(ui, |ui| {
                                 // Auto Fallback Option
                                 let is_auto = current_active == "auto";
-                                egui::Frame::none()
-                                    .fill(if is_auto {
-                                        egui::Color32::from_rgb(26, 44, 58)
+                                manager_card(
+                                    if is_auto { palette::AUTO_BG } else { palette::CARD_BG },
+                                    if is_auto {
+                                        palette::SELECT_STROKE
                                     } else {
-                                        egui::Color32::from_rgb(24, 26, 36)
-                                    })
-                                    .rounding(egui::Rounding::same(8.0))
-                                    .stroke(egui::Stroke::new(
-                                        1.0_f32,
-                                        if is_auto {
-                                            egui::Color32::from_rgb(60, 150, 240)
-                                        } else {
-                                            egui::Color32::from_rgb(40, 44, 60)
-                                        },
-                                    ))
-                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                    .show(ui, |ui| {
+                                        palette::CARD_STROKE
+                                    },
+                                )
+                                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             if ui.radio(is_auto, "").clicked() && !is_auto {
                                                 self.router.set_active_engine("auto");
@@ -927,30 +1230,27 @@ impl OverlayApp {
                                                     ))
                                                     .strong()
                                                     .size(12.0)
-                                                    .color(egui::Color32::from_rgb(240, 245, 255)),
+                                                    .color(palette::TEXT_PRIMARY),
                                                 );
                                                 ui.label(
                                                     egui::RichText::new(format_persian_display(
                                                         "اولویت‌بندی خودکار بین ابری و محلی؛ سوییچ بدون وقفه در قطعی شبکه",
                                                     ))
                                                     .size(10.0)
-                                                    .color(egui::Color32::from_rgb(140, 155, 175)),
+                                                    .color(palette::TEXT_MUTED),
                                                 );
                                             });
 
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 if is_auto {
-                                                    egui::Frame::none()
-                                                        .fill(egui::Color32::from_rgb(20, 80, 50))
-                                                        .rounding(egui::Rounding::same(4.0))
-                                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                                        .show(ui, |ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(format_persian_display("انتخاب‌شده"))
-                                                                    .size(9.5)
-                                                                    .color(egui::Color32::from_rgb(100, 240, 160)),
-                                                            );
-                                                        });
+                                                    status_chip(
+                                                        ui,
+                                                        "انتخاب‌شده",
+                                                        palette::SUCCESS_PILL,
+                                                        palette::SUCCESS_OK,
+                                                        9.5,
+                                                        ChipFamily::Tiny,
+                                                    );
                                                 }
                                             });
                                         });
@@ -961,23 +1261,20 @@ impl OverlayApp {
                                 let mut to_delete: Option<String> = None;
                                 for (id, display_name, kind, health, _is_selected) in &engines {
                                     let is_active = current_active == *id;
-                                    egui::Frame::none()
-                                        .fill(if is_active {
-                                            egui::Color32::from_rgb(28, 42, 54)
+                                    manager_card(
+                                        if is_active {
+                                            palette::SELECTED_BG
                                         } else {
-                                            egui::Color32::from_rgb(24, 26, 36)
-                                        })
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .stroke(egui::Stroke::new(
-                                            1.0_f32,
-                                            if is_active {
-                                                egui::Color32::from_rgb(60, 150, 240)
-                                            } else {
-                                                egui::Color32::from_rgb(40, 44, 60)
-                                            },
-                                        ))
-                                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                        .show(ui, |ui| {
+                                            palette::CARD_BG
+                                        },
+                                        if is_active {
+                                            palette::SELECT_STROKE
+                                        } else {
+                                            palette::CARD_STROKE
+                                        },
+                                    )
+                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                    .show(ui, |ui| {
                                             ui.horizontal(|ui| {
                                                 if ui.radio(is_active, "").clicked() && !is_active {
                                                     self.router.set_active_engine(id);
@@ -994,19 +1291,19 @@ impl OverlayApp {
                                                 // Health indicator dot
                                                 let (dot_color, health_desc) = match health {
                                                     AsrHealth::Ready => (
-                                                        egui::Color32::from_rgb(60, 220, 130),
+                                                        palette::SUCCESS_DOT,
                                                         "آماده کار".to_string(),
                                                     ),
                                                     AsrHealth::NoModel => (
-                                                        egui::Color32::from_rgb(160, 160, 160),
+                                                        palette::DOT_INACTIVE,
                                                         "مدل دانلود نشده".to_string(),
                                                     ),
                                                     AsrHealth::Cooldown { reason, .. } => (
-                                                        egui::Color32::from_rgb(255, 180, 50),
+                                                        palette::WARNING,
                                                         format!("در حال بازیابی: {reason}"),
                                                     ),
                                                     AsrHealth::Failed { reason } => (
-                                                        egui::Color32::from_rgb(255, 80, 80),
+                                                        palette::DANGER_TEXT,
                                                         format!("غیرفعال: {reason}"),
                                                     ),
                                                 };
@@ -1021,26 +1318,23 @@ impl OverlayApp {
                                                             egui::RichText::new(display_name)
                                                                 .strong()
                                                                 .size(12.0)
-                                                                .color(egui::Color32::from_rgb(240, 245, 255)),
+                                                                .color(palette::TEXT_PRIMARY),
                                                         );
 
-                                                        egui::Frame::none()
-                                                            .fill(egui::Color32::from_rgb(36, 42, 56))
-                                                            .rounding(egui::Rounding::same(4.0))
-                                                            .inner_margin(egui::Margin::symmetric(5.0, 1.5))
-                                                            .show(ui, |ui| {
-                                                                ui.label(
-                                                                    egui::RichText::new(*kind)
-                                                                        .size(9.0)
-                                                                        .color(egui::Color32::from_rgb(160, 190, 230)),
-                                                                );
-                                                            });
+                                                        status_chip(
+                                                            ui,
+                                                            kind,
+                                                            palette::CHIP_BG,
+                                                            palette::ACCENT_BADGE,
+                                                            9.0,
+                                                            ChipFamily::Small,
+                                                        );
                                                     });
 
                                                     ui.label(
                                                         egui::RichText::new(format!("ID: {id}"))
                                                             .size(9.5)
-                                                            .color(egui::Color32::from_rgb(120, 130, 150)),
+                                                            .color(palette::TEXT_FAINT),
                                                     );
                                                 });
 
@@ -1050,9 +1344,9 @@ impl OverlayApp {
                                                             egui::Button::new(
                                                                 egui::RichText::new(ic::TRASH)
                                                                     .size(11.0)
-                                                                    .color(egui::Color32::from_rgb(255, 110, 110)),
+                                                                    .color(palette::DANGER),
                                                             )
-                                                            .fill(egui::Color32::from_rgb(45, 25, 30))
+                                                            .fill(palette::DANGER_FILL)
                                                             .rounding(egui::Rounding::same(4.0)),
                                                         );
                                                         if del_btn.clicked() {
@@ -1061,17 +1355,14 @@ impl OverlayApp {
                                                     }
 
                                                     if is_active {
-                                                        egui::Frame::none()
-                                                            .fill(egui::Color32::from_rgb(20, 80, 50))
-                                                            .rounding(egui::Rounding::same(4.0))
-                                                            .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                                            .show(ui, |ui| {
-                                                                ui.label(
-                                                                    egui::RichText::new(format_persian_display("فعال"))
-                                                                        .size(9.5)
-                                                                        .color(egui::Color32::from_rgb(100, 240, 160)),
-                                                                );
-                                                            });
+                                                        status_chip(
+                                                            ui,
+                                                            "فعال",
+                                                            palette::SUCCESS_PILL,
+                                                            palette::SUCCESS_OK,
+                                                            9.5,
+                                                            ChipFamily::Tiny,
+                                                        );
                                                     }
                                                 });
                                             });
@@ -1105,7 +1396,7 @@ impl OverlayApp {
                             egui::RichText::new(format_persian_display("افزودن API / سرور دلخواه (سازگار با OpenAI):"))
                                 .size(12.5)
                                 .strong()
-                                .color(egui::Color32::from_rgb(210, 225, 250)),
+                                .color(palette::TEXT_STRONG_SOFT),
                         );
                         ui.add_space(6.0);
 
@@ -1116,7 +1407,7 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("شناسه یکتا (ID):"))
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(180, 190, 210)),
+                                        .color(palette::TEXT_LABEL),
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.new_engine_id)
@@ -1128,7 +1419,7 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("نام نمایشی:"))
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(180, 190, 210)),
+                                        .color(palette::TEXT_LABEL),
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.new_engine_name)
@@ -1140,7 +1431,7 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("آدرس Base URL:"))
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(180, 190, 210)),
+                                        .color(palette::TEXT_LABEL),
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.new_engine_url)
@@ -1152,7 +1443,7 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("کلید API:"))
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(180, 190, 210)),
+                                        .color(palette::TEXT_LABEL),
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.new_engine_key)
@@ -1165,7 +1456,7 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("نام مدل:"))
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(180, 190, 210)),
+                                        .color(palette::TEXT_LABEL),
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.new_engine_model)
@@ -1177,7 +1468,7 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("زبان (Language):"))
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(180, 190, 210)),
+                                        .color(palette::TEXT_LABEL),
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.new_engine_lang)
@@ -1194,9 +1485,9 @@ impl OverlayApp {
                                     egui::RichText::new(format_persian_display("ثبت و فعال‌سازی این موتور"))
                                         .strong()
                                         .size(11.5)
-                                        .color(egui::Color32::from_rgb(255, 255, 255)),
+                                        .color(palette::WHITE),
                                 )
-                                .fill(egui::Color32::from_rgb(32, 100, 180))
+                                .fill(palette::ACCENT_ACTION)
                                 .rounding(egui::Rounding::same(6.0)),
                             );
 
@@ -1294,32 +1585,22 @@ impl OverlayApp {
                 if hist_ctx.input(|i| i.viewport().close_requested()) {
                     self.show_history_window = false;
                 }
+                apply_theme_visuals(hist_ctx);
 
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(18, 20, 28))
-                            .inner_margin(egui::Margin::same(14.0)),
-                    )
+                    .frame(manager_central_panel())
                     .show(hist_ctx, |ui| {
                         // ── Header & Title ──
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format_persian_display("تاریخچه گفتار و رونوشت‌های صوتی"))
-                                    .size(16.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(240, 245, 255)),
-                            );
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let count = self.history.len();
-                                ui.label(
-                                    egui::RichText::new(format_persian_display(&format!("{count} مورد ثبت‌شده")))
-                                        .size(11.0)
-                                        .color(egui::Color32::from_rgb(150, 165, 185)),
-                                );
-                            });
-                        });
+                        let count = self.history.len();
+                        manager_header(
+                            ui,
+                            "تاریخچه گفتار و رونوشت‌های صوتی",
+                            Some((
+                                &format!("{count} مورد ثبت‌شده"),
+                                palette::HEADER_PILL_BG,
+                                palette::ACCENT_SOFT,
+                            )),
+                        );
 
                         ui.add_space(8.0);
 
@@ -1347,7 +1628,7 @@ impl OverlayApp {
                                 if ui.button(
                                         egui::RichText::new(format!("{} {}", ic::TRASH_SIMPLE, format_persian_display("پاکسازی")))
                                             .size(11.5)
-                                            .color(egui::Color32::from_rgb(255, 120, 120)),
+                                            .color(palette::DANGER_SOFT),
                                     ).clicked() {
                                     self.history.clear();
                                     self.history_copy_msg = Some(("تاریخچه با موفقیت پاک شد.".into(), now));
@@ -1362,7 +1643,7 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display(msg))
                                         .size(11.5)
-                                        .color(egui::Color32::from_rgb(80, 220, 140)),
+                                        .color(palette::SUCCESS_CHIPTXT),
                                 );
                             }
                         }
@@ -1388,12 +1669,12 @@ impl OverlayApp {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("موردی در تاریخچه یافت نشد."))
                                         .size(13.0)
-                                        .color(egui::Color32::from_rgb(130, 145, 165)),
+                                        .color(palette::TEXT_MUTED),
                                 );
                                 ui.label(
                                     egui::RichText::new(format_persian_display("هر صحبتی که انجام دهید به طور خودکار در این بخش نگهداری می‌شود."))
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(100, 115, 135)),
+                                        .color(palette::TEXT_FAINT),
                                 );
                             });
                         } else {
@@ -1403,27 +1684,20 @@ impl OverlayApp {
                                     let mut delete_idx = None;
                                     for &idx in &filtered_indices {
                                         let item = &self.history[idx];
-                                        egui::Frame::none()
-                                            .fill(egui::Color32::from_rgba_unmultiplied(26, 30, 42, 220))
-                                            .rounding(egui::Rounding::same(8.0))
-                                            .stroke(egui::Stroke::new(
-                                                1.0_f32,
-                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                                            ))
-                                            .inner_margin(egui::Margin::same(10.0))
+                                        manager_card(palette::CARD_TRANSLUCENT, palette::HAIRLINE)
                                             .show(ui, |ui| {
                                                 // Meta row: Time, Engine, Actions
                                                 ui.horizontal(|ui| {
                                                     ui.label(
                                                         egui::RichText::new(format!("⏱ {}", item.timestamp))
                                                             .size(10.5)
-                                                            .color(egui::Color32::from_rgb(140, 155, 175)),
+                                                            .color(palette::TEXT_MUTED),
                                                     );
 
                                                     ui.label(
                                                         egui::RichText::new(format!("⚡ {}", item.engine))
                                                             .size(10.0)
-                                                            .color(egui::Color32::from_rgb(100, 190, 255)),
+                                                            .color(palette::ACCENT_SOFT),
                                                     );
 
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1447,7 +1721,7 @@ impl OverlayApp {
                                                 ui.label(
                                                     egui::RichText::new(display)
                                                         .size(12.5)
-                                                        .color(egui::Color32::from_rgb(235, 242, 255)),
+                                                        .color(palette::TEXT_PRIMARY),
                                                 );
                                             });
                                         ui.add_space(6.0);
@@ -1469,6 +1743,7 @@ impl OverlayApp {
         toast.set_closable(true);
         toast.set_show_progress_bar(true);
         toast.set_level(ToastLevel::Custom(ic::MICROPHONE.to_string(), TOAST_ACCENT));
+        toast.set_max_width(Some(TOAST_MAX_WIDTH));
         toast
     }
 
@@ -1770,12 +2045,12 @@ impl eframe::App for OverlayApp {
         match self.visual_mode {
             VisualMode::IdleDormant => {
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(130, 142, 158))
-                            .rounding(egui::Rounding::same(3.0))
-                            .inner_margin(egui::Margin::same(0.0)),
-                    )
+                    .frame(capsule_frame(
+                        palette::pill::DORMANT_BAR,
+                        egui::Stroke::NONE,
+                        3.0,
+                        egui::Margin::same(0.0),
+                    ))
                     .show(ctx, |ui| {
                         let rect = ui.max_rect();
                         let sense = ui.interact(rect, ui.id().with("dormant_bar"), egui::Sense::click());
@@ -1790,16 +2065,12 @@ impl eframe::App for OverlayApp {
             }
             VisualMode::HoveredAwake => {
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(20, 24, 34))
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                egui::Color32::from_rgba_unmultiplied(100, 150, 220, 90),
-                            ))
-                            .rounding(egui::Rounding::same(16.0))
-                            .inner_margin(egui::Margin::symmetric(7.0, 4.0)),
-                    )
+                    .frame(capsule_frame(
+                        palette::pill::SURFACE,
+                        egui::Stroke::new(1.0_f32, palette::pill::IDLE_GLOW),
+                        16.0,
+                        egui::Margin::symmetric(7.0, 4.0),
+                    ))
                     .show(ctx, |ui| {
                         let mut action_btn_clicked = false;
 
@@ -1808,12 +2079,12 @@ impl eframe::App for OverlayApp {
                             let (mic_rect, mic_resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
                             let mic_hover = mic_resp.hovered();
                             let mic_bg = if mic_hover {
-                                egui::Color32::from_rgba_unmultiplied(45, 80, 130, 230)
+                                palette::pill::MIC_IDLE_HOVER
                             } else {
-                                egui::Color32::from_rgba_unmultiplied(35, 60, 90, 200)
+                                palette::pill::MIC_IDLE
                             };
                             ui.painter().circle_filled(mic_rect.center(), 10.5, mic_bg);
-                            paint_vector_mic(ui.painter(), mic_rect, egui::Color32::from_rgb(255, 255, 255));
+                            paint_vector_mic(ui.painter(), mic_rect, palette::WHITE);
                             if mic_resp.clicked() {
                                 let _ = self.events_tx.send(HotkeyEvent::RecordDown);
                                 action_btn_clicked = true;
@@ -1829,7 +2100,7 @@ impl eframe::App for OverlayApp {
                                 egui::RichText::new("CapsLock")
                                     .size(10.5)
                                     .strong()
-                                    .color(egui::Color32::from_rgb(210, 225, 245)),
+                                    .color(palette::TEXT_STRONG_SOFT),
                             );
 
                             // Right-aligned buttons: Engine badge & History
@@ -1852,9 +2123,9 @@ impl eframe::App for OverlayApp {
                                                 egui::RichText::new(engine_short)
                                                     .size(8.5)
                                                     .strong()
-                                                    .color(egui::Color32::from_rgb(190, 210, 235)),
+                                                    .color(palette::pill::BADGE_TEXT),
                                             )
-                                            .fill(egui::Color32::from_rgba_unmultiplied(35, 45, 65, 220))
+                                            .fill(palette::pill::BADGE_BG)
                                             .rounding(egui::Rounding::same(5.0)),
                                         )
                                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1872,9 +2143,9 @@ impl eframe::App for OverlayApp {
                                     let (hist_rect, hist_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                                     let hist_hover = hist_resp.hovered();
                                     let hist_bg = if hist_hover {
-                                        egui::Color32::from_rgba_unmultiplied(40, 75, 65, 230)
+                                        palette::pill::HIST_HOVER
                                     } else {
-                                        egui::Color32::from_rgba_unmultiplied(28, 48, 42, 190)
+                                        palette::pill::HIST_IDLE
                                     };
                                     ui.painter().rect_filled(hist_rect, egui::Rounding::same(4.0), hist_bg);
                                     ui.painter().text(
@@ -1882,7 +2153,7 @@ impl eframe::App for OverlayApp {
                                         egui::Align2::CENTER_CENTER,
                                         ic::CLOCK_COUNTER_CLOCKWISE,
                                         egui::FontId::proportional(10.0),
-                                        egui::Color32::from_rgb(170, 230, 210),
+                                        palette::pill::HIST_ICON,
                                     );
                                     if hist_resp.clicked() {
                                         self.show_history_window = !self.show_history_window;
@@ -1908,16 +2179,12 @@ impl eframe::App for OverlayApp {
             }
             VisualMode::RecordingActive => {
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(18, 20, 28))
-                            .stroke(egui::Stroke::new(
-                                1.2_f32,
-                                egui::Color32::from_rgba_unmultiplied(255, 85, 85, 150),
-                            ))
-                            .rounding(egui::Rounding::same(17.0))
-                            .inner_margin(egui::Margin::symmetric(7.0, 4.0)),
-                    )
+                    .frame(capsule_frame(
+                        palette::WINDOW_BG,
+                        egui::Stroke::new(1.2_f32, palette::pill::REC_GLOW),
+                        17.0,
+                        egui::Margin::symmetric(7.0, 4.0),
+                    ))
                     .show(ctx, |ui| {
                         let mut action_btn_clicked = false;
 
@@ -1926,12 +2193,12 @@ impl eframe::App for OverlayApp {
                             let (cancel_rect, cancel_resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                             let cancel_hover = cancel_resp.hovered();
                             let cancel_bg = if cancel_hover {
-                                egui::Color32::from_rgba_unmultiplied(85, 25, 30, 240)
+                                palette::pill::CANCEL_HOVER
                             } else {
-                                egui::Color32::from_rgba_unmultiplied(65, 25, 30, 220)
+                                palette::pill::CANCEL_IDLE
                             };
                             ui.painter().circle_filled(cancel_rect.center(), 10.0, cancel_bg);
-                            let cross_stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 120, 120));
+                            let cross_stroke = egui::Stroke::new(1.5_f32, palette::pill::CANCEL_ICON);
                             paint_vector_cross(ui.painter(), cancel_rect, cross_stroke);
                             if cancel_resp.clicked() {
                                 let _ = self.events_tx.send(HotkeyEvent::Cancel);
@@ -1953,7 +2220,7 @@ impl eframe::App for OverlayApp {
                                 egui::RichText::new(timer_str)
                                     .size(10.0)
                                     .strong()
-                                    .color(egui::Color32::from_rgb(255, 145, 145)),
+                                    .color(palette::pill::REC_TEXT),
                             );
 
                             ui.add_space(2.0);
@@ -1978,9 +2245,9 @@ impl eframe::App for OverlayApp {
                                 let by = center_y - h / 2.0;
 
                                 let bar_color = if i % 2 == 0 {
-                                    egui::Color32::from_rgb(255, 90, 90)
+                                    palette::pill::WAVE_STRONG
                                 } else {
-                                    egui::Color32::from_rgb(255, 230, 230)
+                                    palette::pill::WAVE_FAINT
                                 };
 
                                 wave_painter.rect_filled(
@@ -2000,12 +2267,12 @@ impl eframe::App for OverlayApp {
                                     let (submit_rect, submit_resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                                     let submit_hover = submit_resp.hovered();
                                     let submit_bg = if submit_hover {
-                                        egui::Color32::from_rgba_unmultiplied(30, 85, 55, 250)
+                                        palette::pill::SUBMIT_HOVER
                                     } else {
-                                        egui::Color32::from_rgba_unmultiplied(22, 65, 42, 230)
+                                        palette::pill::SUBMIT_IDLE
                                     };
                                     ui.painter().circle_filled(submit_rect.center(), 10.0, submit_bg);
-                                    let check_stroke = egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(85, 250, 155));
+                                    let check_stroke = egui::Stroke::new(1.8_f32, palette::pill::SUBMIT_ICON);
                                     paint_vector_check(ui.painter(), submit_rect, check_stroke);
                                     if submit_resp.clicked() {
                                         let _ = self.events_tx.send(HotkeyEvent::RecordUp);
@@ -2031,16 +2298,12 @@ impl eframe::App for OverlayApp {
             }
             VisualMode::Processing => {
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(20, 24, 34))
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                egui::Color32::from_rgba_unmultiplied(255, 185, 45, 100),
-                            ))
-                            .rounding(egui::Rounding::same(16.0))
-                            .inner_margin(egui::Margin::symmetric(8.0, 4.0)),
-                    )
+                    .frame(capsule_frame(
+                        palette::pill::SURFACE,
+                        egui::Stroke::new(1.0_f32, palette::pill::PROC_GLOW),
+                        16.0,
+                        egui::Margin::symmetric(8.0, 4.0),
+                    ))
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             let pulse = 3.0 + 1.5 * (time * 6.0).sin().abs() as f32;
@@ -2049,7 +2312,7 @@ impl eframe::App for OverlayApp {
                                 egui::Sense::hover(),
                             );
                             let center = response.rect.center();
-                            let amber = egui::Color32::from_rgb(255, 185, 45);
+                            let amber = palette::pill::PROC_AMBER;
                             painter.circle_filled(center, pulse + 1.5, amber.linear_multiply(0.25));
                             painter.circle_filled(center, 3.2, amber);
 
@@ -2059,7 +2322,7 @@ impl eframe::App for OverlayApp {
                                 egui::RichText::new(format_persian_display("در حال پردازش..."))
                                     .size(11.0)
                                     .strong()
-                                    .color(egui::Color32::from_rgb(255, 215, 130)),
+                                    .color(palette::pill::PROC_TEXT),
                             );
                         });
                     });
@@ -2083,16 +2346,56 @@ mod tests {
 
     #[test]
     fn test_toast_caption_wraps_and_appends_countdown() {
+        // Short text: body line + footer, no blank spacer row (compact card).
         let short = toast_caption("Hello", 10);
-        assert_eq!(short, format!("Hello\n\n{} 10s", ic::TIMER));
+        assert_eq!(short.lines().count(), 2);
+        assert_eq!(short, format!("Hello\n{} 10s", ic::TIMER));
 
         // Long text: wrapped to 3 lines of 44 chars, then ellipsis + footer.
         let long_text = "x".repeat(200);
         let long = toast_caption(&long_text, 7);
-        let body_lines = long.lines().count() - 2; // minus blank + footer
-        assert_eq!(body_lines, 3);
+        let body_lines = long.lines().count() - 1; // minus footer
+        assert_eq!(body_lines, 3); // 3 rows; ellipsis ends the 3rd row
         assert!(long.contains('…'));
         assert!(long.ends_with(" 7s"));
+    }
+
+    /// Theme sanity for whichever theme this binary was built with: every
+    /// text role must sit far from every surface role in luminance (dark:
+    /// text much lighter, light: text much darker) — catches accidentally
+    /// swapped or duplicated role values in either theme. Role-name parity
+    /// between the two cfg modules is enforced by the compiler: the shared
+    /// call sites simply do not compile if either theme misses a role.
+    #[test]
+    fn test_theme_text_surface_contrast() {
+        let lum = |c: egui::Color32| {
+            0.2126_f32 * c.r() as f32
+                + 0.7152_f32 * c.g() as f32
+                + 0.0722_f32 * c.b() as f32
+        };
+        let surfaces = [
+            palette::WINDOW_BG,
+            palette::TOAST_BG,
+            palette::CARD_BG,
+            palette::CARD_BG_ALT,
+            palette::CHIP_BG,
+        ];
+        let texts = [
+            palette::TEXT_PRIMARY,
+            palette::TEXT_SECTION,
+            palette::TEXT_LABEL,
+            palette::TEXT_SECONDARY,
+            palette::TEXT_MUTED,
+            palette::TEXT_FAINT,
+        ];
+        for s in surfaces {
+            for t in texts {
+                assert!(
+                    (lum(t) - lum(s)).abs() > 40.0,
+                    "text role {t:?} too close to surface {s:?} luminance"
+                );
+            }
+        }
     }
 
     #[test]
