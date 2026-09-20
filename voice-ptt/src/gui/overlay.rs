@@ -2,12 +2,15 @@
 //! that reflects the current state (Idle / Recording / Processing / Typing),
 //! animates live audio waveforms, and displays Persian transcripts crisply.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use ar_reshaper::ArabicReshaper;
 use eframe::egui;
+use egui_notify::{Anchor, Toast, ToastLevel, Toasts};
+use egui_phosphor::regular as ic;
 use unicode_bidi::BidiInfo;
 
 use crate::asr::engine::AsrHealth;
@@ -61,6 +64,69 @@ pub fn format_persian_display(text: &str) -> String {
         visual.push_str(&line);
     }
     visual
+}
+
+/// OmniType dark-card palette for notification cards. egui-notify reads
+/// `widgets.noninteractive.bg_fill` for the card background and
+/// `widgets.noninteractive.fg_stroke` for the caption, ✕ and progress bar;
+/// all three come straight from the app palette, with the accent carried by
+/// a Phosphor microphone glyph (same visual language as the capsule).
+const TOAST_CARD_BG: egui::Color32 = egui::Color32::from_rgb(20, 24, 34);
+const TOAST_TEXT: egui::Color32 = egui::Color32::from_rgb(240, 245, 255);
+const TOAST_ACCENT: egui::Color32 = egui::Color32::from_rgb(140, 205, 250);
+
+/// Height of the transparent glass host viewport; sized for two stacked
+/// 3-line cards so the countdown ticker never clips.
+const TOAST_HOST_HEIGHT: f32 = 190.0;
+const TOAST_TOTAL_SECS: u64 = 10;
+
+/// Fresh `egui_notify` channel with the app's dark bottom-right layout.
+fn new_toast_channel() -> Toasts {
+    Toasts::new()
+        .with_anchor(Anchor::BottomRight)
+        .with_margin(egui::vec2(12.0, 10.0))
+        .with_spacing(6.0)
+        .with_default_font(egui::FontId::proportional(12.5))
+}
+
+/// Applies the OmniType dark palette to `ctx` for the duration of one pass,
+/// returning the previous style for [`restore_toast_style`]. Scoped so the
+/// main capsule and the other manager windows are never re-styled.
+fn apply_toast_style(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
+    let original = ctx.style();
+    let mut styled = (*original).clone();
+    styled.visuals.widgets.noninteractive.bg_fill = TOAST_CARD_BG;
+    styled.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TOAST_TEXT);
+    ctx.set_style(styled);
+    original
+}
+
+/// Restores the style captured by [`apply_toast_style`].
+fn restore_toast_style(ctx: &egui::Context, original: std::sync::Arc<egui::Style>) {
+    ctx.set_style(original);
+}
+
+/// Wraps the (already shaped) transcript into a compact multi-line caption
+/// with a live countdown footer (`⏱ Ns`). Only the preview is truncated —
+/// the full raw text is what click-to-copy puts on the clipboard.
+fn toast_caption(display: &str, remaining_secs: u64) -> String {
+    const CHARS_PER_LINE: usize = 44;
+    const MAX_LINES: usize = 3;
+
+    let mut out = String::new();
+    for (i, ch) in display.chars().enumerate() {
+        if i / CHARS_PER_LINE >= MAX_LINES {
+            out.push('…');
+            break;
+        }
+        if i > 0 && i % CHARS_PER_LINE == 0 {
+            out.push('\n');
+        }
+        out.push(ch);
+    }
+    out.push_str("\n\n");
+    out.push_str(&format!("{} {}s", ic::TIMER, remaining_secs));
+    out
 }
 
 /// Historical voice transcription record.
@@ -239,59 +305,36 @@ fn apply_window_shapes_all() {
     }
 }
 
-/// Paints a vector microphone icon inside `rect`.
+/// Paints a Phosphor microphone icon inside `rect` (replaces the hand-drawn vector mic).
 fn paint_vector_mic(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let center = rect.center();
-    // Mic capsule
-    let cap_w = 4.0_f32;
-    let cap_h = 7.0_f32;
-    let cap_rect = egui::Rect::from_center_size(center - egui::vec2(0.0, 1.5), egui::vec2(cap_w, cap_h));
-    painter.rect_filled(cap_rect, egui::Rounding::same(2.0), color);
-
-    // Cradle (U shape)
-    let cradle_y = center.y + 0.5;
-    painter.line_segment(
-        [center + egui::vec2(-4.0, -1.0), center + egui::vec2(-4.0, cradle_y)],
-        egui::Stroke::new(1.3_f32, color),
-    );
-    painter.line_segment(
-        [center + egui::vec2(-4.0, cradle_y), center + egui::vec2(4.0, cradle_y)],
-        egui::Stroke::new(1.3_f32, color),
-    );
-    painter.line_segment(
-        [center + egui::vec2(4.0, cradle_y), center + egui::vec2(4.0, -1.0)],
-        egui::Stroke::new(1.3_f32, color),
-    );
-
-    // Stem and base
-    painter.line_segment(
-        [center + egui::vec2(0.0, cradle_y), center + egui::vec2(0.0, cradle_y + 3.0)],
-        egui::Stroke::new(1.3_f32, color),
-    );
-    painter.line_segment(
-        [center + egui::vec2(-3.0, cradle_y + 3.0), center + egui::vec2(3.0, cradle_y + 3.0)],
-        egui::Stroke::new(1.3_f32, color),
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ic::MICROPHONE,
+        egui::FontId::proportional(rect.height() * 0.7),
+        color,
     );
 }
 
-/// Paints a vector cross (✕) icon inside `rect`.
+/// Paints a Phosphor cross (✕) icon inside `rect`.
 fn paint_vector_cross(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
-    let center = rect.center();
-    let d = 3.5_f32;
-    painter.line_segment([center - egui::vec2(d, d), center + egui::vec2(d, d)], stroke);
-    painter.line_segment([center + egui::vec2(-d, d), center + egui::vec2(d, -d)], stroke);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ic::X,
+        egui::FontId::proportional(stroke.width * 7.0),
+        stroke.color,
+    );
 }
 
-/// Paints a vector checkmark (✓) icon inside `rect`.
+/// Paints a Phosphor checkmark (✓) icon inside `rect`.
 fn paint_vector_check(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
-    let center = rect.center();
-    painter.line_segment(
-        [center + egui::vec2(-4.0, 0.0), center + egui::vec2(-1.0, 3.5)],
-        stroke,
-    );
-    painter.line_segment(
-        [center + egui::vec2(-1.0, 3.5), center + egui::vec2(4.5, -3.5)],
-        stroke,
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ic::CHECK,
+        egui::FontId::proportional(stroke.width * 7.0),
+        stroke.color,
     );
 }
 
@@ -328,10 +371,15 @@ pub struct OverlayApp {
     history_copy_msg: Option<(String, Instant)>,
     shape_frames_checked: u8,
     /// Transcribed text for the 10-second secondary preview toast window
-    pub toast_text: Option<String>,
-    pub toast_display: Option<String>,
-    pub toast_start: Option<Instant>,
-    pub toast_copied: Option<Instant>,
+    /// Library-managed notification channel (egui-notify). Each transcript
+    /// enqueues a toast that renders inside the preview viewport and manages
+    /// its own 10 s lifetime, slide animation, and progress bar.
+    toasts: Toasts,
+    /// Mirror of the toasts currently alive, oldest first: the raw text,
+    /// first version's enqueue time (lifetime anchor), and the countdown
+    /// digit currently rendered on the card.
+    live_toasts: VecDeque<(usize, String, Instant, u64)>,
+    next_toast_seq: usize,
     pub last_seen_transcript: Option<String>,
     /// Wispr Flow interaction and dock mode
     pub visual_mode: VisualMode,
@@ -398,10 +446,9 @@ impl OverlayApp {
             history_search: String::new(),
             history_copy_msg: None,
             shape_frames_checked: 0,
-            toast_text: None,
-            toast_display: None,
-            toast_start: None,
-            toast_copied: None,
+            toasts: new_toast_channel(),
+            live_toasts: VecDeque::new(),
+            next_toast_seq: 0,
             last_seen_transcript: None,
             visual_mode: VisualMode::IdleDormant,
             is_hovered: false,
@@ -523,7 +570,7 @@ impl OverlayApp {
                             .inner_margin(egui::Margin::same(10.0))
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new(format_persian_display("➕ افزودن یا ویرایش کلمه جدید:"))
+                                    egui::RichText::new(format!("{} {}", ic::PLUS, format_persian_display("افزودن یا ویرایش کلمه جدید:")))
                                         .size(12.0)
                                         .strong()
                                         .color(egui::Color32::from_rgb(220, 230, 248)),
@@ -604,7 +651,7 @@ impl OverlayApp {
                         // ── Search Bar ──
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format_persian_display("🔍 جستجو:"))
+                                egui::RichText::new(format!("{} {}", ic::MAGNIFYING_GLASS, format_persian_display("جستجو:")))
                                     .size(11.5)
                                     .color(egui::Color32::from_rgb(190, 200, 220)),
                             );
@@ -673,7 +720,7 @@ impl OverlayApp {
                                                         .color(egui::Color32::from_rgb(160, 170, 190)),
                                                 );
 
-                                                if ui.button(egui::RichText::new("🗑").size(10.5)).clicked() {
+                                                if ui.button(egui::RichText::new(ic::TRASH).size(10.5)).clicked() {
                                                     rule_to_remove = Some(r.from.clone());
                                                 }
                                                 ui.end_row();
@@ -700,7 +747,7 @@ impl OverlayApp {
 
                         // ── Bottom Action Buttons ──
                         ui.horizontal(|ui| {
-                            if ui.button(egui::RichText::new(format_persian_display("💾 ذخیره در فایل")).size(11.0)).clicked() {
+                            if ui.button(egui::RichText::new(format!("{} {}", ic::FLOPPY_DISK, format_persian_display("ذخیره در فایل"))).size(11.0)).clicked() {
                                 if let Ok(dict) = self.dictionary.read() {
                                     if dict.save_to_file().is_ok() {
                                         self.dict_msg = Some((
@@ -711,7 +758,7 @@ impl OverlayApp {
                                 }
                             }
 
-                            if ui.button(egui::RichText::new(format_persian_display("📝 ویرایش در Notepad")).size(11.0)).clicked() {
+                            if ui.button(egui::RichText::new(format!("{} {}", ic::NOTE_PENCIL, format_persian_display("ویرایش در Notepad"))).size(11.0)).clicked() {
                                 if let Ok(dict) = self.dictionary.read() {
                                     if let Some(path) = dict.file_path() {
                                         #[cfg(windows)]
@@ -724,7 +771,7 @@ impl OverlayApp {
                                 }
                             }
 
-                            if ui.button(egui::RichText::new(format_persian_display("🔄 بارگذاری مجدد")).size(11.0)).clicked() {
+                            if ui.button(egui::RichText::new(format!("{} {}", ic::ARROWS_CLOCKWISE, format_persian_display("بارگذاری مجدد"))).size(11.0)).clicked() {
                                 if let Ok(mut dict) = self.dictionary.write() {
                                     if dict.reload_from_file().is_ok() {
                                         self.dict_msg = Some((
@@ -1001,7 +1048,7 @@ impl OverlayApp {
                                                     if *kind == "Cloud (Custom)" {
                                                         let del_btn = ui.add(
                                                             egui::Button::new(
-                                                                egui::RichText::new("🗑")
+                                                                egui::RichText::new(ic::TRASH)
                                                                     .size(11.0)
                                                                     .color(egui::Color32::from_rgb(255, 110, 110)),
                                                             )
@@ -1286,7 +1333,8 @@ impl OverlayApp {
                             );
 
                             if !self.history.is_empty() {
-                                if ui.button(egui::RichText::new("📋 کپی همه متن‌ها").size(11.5)).clicked() {
+                                if ui.button(egui::RichText::new(format!("{} {}", ic::CLIPBOARD_TEXT, format_persian_display("کپی همه متن‌ها")))
+                                            .size(11.5)).clicked() {
                                     let all_texts = self.history
                                         .iter()
                                         .map(|h| h.text.as_str())
@@ -1296,7 +1344,11 @@ impl OverlayApp {
                                     self.history_copy_msg = Some(("تمامی متن‌ها در کلیپ‌بورد کپی شدند!".into(), now));
                                 }
 
-                                if ui.button(egui::RichText::new("🗑 پاکسازی").size(11.5).color(egui::Color32::from_rgb(255, 120, 120))).clicked() {
+                                if ui.button(
+                                        egui::RichText::new(format!("{} {}", ic::TRASH_SIMPLE, format_persian_display("پاکسازی")))
+                                            .size(11.5)
+                                            .color(egui::Color32::from_rgb(255, 120, 120)),
+                                    ).clicked() {
                                     self.history.clear();
                                     self.history_copy_msg = Some(("تاریخچه با موفقیت پاک شد.".into(), now));
                                 }
@@ -1375,11 +1427,11 @@ impl OverlayApp {
                                                     );
 
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        if ui.button(egui::RichText::new("🗑").size(11.0)).on_hover_text("حذف این مورد").clicked() {
+                                                        if ui.button(egui::RichText::new(ic::TRASH).size(11.0)).on_hover_text("حذف این مورد").clicked() {
                                                             delete_idx = Some(idx);
                                                         }
 
-                                                        let copy_btn = ui.button(egui::RichText::new("📋 کپی متن").size(11.5));
+                                                        let copy_btn = ui.button(egui::RichText::new(format!("{} {}", ic::COPY, format_persian_display("کپی متن"))).size(11.5));
                                                         if copy_btn.clicked() {
                                                             hist_ctx.copy_text(item.text.clone());
                                                             self.history_copy_msg = Some(("متن در کلیپ‌بورد کپی شد!".into(), now));
@@ -1410,46 +1462,88 @@ impl OverlayApp {
             },
         );
     }
-    /// Renders a dedicated, sleek 10-second floating toast preview window positioned right below the main capsule.
-    fn render_preview_toast_window(&mut self, ctx: &egui::Context) {
-        let (Some(ref display_text), Some(start)) = (&self.toast_display, self.toast_start) else {
-            return;
-        };
+    /// Builds a dark OmniType notification card for a transcript.
+    fn make_toast(display: String, remaining_secs: u64, lifetime: Duration) -> Toast {
+        let mut toast = Toast::basic(toast_caption(&display, remaining_secs));
+        toast.set_duration(Some(lifetime));
+        toast.set_closable(true);
+        toast.set_show_progress_bar(true);
+        toast.set_level(ToastLevel::Custom(ic::MICROPHONE.to_string(), TOAST_ACCENT));
+        toast
+    }
 
+    /// Keeps the numeric 10-second countdown on the cards ticking. egui-notify
+    /// freezes captions at enqueue time, so once per second (when a digit
+    /// changes) a freshened toast is appended while the stale one is dismissed
+    /// mid fade-out — a sub-second shimmer at the bottom of the stack.
+    fn refresh_toast_countdowns(&mut self, now: Instant) {
+        let mut stale: Vec<(usize, u64)> = Vec::new();
+        for (seq, _, shown_at, rendered) in self.live_toasts.iter_mut() {
+            let elapsed = now.duration_since(*shown_at).as_secs().min(TOAST_TOTAL_SECS);
+            let remaining = TOAST_TOTAL_SECS.saturating_sub(elapsed);
+            if *rendered != remaining {
+                *rendered = remaining;
+                stale.push((*seq, remaining));
+            }
+        }
+        for (seq, remaining) in stale {
+            let Some(entry) = self.live_toasts.iter().rev().find(|item| item.0 == seq) else {
+                continue;
+            };
+            let raw = entry.1.clone();
+            let display = format_persian_display(&raw);
+            let toast = Self::make_toast(
+                display,
+                remaining,
+                Duration::from_secs(remaining + 1), // outlive until the next refresh
+            );
+            self.toasts.add(toast);
+            self.toasts.dismiss_oldest_toast();
+        }
+    }
+
+    /// Shows the toast preview window. The OS window itself is a bare glass
+    /// host (`OmniType_Preview`, so DWM corner clipping keeps working); the
+    /// notifications inside are fully managed by `egui_notify::Toasts` —
+    /// slide-in animation, dark card, live countdown, progress bar and ✕.
+    fn render_preview_toast_window(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        let elapsed = now.duration_since(start);
-        if elapsed >= Duration::from_secs(10) {
-            self.toast_start = None;
-            self.toast_text = None;
-            self.toast_display = None;
+
+        // Mirror the library's 10 s lifetime locally: every card's mirror
+        // entry is anchored to its first version's enqueue time, so the FIFO
+        // and the library queue stay in step. The extra 0.4 s covers the
+        // slide-out animation before the host window closes.
+        while let Some((_, _, shown_at, _)) = self.live_toasts.front() {
+            if now.duration_since(*shown_at) >= Duration::from_millis(10_400) {
+                self.live_toasts.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.refresh_toast_countdowns(now);
+        if self.live_toasts.is_empty() {
             return;
         }
 
-        let remaining_secs = 10_u64.saturating_sub(elapsed.as_secs()).max(1);
-
-        // Position directly above the docked capsule at the bottom
+        // Position directly above the docked capsule at the bottom.
         let main_rect = ctx.input(|i| i.viewport().outer_rect);
         let (pos_x, pos_y) = if let Some(rect) = main_rect {
-            ((rect.center().x - 160.0).round(), (rect.min.y - 98.0).round())
+            // Anchor the host's *bottom edge* just above the capsule so the
+            // newest card (drawn at the viewport's BottomRight) hugs it.
+            (
+                (rect.center().x - 190.0).round(),
+                (rect.min.y - TOAST_HOST_HEIGHT - 8.0).round(),
+            )
         } else {
             (100.0, 100.0)
         };
-
-        let mut dismiss_requested = false;
-        let mut copy_requested = false;
-        let toast_raw = self.toast_text.clone();
-        let is_copied = self
-            .toast_copied
-            .as_ref()
-            .map(|t| now.duration_since(*t) < Duration::from_secs(2))
-            .unwrap_or(false);
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("preview_toast_viewport"),
             egui::ViewportBuilder::default()
                 .with_title("OmniType_Preview")
                 .with_position([pos_x, pos_y])
-                .with_inner_size([320.0, 90.0])
+                .with_inner_size([380.0, TOAST_HOST_HEIGHT])
                 .with_decorations(false)
                 .with_transparent(true)
                 .with_always_on_top()
@@ -1458,136 +1552,24 @@ impl OverlayApp {
                 #[cfg(windows)]
                 apply_window_shapes_all();
 
-                if toast_ctx.input(|i| i.viewport().close_requested()) {
-                    dismiss_requested = true;
+                // A plain release inside the preview copies the newest
+                // transcript (in practice the card under the pointer); the
+                // library ✕ still dismisses through its own hit-test.
+                if toast_ctx.input(|i| i.pointer.primary_released()) {
+                    if let Some((_, raw, _, _)) = self.live_toasts.back() {
+                        toast_ctx.copy_text(raw.clone());
+                    }
                 }
 
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(20, 24, 34))
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                egui::Color32::from_rgba_unmultiplied(100, 160, 240, 80),
-                            ))
-                            .rounding(egui::Rounding::same(12.0))
-                            .inner_margin(egui::Margin::symmetric(10.0, 7.0)),
-                    )
-                    .show(toast_ctx, |ui| {
-                        // ── Top Header Row ──
-                        ui.horizontal(|ui| {
-                            let (mic_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                            paint_vector_mic(ui.painter(), mic_rect, egui::Color32::from_rgb(140, 195, 255));
-
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(format_persian_display("متن آماده شده"))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(170, 215, 255)),
-                            );
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                // Close button with vector cross
-                                let (close_rect, close_resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                                let close_hover = close_resp.hovered();
-                                let bg_color = if close_hover {
-                                    egui::Color32::from_rgba_unmultiplied(75, 35, 42, 220)
-                                } else {
-                                    egui::Color32::from_rgba_unmultiplied(45, 52, 70, 180)
-                                };
-                                ui.painter().rect_filled(close_rect, egui::Rounding::same(3.0), bg_color);
-                                let cross_color = if close_hover {
-                                    egui::Color32::from_rgb(255, 130, 130)
-                                } else {
-                                    egui::Color32::from_rgb(200, 210, 225)
-                                };
-                                paint_vector_cross(ui.painter(), close_rect, egui::Stroke::new(1.3_f32, cross_color));
-                                if close_resp.clicked() {
-                                    dismiss_requested = true;
-                                }
-                                let _ = close_resp
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text("بستن پیش‌نمایش");
-
-                                ui.add_space(2.0);
-
-                                // Copy button
-                                let (copy_label, copy_color) = if is_copied {
-                                    ("کپی شد ✓", egui::Color32::from_rgb(80, 245, 150))
-                                } else {
-                                    ("کپی متن", egui::Color32::from_rgb(160, 215, 255))
-                                };
-                                let copy_btn = ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new(format_persian_display(copy_label))
-                                                .size(9.5)
-                                                .color(copy_color),
-                                        )
-                                        .fill(egui::Color32::from_rgba_unmultiplied(35, 50, 75, 180))
-                                        .rounding(egui::Rounding::same(3.0)),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text("کپی متن در کلیپ‌بورد");
-                                if copy_btn.clicked() {
-                                    copy_requested = true;
-                                }
-
-                                ui.add_space(4.0);
-
-                                // 10-second countdown pill badge
-                                let count_str = format!("{remaining_secs}s");
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgba_unmultiplied(35, 42, 58, 200))
-                                    .rounding(egui::Rounding::same(4.0))
-                                    .inner_margin(egui::Margin::symmetric(5.0, 1.0))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(count_str)
-                                                .size(9.0)
-                                                .color(egui::Color32::from_rgb(255, 200, 100)),
-                                        );
-                                    });
-                            });
-                        });
-
-                        ui.add_space(3.0);
-
-                        // ── Body: Scrollable Persian text ──
-                        egui::ScrollArea::vertical()
-                            .max_height(48.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let text_resp = ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(display_text)
-                                            .size(11.5)
-                                            .color(egui::Color32::from_rgb(240, 245, 255)),
-                                    )
-                                    .wrap_mode(egui::TextWrapMode::Wrap),
-                                );
-                                if text_resp.clicked() {
-                                    copy_requested = true;
-                                }
-                                text_resp.on_hover_text("برای کپی سریع کلیک کنید");
-                            });
+                    .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
+                    .show(toast_ctx, |_ui| {
+                        let original = apply_toast_style(toast_ctx);
+                        self.toasts.show(toast_ctx);
+                        restore_toast_style(toast_ctx, original);
                     });
             },
         );
-
-        if copy_requested {
-            if let Some(ref raw) = toast_raw {
-                ctx.copy_text(raw.clone());
-                self.toast_copied = Some(now);
-            }
-        }
-
-        if dismiss_requested {
-            self.toast_start = None;
-            self.toast_text = None;
-            self.toast_display = None;
-        }
     }
 }
 
@@ -1663,10 +1645,9 @@ impl eframe::App for OverlayApp {
                 self.recording_start = Some(now);
                 self.last_seen_transcript = None; // Reset so next utterance can trigger toast
             }
-            // Dismiss toast preview when user starts speaking again
-            self.toast_start = None;
-            self.toast_text = None;
-            self.toast_display = None;
+            // Dismiss toast previews when the user starts speaking again
+            self.live_toasts.clear();
+            self.toasts = new_toast_channel();
         } else {
             self.recording_start = None;
         }
@@ -1676,9 +1657,20 @@ impl eframe::App for OverlayApp {
             let trimmed = raw.trim();
             if !trimmed.is_empty() && self.last_seen_transcript.as_deref() != Some(trimmed) {
                 self.last_seen_transcript = Some(trimmed.to_string());
-                self.toast_display = Some(format_persian_display(trimmed));
-                self.toast_text = Some(trimmed.to_string());
-                self.toast_start = Some(now);
+                let seq = self.next_toast_seq;
+                self.next_toast_seq += 1;
+                self.live_toasts
+                    .push_back((seq, trimmed.to_string(), now, TOAST_TOTAL_SECS));
+
+                // Dark OmniType card: near-white caption with a live 10 s
+                // countdown footer, accent mic glyph, progress bar, ✕.
+                let display = format_persian_display(trimmed);
+                let toast = Self::make_toast(
+                    display,
+                    TOAST_TOTAL_SECS,
+                    Duration::from_secs(TOAST_TOTAL_SECS),
+                );
+                self.toasts.add(toast);
 
                 let time_now = local_time_str();
                 let active_engine_str = self.router.active_engine();
@@ -1699,15 +1691,6 @@ impl eframe::App for OverlayApp {
 
                 #[cfg(windows)]
                 apply_window_shapes_all();
-            }
-        }
-
-        // Auto-dismiss toast preview after exactly 10 seconds
-        if let Some(start) = self.toast_start {
-            if now.duration_since(start) >= Duration::from_secs(10) {
-                self.toast_start = None;
-                self.toast_text = None;
-                self.toast_display = None;
             }
         }
 
@@ -1897,7 +1880,7 @@ impl eframe::App for OverlayApp {
                                     ui.painter().text(
                                         hist_rect.center(),
                                         egui::Align2::CENTER_CENTER,
-                                        "H",
+                                        ic::CLOCK_COUNTER_CLOCKWISE,
                                         egui::FontId::proportional(10.0),
                                         egui::Color32::from_rgb(170, 230, 210),
                                     );
@@ -2096,6 +2079,20 @@ mod tests {
         assert!(!formatted.is_empty());
         // Reshaped Persian does not stay identical to raw input (contains contextual presentation forms)
         assert_ne!(formatted, input);
+    }
+
+    #[test]
+    fn test_toast_caption_wraps_and_appends_countdown() {
+        let short = toast_caption("Hello", 10);
+        assert_eq!(short, format!("Hello\n\n{} 10s", ic::TIMER));
+
+        // Long text: wrapped to 3 lines of 44 chars, then ellipsis + footer.
+        let long_text = "x".repeat(200);
+        let long = toast_caption(&long_text, 7);
+        let body_lines = long.lines().count() - 2; // minus blank + footer
+        assert_eq!(body_lines, 3);
+        assert!(long.contains('…'));
+        assert!(long.ends_with(" 7s"));
     }
 
     #[test]

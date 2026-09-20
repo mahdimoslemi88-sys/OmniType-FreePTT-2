@@ -1410,6 +1410,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-notify"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0c6c49d9c02771e28f3b40289c16b4473308807b1ed09a878713d7f11e3dcad"
+dependencies = [
+ "egui",
+]
+
+[[package]]
+name = "egui-phosphor"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7198d3a35fbe756a3daa10a98942159f70dce10d5f2f9ccdb11d242d3bf2fa47"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5420,6 +5438,8 @@ dependencies = [
  "cpal",
  "criterion",
  "eframe",
+ "egui-notify",
+ "egui-phosphor",
  "flacenc",
  "futures-util",
  "ndarray",

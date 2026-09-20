@@ -14,8 +14,10 @@ use voice_ptt::vad::{Endpoint, SileroVad, VadConfig};
 fn load_speech_fixture() -> Option<Vec<f32>> {
     let raw = std::fs::read("assets/test-speech-16k.f32").ok()?;
     Some(
-        raw.chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect(),
     )
 }

@@ -360,6 +360,11 @@ pub fn run() -> Result<()> {
                     .or_default()
                     .push("segoe_ui_symbol".to_owned());
             }
+            // Phosphor icon font — appended to the *same* definitions so it
+            // joins the fallback chain after Segoe UI: glyphs missing from the
+            // system fonts (the PUA icon codepoints) resolve to it, while
+            // Persian coverage from Segoe UI stays intact.
+            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
             cc.egui_ctx.set_fonts(fonts);
 
             Ok(Box::new(OverlayApp::new(

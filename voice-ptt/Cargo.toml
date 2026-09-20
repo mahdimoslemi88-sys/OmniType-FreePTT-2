@@ -67,6 +67,12 @@ windows = { version = "0.58", features = [
 tray-icon = "0.14"
 eframe = "0.28"
 
+# Ready-made egui components (pinned to the egui 0.28-compatible releases):
+# - phosphor icons replace the hand-drawn vector glyphs and emoji buttons
+# - egui-notify provides the animated toast notifications
+egui-phosphor = "0.6"
+egui-notify = "0.15"
+
 [features]
 default = ["silero-vad"]
 silero-vad = ["dep:ort"]
