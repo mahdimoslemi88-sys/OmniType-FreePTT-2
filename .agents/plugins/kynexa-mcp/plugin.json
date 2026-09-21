@@ -1,0 +1,6 @@
+{
+  "name": "kynexa-mcp",
+  "version": "1.0.0",
+  "description": "Project-scoped Model Context Protocol (MCP) server suite for Kynexa-Aitco Enterprise AI Platform. Provides strictly local tools for filesystem governance, git status, documentation index sync, C4 diagrams, DocAI PDF triage, SQLite database queries, CRM API contract verification, safe localhost UI testing, Macro-F1 model evaluation, and security PII auditing.",
+  "author": "Kynexa Architecture Team"
+}

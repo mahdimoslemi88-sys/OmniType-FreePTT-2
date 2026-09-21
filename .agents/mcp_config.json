@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "kynexa-filesystem": {
+      "command": "python",
+      "args": ["tools/mcp/server_filesystem.py"],
+      "cwd": "C:\\Users\\LENOVO LOQ\\Desktop\\projects\\Kynexa-Aitco",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-docai": {
+      "command": "python",
+      "args": ["tools/mcp/server_docai.py"],
+      "cwd": "C:\\Users\\LENOVO LOQ\\Desktop\\projects\\Kynexa-Aitco",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-eval": {
+      "command": "python",
+      "args": ["tools/mcp/server_eval.py"],
+      "cwd": "C:\\Users\\LENOVO LOQ\\Desktop\\projects\\Kynexa-Aitco",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-database": {
+      "command": "python",
+      "args": ["tools/mcp/server_database.py"],
+      "cwd": "C:\\Users\\LENOVO LOQ\\Desktop\\projects\\Kynexa-Aitco",
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

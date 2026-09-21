@@ -1,0 +1,94 @@
+{
+  "mcpServers": {
+    "kynexa-filesystem": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_filesystem.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-git": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_git.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-docs": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_docs.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-diagram": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_diagram.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-docai": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_docai.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-database": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_database.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-api": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_api.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-browser": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_browser.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-eval": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_eval.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    "kynexa-security": {
+      "disabled": true,
+      "command": "python",
+      "args": ["tools/mcp/server_security.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
