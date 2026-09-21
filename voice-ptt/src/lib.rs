@@ -36,6 +36,64 @@ use crate::state::machine::AppServices;
 use crate::state::StateMachine;
 use crate::vad::{AnyVad, VadConfig};
 
+/// Prevents a second instance from racing the first on model downloads
+/// (`.part` file corruption) and text injection (every dictation typed
+/// twice). On Windows this is a named mutex held for the process lifetime;
+/// the second instance shows a short message and exits. Other platforms
+/// are unaffected.
+#[cfg(windows)]
+mod single_instance {
+    use anyhow::{Context, Result};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_OK,
+    };
+
+    /// Owns the instance mutex; dropping it releases the instance.
+    pub struct Guard(HANDLE);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub fn acquire() -> Result<Guard> {
+        const NAME: &str = "Local\\OmniTypeFreePTT.SingleInstance";
+        let wide: Vec<u16> = NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
+            .context("failed to create single-instance mutex")?;
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // Tell the user why "nothing happened" instead of exiting blind.
+            const MSG: &str = "OmniType FreePTT is already running.\r\n\
+                Check the system tray for its capsule icon.";
+            let text: Vec<u16> = MSG.encode_utf16().chain(std::iter::once(0)).collect();
+            let title: Vec<u16> = "OmniType FreePTT".encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                let _ = MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+            }
+            anyhow::bail!("another instance is already running");
+        }
+        Ok(Guard(handle))
+    }
+}
+
+#[cfg(not(windows))]
+mod single_instance {
+    use anyhow::Result;
+
+    /// No-op guard on non-Windows platforms.
+    pub struct Guard;
+
+    pub fn acquire() -> Result<Guard> {
+        Ok(Guard)
+    }
+}
+
 /// Progress callback that logs download status.
 fn log_progress(phase: &'static str) -> impl Fn(u64, Option<u64>) {
     move |done, total| match total {
@@ -55,6 +113,12 @@ pub fn run() -> Result<()> {
     logging::init(&dirs_or_cwd());
     logging::log_session_start();
 
+    // ---- single instance ------------------------------------------------------
+    // Must come before everything else: two instances would fight over the
+    // model download and inject every dictation twice.
+    let _single_instance = single_instance::acquire()?;
+    tracing::info!("single-instance lock acquired");
+
     // Route native whisper.cpp / ggml stderr logs into `tracing` (and thus
     // into the log file) — plain stderr is invisible in a GUI app.
     logging::install_whisper_log_redirect();
@@ -69,6 +133,11 @@ pub fn run() -> Result<()> {
     logging::stage("settings", &format!("config path: {}", config_path.display()));
 
     // ---- models (the only network access in the app) ----------------------
+    // The model NAME is resolved up front, but the (possibly very large)
+    // whisper model downloads in the BACKGROUND after the tray is up, so a
+    // fresh install is immediately usable (tray, hotkeys, cloud engines)
+    // instead of sitting blind on a multi-hundred-MB fetch. Only the tiny
+    // Silero VAD model is fetched synchronously here.
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let gpu = asr::whisper::detect_gpu();
     let model_name = settings.resolve_model_name(gpu, cores);
@@ -80,32 +149,58 @@ pub fn run() -> Result<()> {
         .build()
         .context("failed to start async runtime")?;
 
-    let (model_path, vad_path) = {
-        let models_dir = paths::resolve_models_dir();
+    #[cfg(feature = "silero-vad")]
+    let vad_path: Option<std::path::PathBuf> = {
         let assets_dir = paths::resolve_assets_dir();
-        tracing::info!(
-            models = %models_dir.display(),
-            assets = %assets_dir.display(),
-            "data directories resolved"
-        );
-        rt.block_on(async move {
-            let model_path =
-                downloader::ensure_model(&models_dir, &model_name, Some(&log_progress("whisper")))
-                    .await
-                    .context("whisper model unavailable (download failed?)");
-            #[cfg(feature = "silero-vad")]
-            let vad_path =
-                downloader::ensure_vad_model(&assets_dir, Some(&log_progress("vad")))
-                    .await
-                    .ok();
-            #[cfg(not(feature = "silero-vad"))]
-            let vad_path: Option<std::path::PathBuf> = None;
-            (model_path, vad_path)
+        tracing::info!(assets = %assets_dir.display(), "assets directory resolved");
+        rt.block_on(async {
+            downloader::ensure_vad_model(&assets_dir, Some(&log_progress("vad")))
+                .await
+                .ok()
         })
     };
-    let model_path = model_path?;
-    tracing::info!(model = %model_path.display(), "whisper model ready");
-    logging::stage("models", "model file ready");
+    #[cfg(not(feature = "silero-vad"))]
+    let vad_path: Option<std::path::PathBuf> = None;
+
+    // ---- tray + hotkeys (before any large download) ---------------------------
+    // Spawned before the whisper download so first-launch users see the tray
+    // right away; the big model streams in behind the UI.
+    let (hk_tx, hk_rx) = std::sync::mpsc::channel::<HotkeyEvent>();
+    let listener = HotkeyListener::spawn(hk_tx)?;
+
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<HotkeyEvent>();
+    let overlay_flag = Arc::new(AtomicBool::new(false));
+    let dict_flag = Arc::new(AtomicBool::new(false));
+    let engine_flag = Arc::new(AtomicBool::new(false));
+    let history_flag = Arc::new(AtomicBool::new(false));
+    let quit_flag = Arc::new(AtomicBool::new(false));
+    let dict_path = paths::resolve_dictionary_path();
+    gui::spawn_tray(
+        events_tx.clone(),
+        overlay_flag.clone(),
+        dict_flag.clone(),
+        engine_flag.clone(),
+        history_flag.clone(),
+        quit_flag.clone(),
+        dict_path.clone(),
+        config_path.clone(),
+    )?;
+
+    // ---- bridge: std channel → tokio channel ---------------------------------
+    let bridge_tx = events_tx.clone();
+    let bridge_overlay = overlay_flag.clone();
+    std::thread::Builder::new()
+        .name("hotkey-bridge".into())
+        .spawn(move || {
+            for ev in hk_rx {
+                if matches!(ev, HotkeyEvent::ToggleOverlay) {
+                    bridge_overlay.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if bridge_tx.send(ev).is_err() {
+                    break; // machine gone → shutting down
+                }
+            }
+        })?;
 
     // ---- audio ------------------------------------------------------------
     let capture_cfg = CaptureConfig {
@@ -142,6 +237,9 @@ pub fn run() -> Result<()> {
     logging::stage("vad", &format!("engine: {vad_kind:?}"));
 
     // ---- ASR --------------------------------------------------------------
+    // The model file may not exist yet on a fresh install: the engine loads
+    // cold and the background task (after the state machine below) hot-reloads
+    // it the moment the download completes.
     let opts = WhisperOptions {
         language: settings.asr.language.clone(),
         beam_size: settings.asr.beam_size,
@@ -149,13 +247,17 @@ pub fn run() -> Result<()> {
         initial_prompt: settings.asr.initial_prompt.clone(),
         translate: false,
     };
+    let models_dir = paths::resolve_models_dir();
+    tracing::info!(models = %models_dir.display(), "models directory resolved");
+    let model_path = models_dir.join(format!("ggml-{model_name}.bin"));
     let whisper = Arc::new(WhisperEngine::load(&model_path, opts));
     let health = asr::AsrEngine::health(whisper.as_ref());
-    tracing::info!(?health, "whisper engine status");
-    if !health.is_available() {
-        tracing::error!("whisper engine failed to load; transcription will error until fixed");
+    let engine_ready = health.is_available();
+    tracing::info!(?health, ready = engine_ready, "whisper engine status");
+    if !engine_ready {
+        tracing::info!("whisper model not loaded yet; background download will hot-reload it");
     }
-    logging::stage("asr", "whisper engine loaded");
+    logging::stage("asr", "whisper engine initialized");
 
     // Engine priority: cloud first (if configured with API key), then Google Free Speech
     // (no key needed, fast online), custom providers, then local whisper as the always-available fallback.
@@ -200,12 +302,11 @@ pub fn run() -> Result<()> {
         )));
     }
 
-    engines.push(whisper);
+    engines.push(whisper.clone());
     let router = AsrRouter::new_with_active(engines, settings.active_engine.clone());
 
     // ---- text processing ---------------------------------------------------
     let normalizer = Arc::new(Normalizer::new());
-    let dict_path = paths::resolve_dictionary_path();
     let dictionary = Arc::new(RwLock::new(Dictionary::load_or_create(&dict_path)));
     tracing::info!(
         rules = dictionary.read().map(|d| d.len()).unwrap_or(0),
@@ -228,44 +329,36 @@ pub fn run() -> Result<()> {
         settings: settings.clone(),
     }));
 
-    // ---- hotkeys -------------------------------------------------------------
-    let (hk_tx, hk_rx) = std::sync::mpsc::channel::<HotkeyEvent>();
-    let listener = HotkeyListener::spawn(hk_tx)?;
+    // ---- hotkeys were registered above (tray-first startup) -------------------
 
-    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<HotkeyEvent>();
-
-    // ---- tray ----------------------------------------------------------------
-    let overlay_flag = Arc::new(AtomicBool::new(false));
-    let dict_flag = Arc::new(AtomicBool::new(false));
-    let engine_flag = Arc::new(AtomicBool::new(false));
-    let history_flag = Arc::new(AtomicBool::new(false));
-    let quit_flag = Arc::new(AtomicBool::new(false));
-    gui::spawn_tray(
-        events_tx.clone(),
-        overlay_flag.clone(),
-        dict_flag.clone(),
-        engine_flag.clone(),
-        history_flag.clone(),
-        quit_flag.clone(),
-        dict_path,
-        config_path.clone(),
-    )?;
-
-    // ---- bridge: std channel → tokio channel ---------------------------------
-    let bridge_tx = events_tx.clone();
-    let bridge_overlay = overlay_flag.clone();
-    std::thread::Builder::new()
-        .name("hotkey-bridge".into())
-        .spawn(move || {
-            for ev in hk_rx {
-                if matches!(ev, HotkeyEvent::ToggleOverlay) {
-                    bridge_overlay.store(true, std::sync::atomic::Ordering::Relaxed);
+    // ---- whisper model: background download + hot reload ----------------------
+    // The tray and hotkeys are already live (see the tray-first startup), so
+    // a first launch never sits blind on a multi-hundred-MB download. Cloud
+    // engines (Google Free Speech etc.) serve transcriptions meanwhile; the
+    // local engine is hot-swapped the moment the model file completes.
+    if !engine_ready {
+        let engine = whisper.clone();
+        let models_dir = models_dir.clone();
+        let model_name = model_name.clone();
+        rt.spawn(async move {
+            let progress_cb = log_progress("whisper");
+            match downloader::ensure_model(&models_dir, &model_name, Some(&progress_cb)).await {
+                Ok(path) => {
+                    if engine.reload(&path) {
+                        tracing::info!(
+                            model = %path.display(),
+                            "whisper model ready (background download)"
+                        );
+                        logging::stage("models", "model file ready");
+                    }
                 }
-                if bridge_tx.send(ev).is_err() {
-                    break; // machine gone → shutting down
-                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "whisper model download failed; local engine stays offline (cloud engines still work)"
+                ),
             }
-        })?;
+        });
+    }
 
     // ---- run the state machine ------------------------------------------------
     {

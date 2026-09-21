@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -49,34 +49,67 @@ impl Default for WhisperOptions {
 }
 
 /// Local whisper.cpp engine. Cheap to clone (Arc'd context).
-#[derive(Clone)]
 pub struct WhisperEngine {
-    context: Option<Arc<WhisperContext>>,
-    model_path: PathBuf,
+    context: RwLock<Option<Arc<WhisperContext>>>,
+    model_path: RwLock<PathBuf>,
     opts: WhisperOptions,
     active_transcriptions: Arc<AtomicUsize>,
-    load_error: Option<String>,
+    load_error: RwLock<Option<String>>,
+}
+
+impl Clone for WhisperEngine {
+    fn clone(&self) -> Self {
+        Self {
+            context: RwLock::new(
+                self.context.read().expect("context lock poisoned").clone(),
+            ),
+            model_path: RwLock::new(self.model_path().clone()),
+            opts: self.opts.clone(),
+            active_transcriptions: self.active_transcriptions.clone(),
+            load_error: RwLock::new(
+                self.load_error.read().expect("load_error lock poisoned").clone(),
+            ),
+        }
+    }
 }
 
 impl WhisperEngine {
     /// Loads a ggml model file. Returns an engine with `health() == NoModel`
     /// semantics via `load_error` when loading fails, so the router can
-    /// degrade gracefully instead of crashing.
+    /// degrade gracefully instead of crashing. The engine also starts cold
+    /// (`load_error = Some("model file not present yet …")`) when the file
+    /// does not exist — a background download can then hot-reload it with
+    /// [`WhisperEngine::reload`] once it completes.
     pub fn load(model_path: &Path, opts: WhisperOptions) -> Self {
+        if !model_path.is_file() {
+            tracing::info!(
+                model = %model_path.display(),
+                "model file not present yet; engine starts cold and will hot-reload after download"
+            );
+            return Self {
+                context: RwLock::new(None),
+                model_path: RwLock::new(model_path.to_path_buf()),
+                opts,
+                active_transcriptions: Arc::new(AtomicUsize::new(0)),
+                load_error: RwLock::new(Some(
+                    "model file not present yet (background download pending)".into(),
+                )),
+            };
+        }
         match Self::load_inner(model_path) {
             Ok(context) => Self {
-                context: Some(context),
-                model_path: model_path.to_path_buf(),
+                context: RwLock::new(Some(context)),
+                model_path: RwLock::new(model_path.to_path_buf()),
                 opts,
                 active_transcriptions: Arc::new(AtomicUsize::new(0)),
-                load_error: None,
+                load_error: RwLock::new(None),
             },
             Err(e) => Self {
-                context: None,
-                model_path: model_path.to_path_buf(),
+                context: RwLock::new(None),
+                model_path: RwLock::new(model_path.to_path_buf()),
                 opts,
                 active_transcriptions: Arc::new(AtomicUsize::new(0)),
-                load_error: Some(format!("{e:#}")),
+                load_error: RwLock::new(Some(format!("{e:#}"))),
             },
         }
     }
@@ -93,8 +126,27 @@ impl WhisperEngine {
         Ok(Arc::new(ctx))
     }
 
-    pub fn model_path(&self) -> &Path {
-        &self.model_path
+    /// Swaps in a freshly downloaded model without restarting the app. In-flight
+    /// transcriptions keep their `Arc` to the old context; the next utterance
+    /// uses the new one. Returns whether the model actually loaded.
+    pub fn reload(&self, model_path: &Path) -> bool {
+        match Self::load_inner(model_path) {
+            Ok(context) => {
+                *self.model_path.write().expect("model_path lock poisoned") =
+                    model_path.to_path_buf();
+                *self.context.write().expect("context lock poisoned") = Some(context);
+                *self.load_error.write().expect("load_error lock poisoned") = None;
+                true
+            }
+            Err(e) => {
+                tracing::error!(model = %model_path.display(), error = %e, "model reload failed");
+                false
+            }
+        }
+    }
+
+    pub fn model_path(&self) -> PathBuf {
+        self.model_path.read().expect("model_path lock poisoned").clone()
     }
 
     /// Number of transcriptions currently running (for the overlay).
@@ -105,8 +157,11 @@ impl WhisperEngine {
     fn transcribe_blocking(&self, audio: &AudioUtterance) -> Result<String> {
         let context = self
             .context
+            .read()
+            .expect("context lock poisoned")
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("whisper model not loaded"))?;
+            .ok_or_else(|| anyhow::anyhow!("whisper model not loaded"))?
+            .clone();
 
         let samples = &audio.samples;
         if samples.is_empty() {
@@ -173,7 +228,9 @@ impl AsrEngine for WhisperEngine {
     }
 
     fn health(&self) -> AsrHealth {
-        match (&self.context, &self.load_error) {
+        let ctx = self.context.read().expect("context lock poisoned");
+        let err = self.load_error.read().expect("load_error lock poisoned");
+        match (&*ctx, &*err) {
             (Some(_), _) => AsrHealth::Ready,
             (None, Some(e)) => AsrHealth::Failed {
                 reason: e.clone(),
@@ -261,5 +318,25 @@ mod tests {
             sample_rate: 16_000,
         };
         assert!(AsrEngine::transcribe(&engine, &utt).is_err());
+    }
+
+    #[test]
+    fn cold_engine_hot_reloads_when_model_appears() {
+        let dir = std::env::temp_dir().join("voice-ptt-whisper-hotreload");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.bin");
+
+        // Start cold (file absent).
+        let engine = WhisperEngine::load(&path, WhisperOptions::default());
+        assert!(!engine.health().is_available());
+
+        // Still cold even though the path now exists but is empty/invalid.
+        std::fs::write(&path, b"not a ggml model").unwrap();
+        assert!(!engine.health().is_available());
+
+        // A failed reload keeps the engine cold and doesn't panic.
+        assert!(!engine.reload(&path));
+        assert!(!engine.health().is_available());
     }
 }
