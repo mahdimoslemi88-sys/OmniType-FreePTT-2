@@ -1,12 +1,17 @@
 # egui-notify PR package
 
 Target repo: `ItsEthra/egui-notify` — branch `main` @ `18ac220` (v0.23.0, egui 0.36).
-Local clone: `C:\Users\<you>\AppData\Local\Temp\egui-notify` (branch `feature/toast-max-width`).
+Local clone: `C:\Users\LENOVO LOQ\AppData\Local\Temp\egui-notify` (branch `feature/toast-max-width`).
+
+> **Status**: upstream issue opened first — [#54](https://github.com/ItsEthra/egui-notify/issues/54)
+> (2026-09-21, via `gh`, account `mahdimoslemi88-sys`). Link the PR to it with `Fixes #54`;
+> adjust naming/formula to the maintainer's answers before submitting.
 
 ## Contents of this folder
 
 | File | What it is |
 |---|---|
+| `ISSUE.md` | Issue draft (already opened as #54) + submission checklist |
 | `toast-max-width.patch` | `git diff` of the two-file change (lib.rs, toast.rs) — applies cleanly on pristine `main` (verified with `git apply --check`) |
 | `examples/toast_width_cap.rs` | Demo example; compiles against the patched crate (`cargo check --example toast_width_cap` ✅) |
 | `PR.md` | This document |
@@ -92,22 +97,26 @@ workarounds keep working.
   the builder.
 
 Fixes the "no way to limit toast width" gap left by the 0.19 auto-width
-rework.
+rework. Follows up on #54 (design discussion).
 ```
 
 ## Copy-paste commands
 
 ```bash
-# 1. Fork https://github.com/ItsEthra/egui-notify on GitHub (web UI), then:
+# `gh` is already authenticated as mahdimoslemi88-sys on this machine.
 
-# 2. Use the ready branch in the local clone
+# 1. Fork (creates the fork and adds a git remote named `fork`):
 cd /tmp/egui-notify   # %LOCALAPPDATA%\Temp\egui-notify
-git checkout feature/toast-max-width
-git remote add fork https://github.com/<USERNAME>/egui-notify.git
+gh repo fork ItsEthra/egui-notify --remote
+
+# 2. Push the ready branch:
 git push -u fork feature/toast-max-width
 
-# 3. Open the PR
-# https://github.com/ItsEthra/egui-notify/compare/main...<USERNAME>:egui-notify:feature/toast-copy
+# 3. Open the PR (body-file = the markdown block in this document):
+gh pr create --repo ItsEthra/egui-notify \
+  --head mahdimoslemi88-sys:feature/toast-max-width \
+  --title "Add optional toast width cap: Toasts::with_max_width / Toast::max_width" \
+  --body-file /tmp/egui-notify-pr-body.md
 ```
 
 ## Submission guide (فارسی)
@@ -125,10 +134,10 @@ git push -u fork feature/toast-max-width
 
 ### گام‌های ارسال
 
-1. **فورک کنید**: در گیت‌هاب، مخزن `ItsEthra/egui-notify` را فورک کنید.
-2. **پوش کند**: از کلون آمادهٔ `/tmp/egui-notify` (شاخهٔ `feature/toast-max-width`) — دستورها در بخش «Copy-paste commands» بالاست. نام‌کاربری گیت‌هاب خود را جای `<USERNAME>` بگذارید.
-3. **PR باز کنید**: لینک compare در همان بخش؛ عنوان و بدنه از `PR.md` کپی شود. بدنه به انگلیسی نوشته شده چون زبان رسمی بالادست است.
-4. **جایگزین سریع بدون PR** (اگر منتظر مرج شدن نمی‌مانید): همان پچ را به‌عنوان `[patch.crates-io]` در `Cargo.toml` اصلی OmniType بیاورید (نیاز به پچ داخل `v-2` دارد)؛ این مسیر کوتاه‌مدت است و PR مسیر بلندمدت.
+0. ✅ **Issue باز شد**: [#54](https://github.com/ItsEthra/egui-notify/issues/54) — منتظر بازخورد maintainer روی ۴ سؤال طراحی (نام‌گذاری، سطح per-toast، پیش‌فرض، فرمول wrap).
+1. **فورک + پوش**: دستورهای بخش «Copy-paste commands» (با `gh` احرازشده، نیازی به تنظیم دستی ریموت نیست).
+2. **PR باز کنید**: عنوان و بدنه از `PR.md` — بدنه به انگلیسی است چون زبان رسمی بالادست است؛ `Fixes #54` داخل بدنه هست.
+3. **جایگزین سریع بدون PR** (اگر منتظر مرج شدن نمی‌مانید): همان پچ را به‌عنوان `[patch.crates-io]` در `Cargo.toml` اصلی OmniType بیاورید؛ این مسیر کوتاه‌مدت است و PR مسیر بلندمدت.
 
 ### نکتهٔ نهایی
 
