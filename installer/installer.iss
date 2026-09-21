@@ -1,6 +1,9 @@
 ; Inno Setup 6 script for OmniType FreePTT (voice-ptt)
 ; Build:  ISCC.exe installer.iss   →  Output\OmniType-FreePTT-<ver>-setup.exe
-; Source layout is the release dist folder (../voice-ptt-dist).
+; A LIGHT setup (~35 MB): the app only. Whisper models are NOT bundled —
+; the wizard downloads the selected model with progress + SHA-256
+; verification, and if the user skips that, the app downloads a model on
+; first launch. For offline media, use the voice-ptt-dist folder directly.
 
 #define MyAppName "OmniType FreePTT"
 #define MyAppVersion "0.1.0"
@@ -36,36 +39,22 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
 Name: "autostart"; Description: "Start OmniType FreePTT when Windows starts"; \
     GroupDescription: "Startup:"; Flags: unchecked
 
-[Types]
-Name: "full"; Description: "Full installation (includes the large model)"
-Name: "compact"; Description: "Compact installation (base model only)"
-Name: "custom"; Description: "Custom"; Flags: iscustom
-
-[Components]
-Name: "core"; Description: "OmniType FreePTT (app, DirectML, VAD asset, dictionary)"; \
-    Types: full compact custom; Flags: fixed
-Name: "models/base"; Description: "Whisper base model (~141 MB) — fast, English+multilingual"; \
-    Types: full compact
-Name: "models/large"; Description: "Whisper large-v3-turbo model (~1.5 GB) — highest accuracy"; \
-    Types: full
-
 [Files]
-Source: "{#DistRoot}\{#MyAppExeName}"; DestDir: "{app}"; \
-    Flags: ignoreversion; Components: core
-Source: "{#DistRoot}\DirectML.dll"; DestDir: "{app}"; \
-    Flags: ignoreversion; Components: core
-Source: "{#DistRoot}\icon.ico"; DestDir: "{app}"; \
-    Flags: ignoreversion; Components: core
+; App payload — the entire light setup (~35 MB).
+Source: "{#DistRoot}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#DistRoot}\DirectML.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#DistRoot}\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistRoot}\dictionary.toml"; DestDir: "{app}"; \
-    Flags: ignoreversion onlyifdoesntexist; Components: core
-Source: "{#DistRoot}\README-TEST.md"; DestDir: "{app}"; \
-    Flags: ignoreversion; Components: core
-Source: "{#DistRoot}\assets\silero_vad.onnx"; DestDir: "{app}\assets"; \
-    Flags: ignoreversion; Components: core
-Source: "{#DistRoot}\models\ggml-base.bin"; DestDir: "{app}\models"; \
-    Flags: ignoreversion; Components: models/base
-Source: "{#DistRoot}\models\ggml-large-v3-turbo.bin"; DestDir: "{app}\models"; \
-    Flags: ignoreversion; Components: models/large
+    Flags: ignoreversion onlyifdoesntexist
+Source: "{#DistRoot}\README-TEST.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#DistRoot}\assets\silero_vad.onnx"; DestDir: "{app}\assets"; Flags: ignoreversion
+; Whisper models downloaded in-wizard (see [Code]) into {tmp}, then copied
+; here — the app resolves models exe-first, so {app}\models wins. Same URLs
+; and hashes as the app's own downloader (asr/downloader.rs).
+Source: "{tmp}\ggml-base.bin"; DestDir: "{app}\models"; \
+    Flags: external ignoreversion; Check: ModelWanted('base')
+Source: "{tmp}\ggml-large-v3-turbo.bin"; DestDir: "{app}\models"; \
+    Flags: external ignoreversion; Check: ModelWanted('large')
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -76,9 +65,9 @@ Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; \
     Tasks: autostart
 
 [Run]
-; The finished-page launch checkbox is the bootstrap trigger: the custom
-; "Model Preparation" page pre-ticks it, and the app itself downloads the
-; missing Whisper model on first startup.
+; Launch checkbox on the finished page: launching the app right after
+; install also exercises its first-launch model download when the user
+; chose "None" on the model page.
 Filename: "{app}\{#MyAppExeName}"; \
     Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; \
     Flags: nowait postinstall skipifsilent runasoriginaluser
@@ -95,60 +84,130 @@ Type: files; Name: "{app}\DirectML.dll"
 
 [Messages]
 WelcomeLabel2=This will install [name/ver] on your computer.%n%nAn offline, push-to-talk voice typing tool: hold the hotkey, speak, release, and the text is typed into any app.%n%nIt is recommended that you close all other applications before continuing.
-SelectComponentsLabel2=Which Whisper model should be installed?%n%nYou can skip both and download models later from inside the app; a model installed here works immediately, fully offline.
 SelectTasksLabel2=Which additional shortcuts should be created?%n%n"Start when Windows starts" makes the push-to-talk capsule available right after login.
 FinishedHeadingLabel=[name] has been installed
 FinishedLabelNoIcons=[name] has been installed on your computer.%n%nHold the hotkey (CapsLock by default) anywhere, speak, then release to type your text.
 FinishedLabel=[name] has been installed on your computer.%n%nHold the hotkey (CapsLock by default) anywhere, speak, then release to type your text.
 
 [Code]
-var
-  ModelPrepPage: TInputOptionWizardPage;
-  // Zero-initialized (False): silent installs never auto-launch anything.
-  BootstrapLaunchWanted: Boolean;
+const
+  // Same URLs the app's own downloader uses (asr/downloader.rs), so a
+  // model fetched here is byte-identical to one the app would fetch.
+  ModelBaseURL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/';
+  // SHA-256 of each model, computed from the packaged dist files
+  // (byte-identical to the HuggingFace artifacts).
+  BaseSHA256 = '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe';
+  LargeSHA256 = '1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69';
 
-function NoModelsSelected: Boolean;
+var
+  ModelPage: TInputOptionWizardPage;
+  DLPage: TDownloadWizardPage;
+
+// Writes {app}\config.toml pinning the model chosen on the wizard's model
+// page. The app resolves config exe-first, so this BEATS any pre-existing
+// %APPDATA%\voice-ptt\config.toml — without it the app's default "auto"
+// policy would pick large-v3-turbo on GPU machines and silently download
+// 1.5 GB regardless of what the user picked here. Pure ASCII on purpose:
+// SaveStringsToUTF8File would emit a BOM that Rust's TOML parser rejects.
+procedure WriteModelConfig(ModelName: String);
+var
+  S: String;
 begin
-  Result :=
-    (not WizardIsComponentSelected('models/base')) and
-    (not WizardIsComponentSelected('models/large'));
+  S := '[asr]' #13#10 +
+       'model = "' + ModelName + '"' #13#10 +
+       'language = "fa"' #13#10;
+  SaveStringToFile(S, ExpandConstant('{app}\config.toml'), False);
 end;
 
 procedure InitializeWizard;
 begin
-  // Shown only when the user picked no model: the app downloads its first
-  // Whisper model automatically on startup, so "preparing the model" here
-  // simply means launching the app once after installation.
-  ModelPrepPage := CreateInputOptionPage(wpSelectComponents,
-    'Model Preparation', 'No Whisper model was selected',
-    'OmniType needs one Whisper model to transcribe. None was installed, so on '
-    + 'first launch the app will download it automatically (needs internet; '
-    + 'the base model is ~141 MB, large-v3-turbo is ~1.5 GB).', False, False);
-  ModelPrepPage.Add('&Start OmniType after installation to download the model now');
-  ModelPrepPage.Values[0] := True;
+  // Model choice right after the directory page. "None" leaves the
+  // download to the app's own first-launch logic.
+  ModelPage := CreateInputOptionPage(wpSelectDir,
+    'Which Whisper model?', 'Downloaded during installation',
+    'Pick the speech-recognition model to download now (internet required). '
+    + 'You can also skip this: on first launch the app downloads a model '
+    + 'automatically.', False, False);
+  ModelPage.Add('&Whisper base (~141 MB) — fast, recommended');
+  ModelPage.Add('Whisper &large-v3-turbo (~1.5 GB) — highest accuracy');
+  ModelPage.Add('&None now — the app downloads a model on first launch');
+  ModelPage.Values[0] := True;
+
+  DLPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
+    SetupMessage(msgPreparingDesc), nil);
+  DLPage.ShowBaseNameInsteadOfUrl := True;
 end;
 
-function ShouldSkipPage(PageID: Integer): Boolean;
+// [Files] Check hook: which model entries got downloaded.
+function ModelWanted(Which: String): Boolean;
 begin
-  Result := False;
-  if (PageID = ModelPrepPage.ID) and (not NoModelsSelected) then
-    Result := True;
+  if Which = 'base' then
+    Result := ModelPage.Values[0]
+  else if Which = 'large' then
+    Result := ModelPage.Values[1]
+  else
+    Result := False;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Error: String;
 begin
   Result := True;
-  if CurPageID = ModelPrepPage.ID then
+  if (CurPageID = wpReady) and (not ModelPage.Values[2]) then
   begin
-    BootstrapLaunchWanted := ModelPrepPage.Values[0];
-    if BootstrapLaunchWanted and (WizardForm.RunList.Items.Count > 0) then
-      // Make sure the finished-page launch box is ticked so the download
-      // actually starts when the user clicks Finish.
-      WizardForm.RunList.Checked[0] := True;
+    // Download the chosen model now, with progress + hash verification.
+    // Failure keeps the user on the Ready page to retry or cancel.
+    DLPage.Clear;
+    if ModelPage.Values[0] then
+      DLPage.Add(ModelBaseURL + 'ggml-base.bin', 'ggml-base.bin', BaseSHA256);
+    if ModelPage.Values[1] then
+      DLPage.Add(ModelBaseURL + 'ggml-large-v3-turbo.bin',
+        'ggml-large-v3-turbo.bin', LargeSHA256);
+    DLPage.Show;
+    try
+      try
+        DLPage.Download;
+        // Clear any stale partial download left by an earlier interrupted
+        // first launch of the app before it tries the same model itself.
+        DeleteFile(ExpandConstant('{app}\models\ggml-base.part'));
+        DeleteFile(ExpandConstant('{app}\models\ggml-large-v3-turbo.part'));
+        Result := True;
+      except
+        if DLPage.AbortedByUser then
+          Log('Model download aborted by user.')
+        else
+        begin
+          Error := Format('%s: %s', [DLPage.LastBaseNameOrUrl, GetExceptionMessage]);
+          SuppressibleMsgBox(AddPeriod(Error), mbCriticalError, MB_OK, IDOK);
+        end;
+        Result := False;
+      end;
+    finally
+      DLPage.Hide;
+    end;
   end;
 end;
 
-function ModelBootstrapWanted: Boolean;
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  AppConfig: String;
 begin
-  Result := BootstrapLaunchWanted and NoModelsSelected;
+  if CurStep = ssInstall then
+  begin
+    // Only a FRESH install pins the wizard choice: an upgrade must keep
+    // whatever model the user already configured (in {app} or %APPDATA%),
+    // or it would silently switch their model on every update.
+    AppConfig := ExpandConstant('{app}\config.toml');
+    if (not FileExists(AppConfig))
+       and (not FileExists(ExpandConstant('{userappdata}\voice-ptt\config.toml'))) then
+    begin
+      if ModelPage.Values[0] then
+        WriteModelConfig('base')
+      else if ModelPage.Values[1] then
+        WriteModelConfig('large-v3-turbo')
+      else
+        WriteModelConfig('auto');
+    end;
+  end;
 end;
