@@ -10,13 +10,6 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::hotkey::HotkeyEvent;
 
-/// Commands the tray can produce toward the application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayCommand {
-    ToggleOverlay,
-    Quit,
-}
-
 /// Builds the tray and spawns the event-polling thread.
 ///
 /// * `hotkey_tx` — forwarded `Quit` events reach the state machine.
@@ -24,9 +17,8 @@ pub enum TrayCommand {
 /// * `dict_toggle` — set when the user asks to open the dictionary manager GUI.
 /// * `engine_toggle` — set when the user asks to open the AI model/engine manager GUI.
 /// * `history_toggle` — set when the user asks to open the transcript history GUI.
+/// * `settings_toggle` — set when the user asks to open the in-app settings GUI.
 /// * `quit_flag` — set when the user asks to quit (GUI watches it to close).
-/// * `dict_path` — path to dictionary.toml for opening in default editor.
-/// * `config_path` — path to config.toml for opening in default editor.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     hotkey_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
@@ -34,35 +26,32 @@ pub fn spawn(
     dict_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     engine_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     history_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    settings_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     quit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    dict_path: std::path::PathBuf,
-    config_path: std::path::PathBuf,
 ) -> Result<()> {
-    let show_hide = MenuItem::new("Show / Hide overlay", true, None);
-    let history_gui = MenuItem::new("Transcription History (تاریخچه گفتار و کپی)", true, None);
-    let engine_gui = MenuItem::new("AI Models & Engines (مدیریت مدل‌ها)", true, None);
-    let dict_gui = MenuItem::new("Dictionary Manager (واژگان)", true, None);
-    let config_file = MenuItem::new("Open config.toml (تنظیمات)", true, None);
-    let dict_file = MenuItem::new("Open dictionary.toml (فایل دیکشنری)", true, None);
-    let quit = MenuItem::new("Quit", true, None);
+    // Tray labels follow the skill's section-8 contract. Routine config and
+    // dictionary editing happens in the unified dashboard — no external editors.
+    let show_hide = MenuItem::new("Open OmniType (باز کردن پنجره)", true, None);
+    let history_gui = MenuItem::new("Transcription History (تاریخچه گفتار)", true, None);
+    let engine_gui = MenuItem::new("Active Engine — Models (مدیریت مدل‌ها)", true, None);
+    let dict_gui = MenuItem::new("Dictionary (واژگان)", true, None);
+    let settings_gui = MenuItem::new("Settings (تنظیمات)", true, None);
+    let quit = MenuItem::new("Exit completely (خروج کامل)", true, None);
 
     let show_id = show_hide.id().clone();
     let history_gui_id = history_gui.id().clone();
     let engine_gui_id = engine_gui.id().clone();
     let dict_gui_id = dict_gui.id().clone();
-    let config_file_id = config_file.id().clone();
-    let dict_file_id = dict_file.id().clone();
+    let settings_gui_id = settings_gui.id().clone();
     let quit_id = quit.id().clone();
 
     let menu = Menu::new();
     menu.append(&show_hide)?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&history_gui)?;
     menu.append(&engine_gui)?;
     menu.append(&dict_gui)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&config_file)?;
-    menu.append(&dict_file)?;
+    menu.append(&settings_gui)?;
+    menu.append(&history_gui)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
 
@@ -93,22 +82,8 @@ pub fn spawn(
                     engine_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
                 } else if event.id == dict_gui_id {
                     dict_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else if event.id == config_file_id {
-                    #[cfg(windows)]
-                    {
-                        let target = config_path.to_str().unwrap_or("config.toml");
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/C", "start", "", target])
-                            .spawn();
-                    }
-                } else if event.id == dict_file_id {
-                    #[cfg(windows)]
-                    {
-                        let target = dict_path.to_str().unwrap_or("dictionary.toml");
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/C", "start", "", target])
-                            .spawn();
-                    }
+                } else if event.id == settings_gui_id {
+                    settings_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
                 } else if event.id == quit_id {
                     quit_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = hotkey_tx.send(HotkeyEvent::Quit);

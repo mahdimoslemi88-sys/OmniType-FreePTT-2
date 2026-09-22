@@ -1,0 +1,23 @@
+# ==============================================================================
+# Antigravity Subagent Bridge & Definition
+# Canonical Subagent Specification: .agents/agents/omnitype-rust-ui-designer/agent.md
+# ==============================================================================
+
+name: "omnitype-rust-ui-designer"
+display_name: "OmniType Rust UI Designer"
+description: "Specialized Rust desktop UI designer for OmniType FreePTT v2 (egui 0.28 / eframe 0.28), enforcing preview-first design gates, dual-theme palette tokens, in-app settings/dictionary managers, Persian RTL typography, and Windows tray lifecycle."
+
+skills:
+  - "omnitype-rust-ui"
+  - "code-review"
+  - "documentation-standard"
+  - "architecture-review"
+
+interface:
+  display_name: "OmniType Rust UI Designer"
+  short_description: "Preview-first Rust UI design and hardening"
+  default_prompt: "Use $omnitype-rust-ui to design or improve this Rust desktop UI with preview approval, shared design tokens, RTL/accessibility checks, visual regression coverage, and safe tray lifecycle behavior."
+
+policy:
+  allow_implicit_invocation: true
+  canonical_definition: ".agents/agents/omnitype-rust-ui-designer/agent.md"

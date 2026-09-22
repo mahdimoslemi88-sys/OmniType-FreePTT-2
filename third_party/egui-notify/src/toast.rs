@@ -192,6 +192,20 @@ impl Toast {
         self
     }
 
+    /// Replaces the caption in place, without re-triggering the appear
+    /// animation. Used for live-updating captions (e.g. a countdown) that
+    /// must not rebuild the host window or restart the slide-in.
+    pub fn set_caption(&mut self, caption: impl Into<String>) -> &mut Self {
+        self.caption = caption.into();
+        self
+    }
+
+    /// Returns the current caption. Used to match a live toast for an
+    /// in-place caption update.
+    pub fn caption(&self) -> &str {
+        &self.caption
+    }
+
     /// Should a progress bar be shown?
     pub fn set_show_progress_bar(&mut self, show_progress_bar: bool) -> &mut Self {
         self.show_progress_bar = show_progress_bar;

@@ -15,6 +15,7 @@
 | ۱ | `knowledge-engineer` | [`agent.md`](file:///c:/Users/LENOVO%20LOQ/Desktop/projects/Kynexa-Aitco/.agents/agents/knowledge-engineer/agent.md) | `filesystem`, `docs`, `docai`, `database`, `eval` | `rag-design`, `document-ai-pipeline`, `industrial-ontology`, `data-quality-check` | 1.0.0 | 2026-09-12 |
 | ۲ | `platform-architect` | [`agent.md`](file:///c:/Users/LENOVO%20LOQ/Desktop/projects/Kynexa-Aitco/.agents/agents/platform-architect/agent.md) | `filesystem`, `git`, `docs`, `diagram`, `api` | `architecture-review`, `adr-management`, `enterprise-integration`, `product-management` | 1.0.0 | 2026-09-12 |
 | ۳ | `enterprise-product-manager` | [`agent.md`](file:///c:/Users/LENOVO%20LOQ/Desktop/projects/Kynexa-Aitco/.agents/agents/enterprise-product-manager/agent.md) | `filesystem`, `docs`, `git` | `product-management`, `requirement-analysis`, `documentation-standard`, `proposal-generation` | 1.0.0 | 2026-09-12 |
+| ۴ | `omnitype-rust-ui-designer` | [`agent.md`](file:///c:/Users/LENOVO%20LOQ/tools/OmniType-FreePTT/v-2/.agents/agents/omnitype-rust-ui-designer/agent.md) | `filesystem`, `git` | `omnitype-rust-ui`, `code-review`, `documentation-standard`, `architecture-review` | 2.0.0 | 2026-09-21 |
 
 ---
 
@@ -153,18 +154,55 @@
 
 ---
 
-## ۵. ماتریس تفکیک نقش‌ها با سایر عامل‌های پروژه (Role Differentiation)
+## ۵. شناسنامه تفصیلی عامل ۴: `omnitype-rust-ui-designer`
+
+### ۱. مشخصات عمومی (General Information)
+- **نام عامل:** `omnitype-rust-ui-designer`
+- **عنوان سازمانی:** طراح و توسعه‌دهنده تخصصی رابط کاربری دسکتاپ (Rust Desktop UI Designer)
+- **نسخه:** ۲٫۰٫۰
+- **تاریخ ایجاد:** ۳۱ شهریور ۱۴۰۵ (۲۱ سپتامبر ۲۰۲۶)
+- **دامنه فعالیت:** رابط کاربری دسکتاپ ویندوز، پنجره‌های مدیریت درون‌برنامه‌ای، تم دوگانه، وضعیت کپسول شناور و چرخه حیات ترِی در OmniType FreePTT v2.
+
+### ۲. هدف و فلسفه وجودی (Purpose)
+طراحی و پیاده‌سازی رابط کاربری مقاوم، زیبا و سبک دسکتاپ بر پایه `egui 0.28` و `eframe 0.28` با الزام بر اصل «پیش‌نمایش قبل از پیاده‌سازی» (Preview-First Gate)، تضمین پایداری خط و فونت فارسی RTL، و حذف کامل باز شدن فایل‌های پیکربندی در IDE خارجی.
+
+### ۳. مسئولیت‌های کلیدی (Responsibilities)
+1. طراحی و ارائه وایرفریم‌ها و گزینه‌های طراحی در قالب Artifact قبل از هرگونه کدنویسی.
+2. پیاده‌سازی پنجره‌های مدیریتی داخل اپلیکیشن برای تنظیمات (`config.toml`) و دیکشنری (`dictionary.toml`).
+3. توسعه و صیانت از پالت رنگی معنایی `mod palette` و هلپرهای استاندارد کروم در `overlay.rs`.
+4. تضمین تایپوگرافی بدون نقص فارسی، حفظ نیم‌فاصله (`\u{200c}`) و چیدمان عبارات ترکیبی.
+5. مدیریت چرخه حیات تمیز پنجره و ترِی ویندوز با تفکیک پنهان‌سازی از خروج کامل.
+
+### ۴. قوانین حاکم بر رفتار عامل (Governing Rules)
+- **پایبندی به egui/eframe 0.28:** هرگونه تغییر یا پیشنهاد فریم‌ورک ثالث (Slint, Iced, GTK) نیازمند ADR رسمی است.
+- **توقف در گیت پیش‌نمایش:** بدون تایید صریح کاربر بر روی طراحی، کدنویسی آغاز نمی‌شود.
+- **پرهیز از رنگ‌های مستقیم:** تمام رنگ‌ها باید از پالت معنایی فراخوانی شوند.
+
+### ۵. دسترسی به ابزارهای MCP (Enabled MCP Tools)
+- `kynexa-filesystem`: ناوبری و خواندن امن فایل‌های UI و کانفیگ
+- `kynexa-git`: بررسی تغییرات و ساختار شاخه‌های UI
+
+### ۶. مهارت‌های تخصصی متصل (Enabled Skills)
+- [`omnitype-rust-ui`](file:///c:/Users/LENOVO%20LOQ/tools/OmniType-FreePTT/v-2/.agents/skills/omnitype-rust-ui/SKILL.md)
+- [`code-review`](file:///c:/Users/LENOVO%20LOQ/tools/OmniType-FreePTT/v-2/.agents/skills/code-review/SKILL.md)
+- [`documentation-standard`](file:///c:/Users/LENOVO%20LOQ/tools/OmniType-FreePTT/v-2/.agents/skills/documentation-standard/SKILL.md)
+- [`architecture-review`](file:///c:/Users/LENOVO%20LOQ/tools/OmniType-FreePTT/v-2/.agents/skills/architecture-review/SKILL.md)
+
+---
+
+## ۶. ماتریس تفکیک نقش‌ها با سایر عامل‌های پروژه (Role Differentiation)
 
 | حوزه تمرکز | عامل موجود در پروژه | عامل جدید پلتفرمی | مرزبندی و تمایز کارکردی |
 | :--- | :--- | :--- | :--- |
 | **معماری** | `solution-architect` | `platform-architect` | **معمار راه‌حل** بر روی استقرار کنونی، سازگاری با سرور HP G8 و یکپارچگی Sarv CRM تمرکز دارد؛ در حالی که **معمار پلتفرم** بر روی تعمیم‌پذیری، ساختار ماژولار، چندمستاجری و تبدیل به نرم‌افزار سازمانی مستقل متمرکز است. |
 | **محصول** | `product-owner` | `enterprise-product-manager` | **مالک محصول** بر روی تحویل اسپرینت‌های فعلی، رضایت کارفرمای آتبین ایستا و پذیرش UAT تمرکز دارد؛ در حالی که **مدیر محصول سازمانی** بر روی نقشه راه تجاری‌سازی، فروش پلتفرم به سایر مجتمع‌ها، قیمت‌گذاری و مدل‌های استقرار مقیاس‌پذیر تمرکز می‌نماید. |
 | **هوش مصنوعی و دانش** | `ai-engineer` / `data-engineer` | `knowledge-engineer` | **مهندس هوش مصنوعی** بر روی پرامپت‌ها، پارامترهای LLM و استنتاج متمرکز است؛ در حالی که **مهندس دانش** متولی هستی‌شناسی تجهیزات، ارتباط کاتالوگ‌ها با استانداردهای نفت، مهندسی متاداده و معماری دانش است. |
+| **رابط کاربری دسکتاپ** | `frontend-engineer` | `omnitype-rust-ui-designer` | **مهندس فرانت‌اند** بر روی پورتال‌های تحت وب بازبینی استعلام‌ها تمرکز دارد؛ در حالی که **طراح UI راست** منحصراً بر روی اپلیکیشن دسکتاپ ویندوز، پنجره‌های داخل اپ، پالت تم، ترِی سیستم و هوک‌های سیستم‌عامل در OmniType متمرکز است. |
 
 ---
 
-## ۶. اعتبارسنجی حاکمیتی و ممیزی کیفی (Governance Validation)
-- [x] کلیه ۳ عامل در سطح مخزن محلی پروژه ثبت شدند (Project-Scoped).
+## ۷. اعتبارسنجی حاکمیتی و ممیزی کیفی (Governance Validation)
+- [x] کلیه عامل‌ها در سطح مخزن محلی پروژه ثبت شدند (Project-Scoped).
 - [x] هیچ‌گونه تغییری در تنظیمات سراسری سیستم‌عامل یا کاربر اعمال نشد.
 - [x] تکرار یا همپوشانی مخرب با عامل‌های قبلی وجود ندارد و ماتریس تفکیک نقش‌ها تدوین شد.
 - [x] مجوزهای ابزارهای MCP با رعایت اصل حداقل دسترسی مجاز (Least Privilege) اعطا گردید.

@@ -173,17 +173,16 @@ pub fn run() -> Result<()> {
     let dict_flag = Arc::new(AtomicBool::new(false));
     let engine_flag = Arc::new(AtomicBool::new(false));
     let history_flag = Arc::new(AtomicBool::new(false));
+    let settings_flag = Arc::new(AtomicBool::new(false));
     let quit_flag = Arc::new(AtomicBool::new(false));
-    let dict_path = paths::resolve_dictionary_path();
     gui::spawn_tray(
         events_tx.clone(),
         overlay_flag.clone(),
         dict_flag.clone(),
         engine_flag.clone(),
         history_flag.clone(),
+        settings_flag.clone(),
         quit_flag.clone(),
-        dict_path.clone(),
-        config_path.clone(),
     )?;
 
     // ---- bridge: std channel → tokio channel ---------------------------------
@@ -307,10 +306,12 @@ pub fn run() -> Result<()> {
 
     // ---- text processing ---------------------------------------------------
     let normalizer = Arc::new(Normalizer::new());
-    let dictionary = Arc::new(RwLock::new(Dictionary::load_or_create(&dict_path)));
+    let dictionary = Arc::new(RwLock::new(Dictionary::load_or_create(
+        &paths::resolve_dictionary_path(),
+    )));
     tracing::info!(
         rules = dictionary.read().map(|d| d.len()).unwrap_or(0),
-        path = %dict_path.display(),
+        path = %paths::resolve_dictionary_path().display(),
         "dictionary loaded and ready"
     );
     logging::stage("text-processing", "normalizer + dictionary ready");
@@ -409,6 +410,7 @@ pub fn run() -> Result<()> {
     let gui_dict_flag = dict_flag.clone();
     let gui_engine_flag = engine_flag.clone();
     let gui_history_flag = history_flag.clone();
+    let gui_settings_flag = settings_flag.clone();
     let gui_dict = dictionary.clone();
     let gui_router = router.clone();
     let gui_settings = settings_rwlock.clone();
@@ -467,6 +469,7 @@ pub fn run() -> Result<()> {
                 gui_dict_flag,
                 gui_engine_flag,
                 gui_history_flag,
+                gui_settings_flag,
                 gui_quit,
                 gui_dict,
                 gui_router,

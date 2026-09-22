@@ -94,6 +94,13 @@ impl Toasts {
         }
     }
 
+    /// Mutably borrows the live toast stack. Used for in-place caption
+    /// updates (live countdowns) that must not add/dismiss toasts and so
+    /// must not restart any animation.
+    pub fn toasts_mut(&mut self) -> &mut [Toast] {
+        &mut self.toasts
+    }
+
     /// Dismisses all toasts
     pub fn dismiss_all_toasts(&mut self) {
         for toast in self.toasts.iter_mut() {
