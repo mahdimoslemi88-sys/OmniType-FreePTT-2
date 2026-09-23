@@ -975,6 +975,8 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     new_engine_model: String,
     new_engine_lang: String,
     engine_msg: Option<(String, Instant)>,
+    pub update_state: crate::updates::SharedUpdateState,
+    update_toast_notified: Option<String>,
 }
 
 impl OverlayApp {
@@ -992,6 +994,7 @@ impl OverlayApp {
         router: AsrRouter,
         settings: Arc<RwLock<Settings>>,
         config_path: PathBuf,
+        update_state: crate::updates::SharedUpdateState,
     ) -> Self {
         let initial_visible = settings
             .read()
@@ -1055,6 +1058,8 @@ impl OverlayApp {
             new_engine_model: "whisper-large-v3-turbo".to_string(),
             new_engine_lang: "fa".to_string(),
             engine_msg: None,
+            update_state,
+            update_toast_notified: None,
         }
     }
 
@@ -1949,345 +1954,619 @@ impl OverlayApp {
                                 });
                         }
     }
-    /// Settings tab body for the unified dashboard (viewport wrapper removed).
-    /// Replaces the old "Open config.toml" tray items: routine configuration
-    /// never launches an external editor.
+    /// Settings tab body for the unified dashboard (Bento / 2-column masonry layout).
+    /// At most 2 cards placed side by side with staggered natural heights.
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
-                        let engine_count = self.settings.read().map(|s| s.custom_providers.len()).unwrap_or(0);
-                        manager_header(
-                            ui,
-                            "تنظیمات",
-                            Some((
-                                &format!("{} موتور سفارشی", engine_count),
-                                palette::HEADER_PILL_BG,
-                                palette::ACCENT_SOFT,
-                            )),
-                        );
-                        manager_subtitle(ui, "پیکربندی صوت، موتور تشخیص گفتار، تشخیص سکوت و کلیدها");
-                        ui.add_space(10.0);
+        let engine_count = self
+            .settings
+            .read()
+            .map(|s| s.custom_providers.len())
+            .unwrap_or(0);
+        manager_header(
+            ui,
+            "تنظیمات",
+            Some((
+                &format!("{} موتور سفارشی", engine_count),
+                palette::HEADER_PILL_BG,
+                palette::ACCENT_SOFT,
+            )),
+        );
+        manager_subtitle(
+            ui,
+            "پیکربندی صوت، موتور تشخیص گفتار، تشخیص سکوت، کلیدها و دریافت به‌روزرسانی",
+        );
+        ui.add_space(8.0);
 
-                        // ── Card: Audio ──
-                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{} {}", ic::MICROPHONE, format_persian_display("صوت")))
-                                    .size(12.5)
-                                    .strong()
-                                    .color(palette::TEXT_SECTION),
-                            );
-                            ui.add_space(6.0);
+        // Pre-validate draft settings so save state and error notices are ready
+        let validation = validate_settings(&self.draft_settings);
+        match &validation {
+            Ok(()) => {
+                self.settings_error = None;
+            }
+            Err(msg) => {
+                self.settings_error = Some(msg.clone());
+            }
+        }
 
-                            egui::Grid::new("settings_audio_grid")
-                                .spacing([10.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("دستگاه ورودی:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.draft_settings.audio.device)
-                                            .hint_text("default")
-                                            .desired_width(180.0),
-                                    );
-                                    ui.end_row();
+        // 2-Column Bento / Masonry Layout (at most 2 boxes per row)
+        // In Persian RTL order:
+        // cols[1] is the Right Column (Primary: ASR Engine, Hotkeys & UI, Software Updates)
+        // cols[0] is the Left Column (Hardware & Actions: Audio, VAD, Save Hub)
+        ui.columns(2, |cols| {
+            // ── Right Column (cols[1]): AI Core, Hotkeys, Updates ──
+            {
+                let ui = &mut cols[1];
 
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("نرخ نمونه‌برداری (Hz):"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.draft_settings.audio.sample_rate)
-                                            .range(8_000..=96_000)
-                                            .suffix(" Hz"),
-                                    );
-                                    ui.end_row();
+                // ── Card 1: ASR Engine (موتور تشخیص گفتار) ──
+                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            ic::BRAIN,
+                            format_persian_display("موتور تشخیص گفتار")
+                        ))
+                        .size(12.5)
+                        .strong()
+                        .color(palette::TEXT_SECTION),
+                    );
+                    ui.add_space(6.0);
 
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("تقویت نرم‌افزاری (dB):"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut self.draft_settings.audio.gain_db, -12.0..=24.0)
-                                            .suffix(" dB")
-                                            .text(format_persian_display("بلندی ورودی"))
-                                            .fixed_decimals(1),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("حافظه حلقه (ثانیه):"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut self.draft_settings.audio.ring_seconds, 5..=120)
-                                            .suffix(" s")
-                                            .text(format_persian_display("بافر ضبط")),
-                                    );
-                                    ui.end_row();
-                                });
+                    // 2x2 grid for engine radio selection (never overflows card width)
+                    egui::Grid::new("settings_engine_radios")
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            for (id, label) in [("auto", "خودکار"), ("google", "گوگل رایگان")] {
+                                if ui
+                                    .radio(
+                                        self.draft_settings.active_engine == *id,
+                                        format_persian_display(label),
+                                    )
+                                    .clicked()
+                                {
+                                    self.draft_settings.active_engine = (*id).to_string();
+                                }
+                            }
+                            ui.end_row();
+                            for (id, label) in [
+                                ("local_whisper", "ویسپر محلی"),
+                                ("groq", "ابر (Groq)"),
+                            ] {
+                                if ui
+                                    .radio(
+                                        self.draft_settings.active_engine == *id,
+                                        format_persian_display(label),
+                                    )
+                                    .clicked()
+                                {
+                                    self.draft_settings.active_engine = (*id).to_string();
+                                }
+                            }
+                            ui.end_row();
                         });
 
-                        ui.add_space(10.0);
+                    ui.add_space(4.0);
+                    if self.draft_settings.active_engine == "groq" {
+                        callout(
+                            ui,
+                            CalloutKind::Warning,
+                            "با انتخاب موتور ابری، صوت شما برای پردازش به سرور خارجی ارسال می‌شود.",
+                        );
+                    } else if self.draft_settings.active_engine == "google" {
+                        callout(
+                            ui,
+                            CalloutKind::Info,
+                            "گوگل رایگان نیازی به کلید API ندارد، اما به اینترنت متصل می‌ماند.",
+                        );
+                    } else if self.draft_settings.active_engine == "local_whisper" {
+                        callout(
+                            ui,
+                            CalloutKind::Info,
+                            "ویسپر محلی کاملاً آفلاین است؛ هیچ صوتی ماشین شما را ترک نمی‌کند.",
+                        );
+                    }
+                    ui.add_space(4.0);
 
-                        // ── Card: ASR engine ──
-                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                    egui::Grid::new("settings_asr_grid")
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new(format!("{} {}", ic::BRAIN, format_persian_display("موتور تشخیص گفتار")))
-                                    .size(12.5)
-                                    .strong()
-                                    .color(palette::TEXT_SECTION),
+                                egui::RichText::new(format_persian_display("مدل محلی:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
                             );
-                            ui.add_space(6.0);
-
-                            ui.horizontal(|ui| {
-                                for (id, label) in [
-                                    ("auto", "خودکار"),
-                                    ("google", "گوگل رایگان"),
-                                    ("local_whisper", "ویسپر محلی"),
-                                    ("groq", "ابر (Groq)"),
-                                ] {
-                                    if ui.radio(self.draft_settings.active_engine == *id, format_persian_display(label)).clicked() {
-                                        self.draft_settings.active_engine = (*id).to_string();
+                            let model = egui::ComboBox::from_id_source("settings_local_model")
+                                .selected_text(self.draft_settings.asr.model.clone())
+                                .show_ui(ui, |ui| {
+                                    for m in [
+                                        "auto",
+                                        "tiny",
+                                        "base",
+                                        "small",
+                                        "medium",
+                                        "large-v3",
+                                        "large-v3-turbo",
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.draft_settings.asr.model,
+                                            (*m).to_string(),
+                                            m,
+                                        );
                                     }
+                                });
+                            let _ = model;
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display("زبان تشخیص:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft_settings.asr.language)
+                                    .desired_width(70.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display("سقف روزانه ابر:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.draft_settings.cloud.daily_limit)
+                                    .range(1..=10_000),
+                            );
+                            ui.end_row();
+                        });
+                });
+
+                ui.add_space(8.0);
+
+                // ── Card 2: Hotkeys & GUI (کلیدهای میانبر و رابط کاربری) ──
+                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            ic::KEYBOARD,
+                            format_persian_display("کلیدهای میانبر و رابط کاربری")
+                        ))
+                        .size(12.5)
+                        .strong()
+                        .color(palette::TEXT_SECTION),
+                    );
+                    ui.add_space(6.0);
+
+                    egui::Grid::new("settings_hotkey_grid")
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format_persian_display("کلید ضبط:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft_settings.hotkey.record)
+                                    .desired_width(110.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display("نمایش/مخفی کپسول:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(
+                                    &mut self.draft_settings.hotkey.toggle_overlay,
+                                )
+                                .desired_width(110.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display("کلید خروج:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft_settings.hotkey.quit)
+                                    .desired_width(110.0),
+                            );
+                            ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut self.draft_settings.gui.show_overlay,
+                        format_persian_display("نمایش کپسول شناور"),
+                    );
+                });
+
+                ui.add_space(8.0);
+
+                // ── Card 3: Software Updates (به‌روزرسانی نرم‌افزار) ──
+                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            ic::CLOUD_ARROW_DOWN,
+                            format_persian_display("به‌روزرسانی نرم‌افزار")
+                        ))
+                        .size(12.5)
+                        .strong()
+                        .color(palette::TEXT_SECTION),
+                    );
+                    ui.add_space(6.0);
+
+                    let current_ver = env!("CARGO_PKG_VERSION");
+                    ui.label(
+                        egui::RichText::new(format_persian_display(&format!(
+                            "نگارش فعلی: v{current_ver}"
+                        )))
+                        .size(11.0)
+                        .color(palette::TEXT_LABEL),
+                    );
+                    ui.add_space(4.0);
+
+                    let current_state = {
+                        if let Ok(st) = self.update_state.read() {
+                            (*st).clone()
+                        } else {
+                            crate::updates::UpdateState::Idle
+                        }
+                    };
+
+                    match current_state {
+                        crate::updates::UpdateState::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(12.0).color(palette::ACCENT));
+                                ui.label(
+                                    egui::RichText::new(format_persian_display(
+                                        "در حال بررسی سرور...",
+                                    ))
+                                    .size(10.5)
+                                    .color(palette::TEXT_MUTED),
+                                );
+                            });
+                        }
+                        crate::updates::UpdateState::Available(ref info) => {
+                            ui.horizontal(|ui| {
+                                status_chip(
+                                    ui,
+                                    &format!("نسخه جدید: v{}", info.latest_version),
+                                    palette::SUCCESS_FILL,
+                                    palette::SUCCESS,
+                                    10.5,
+                                    ChipFamily::Small,
+                                );
+                            });
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                if let Some(ref installer_url) = info.installer_url {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("دانلود فایل نصب")
+                                                    .size(10.5)
+                                                    .strong()
+                                                    .color(palette::WHITE),
+                                            )
+                                            .fill(palette::ACCENT_ACTION)
+                                            .rounding(egui::Rounding::same(5.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        crate::updates::open_url_in_browser(installer_url);
+                                    }
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("مشاهده در GitHub")
+                                                .size(10.5)
+                                                .color(palette::TEXT_SECONDARY),
+                                        )
+                                        .fill(palette::CHIP_BG)
+                                        .rounding(egui::Rounding::same(5.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    crate::updates::open_url_in_browser(&info.release_url);
                                 }
                             });
-
-                            ui.add_space(4.0);
-                            if self.draft_settings.active_engine == "groq" {
-                                callout(
-                                    ui,
-                                    CalloutKind::Warning,
-                                    "با انتخاب موتور ابری، صوت شما برای پردازش به سرور خارجی ارسال می‌شود.",
-                                );
-                            } else if self.draft_settings.active_engine == "google" {
-                                callout(
-                                    ui,
-                                    CalloutKind::Info,
-                                    "گوگل رایگان نیازی به کلید API ندارد، اما به اینترنت متصل می‌ماند.",
-                                );
-                            } else if self.draft_settings.active_engine == "local_whisper" {
-                                callout(
-                                    ui,
-                                    CalloutKind::Info,
-                                    "ویسپر محلی کاملاً آفلاین است؛ هیچ صوتی ماشین شما را ترک نمی‌کند.",
-                                );
-                            }
-                            ui.add_space(4.0);
-
-                            egui::Grid::new("settings_asr_grid")
-                                .spacing([10.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("مدل محلی:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    let model = egui::ComboBox::from_id_source("settings_local_model")
-                                        .selected_text(self.draft_settings.asr.model.clone())
-                                        .show_ui(ui, |ui| {
-                                            for m in ["auto", "tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"] {
-                                                ui.selectable_value(&mut self.draft_settings.asr.model, (*m).to_string(), m);
-                                            }
-                                        });
-                                    let _ = model;
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("زبان تشخیص:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.draft_settings.asr.language)
-                                            .desired_width(80.0),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("سقف روزانه ابر:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.draft_settings.cloud.daily_limit)
-                                            .range(1..=10_000),
-                                    );
-                                    ui.end_row();
-                                });
-                        });
-
-                        ui.add_space(10.0);
-
-                        // ── Card: VAD ──
-                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                        }
+                        crate::updates::UpdateState::UpToDate { ref checked_at } => {
                             ui.label(
-                                egui::RichText::new(format!("{} {}", ic::WAVE_SINE, format_persian_display("تشخیص سکوت (VAD)")))
-                                    .size(12.5)
-                                    .strong()
-                                    .color(palette::TEXT_SECTION),
+                                egui::RichText::new(format!(
+                                    "{} نسخه شما به‌روز است ({})",
+                                    ic::CHECK_CIRCLE,
+                                    checked_at
+                                ))
+                                .size(10.5)
+                                .color(palette::SUCCESS),
                             );
-                            ui.add_space(6.0);
-
-                            egui::Grid::new("settings_vad_grid")
-                                .spacing([10.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("حساسیت:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut self.draft_settings.vad.threshold, 0.05..=0.95)
-                                            .text(format_persian_display("آستانه سکوت"))
-                                            .fixed_decimals(2),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("مدت سکوت برای توقف (ms):"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.draft_settings.vad.silence_timeout_ms)
-                                            .range(200..=10_000)
-                                            .suffix(" ms"),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("حداقل مدت گفتار (ms):"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.draft_settings.vad.min_speech_ms)
-                                            .range(50..=2_000)
-                                            .suffix(" ms"),
-                                    );
-                                    ui.end_row();
-                                });
-
-                            ui.add_space(4.0);
-                            if ui.checkbox(&mut self.draft_settings.vad.cutoff_on_hold, format_persian_display("توقف ضبط با سکوت، حتی با نگه‌داشتن کلید")).changed() {
-                                self.settings_error = None;
-                            }
-                        });
-
-                        ui.add_space(10.0);
-
-                        // ── Card: Hotkeys & GUI ──
-                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                        }
+                        crate::updates::UpdateState::Error(ref err) => {
                             ui.label(
-                                egui::RichText::new(format!("{} {}", ic::KEYBOARD, format_persian_display("کلیدهای میانبر و رابط کاربری")))
-                                    .size(12.5)
-                                    .strong()
-                                    .color(palette::TEXT_SECTION),
+                                egui::RichText::new(format!("{} خطا: {}", ic::WARNING, err))
+                                    .size(10.0)
+                                    .color(palette::WARNING),
                             );
-                            ui.add_space(6.0);
+                        }
+                        crate::updates::UpdateState::Idle => {
+                            ui.label(
+                                egui::RichText::new(format_persian_display(
+                                    "هنوز بررسی انجام نشده است",
+                                ))
+                                .size(10.5)
+                                .color(palette::TEXT_MUTED),
+                            );
+                        }
+                    }
 
-                            egui::Grid::new("settings_hotkey_grid")
-                                .spacing([10.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("کلید ضبط:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.draft_settings.hotkey.record)
-                                            .desired_width(140.0),
-                                    );
-                                    ui.end_row();
+                    ui.add_space(4.0);
+                    if ui
+                        .button(
+                            egui::RichText::new(format!(
+                                "{} {}",
+                                ic::ARROWS_CLOCKWISE,
+                                format_persian_display("بررسی به‌روزرسانی اکنون")
+                            ))
+                            .size(10.5),
+                        )
+                        .clicked()
+                    {
+                        let st = self.update_state.clone();
+                        tokio::spawn(async move {
+                            crate::updates::perform_check(&st, env!("CARGO_PKG_VERSION")).await;
+                        });
+                    }
+                    ui.add_space(2.0);
+                    ui.checkbox(
+                        &mut self.draft_settings.updates.check_on_startup,
+                        format_persian_display("بررسی خودکار در شروع برنامه"),
+                    );
+                });
+            }
 
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("نمایش/مخفی کپسول:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.draft_settings.hotkey.toggle_overlay)
-                                            .desired_width(140.0),
-                                    );
-                                    ui.end_row();
+            // ── Left Column (cols[0]): Audio, VAD, Save Hub ──
+            {
+                let ui = &mut cols[0];
 
-                                    ui.label(
-                                        egui::RichText::new(format_persian_display("کلید خروج:"))
-                                            .size(11.0)
-                                            .color(palette::TEXT_LABEL),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.draft_settings.hotkey.quit)
-                                            .desired_width(140.0),
-                                    );
-                                    ui.end_row();
-                                });
+                // ── Card 4: Audio (صوت) ──
+                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            ic::MICROPHONE,
+                            format_persian_display("صوت")
+                        ))
+                        .size(12.5)
+                        .strong()
+                        .color(palette::TEXT_SECTION),
+                    );
+                    ui.add_space(6.0);
 
-                            ui.add_space(4.0);
-                            ui.checkbox(&mut self.draft_settings.gui.show_overlay, format_persian_display("نمایش کپسول شناور"));
+                    egui::Grid::new("settings_audio_grid")
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format_persian_display("دستگاه ورودی:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.draft_settings.audio.device)
+                                    .hint_text("default")
+                                    .desired_width(120.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display("نرخ نمونه‌برداری:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.draft_settings.audio.sample_rate)
+                                    .range(8_000..=96_000)
+                                    .suffix(" Hz"),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display("تقویت صدا:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.draft_settings.audio.gain_db,
+                                    -12.0..=24.0,
+                                )
+                                .suffix(" dB")
+                                .fixed_decimals(1),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display("حافظه حلقه:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.draft_settings.audio.ring_seconds,
+                                    5..=120,
+                                )
+                                .suffix(" s"),
+                            );
+                            ui.end_row();
+                        });
+                });
+
+                ui.add_space(8.0);
+
+                // ── Card 5: VAD (تشخیص سکوت) ──
+                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            ic::WAVE_SINE,
+                            format_persian_display("تشخیص سکوت (VAD)")
+                        ))
+                        .size(12.5)
+                        .strong()
+                        .color(palette::TEXT_SECTION),
+                    );
+                    ui.add_space(6.0);
+
+                    egui::Grid::new("settings_vad_grid")
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format_persian_display("آستانه سکوت:"))
+                                    .size(11.0)
+                                    .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.draft_settings.vad.threshold,
+                                    0.05..=0.95,
+                                )
+                                .fixed_decimals(2),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display(
+                                    "مدت سکوت برای توقف:",
+                                ))
+                                .size(11.0)
+                                .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::DragValue::new(
+                                    &mut self.draft_settings.vad.silence_timeout_ms,
+                                )
+                                .range(200..=10_000)
+                                .suffix(" ms"),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new(format_persian_display(
+                                    "حداقل مدت گفتار:",
+                                ))
+                                .size(11.0)
+                                .color(palette::TEXT_LABEL),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.draft_settings.vad.min_speech_ms)
+                                    .range(50..=2_000)
+                                    .suffix(" ms"),
+                            );
+                            ui.end_row();
                         });
 
-                        ui.add_space(10.0);
+                    ui.add_space(4.0);
+                    if ui
+                        .checkbox(
+                            &mut self.draft_settings.vad.cutoff_on_hold,
+                            format_persian_display("توقف ضبط با سکوت، حتی با نگه‌داشتن کلید"),
+                        )
+                        .changed()
+                    {
+                        self.settings_error = None;
+                    }
+                });
 
-                        // ── Validation + footer ──
-                        let validation = validate_settings(&self.draft_settings);
-                        match &validation {
-                            Ok(()) => {
-                                self.settings_error = None;
+                ui.add_space(8.0);
+
+                // ── Card 6: Save & Action Hub (ذخیره و مدیریت تنظیمات) ──
+                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            ic::FLOPPY_DISK,
+                            format_persian_display("ذخیره و اعمال تنظیمات")
+                        ))
+                        .size(12.5)
+                        .strong()
+                        .color(palette::TEXT_SECTION),
+                    );
+                    ui.add_space(6.0);
+
+                    if let Some(ref err) = self.settings_error {
+                        callout(ui, CalloutKind::Warning, err);
+                        ui.add_space(6.0);
+                    }
+
+                    ui.horizontal(|ui| {
+                        let can_save = self.settings_error.is_none();
+                        let save = ui.add_enabled(
+                            can_save,
+                            egui::Button::new(
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    ic::FLOPPY_DISK,
+                                    format_persian_display("ذخیره تنظیمات")
+                                ))
+                                .size(11.5)
+                                .strong()
+                                .color(palette::WHITE),
+                            )
+                            .fill(if can_save {
+                                palette::ACCENT_ACTION
+                            } else {
+                                palette::CHIP_BG
+                            })
+                            .rounding(egui::Rounding::same(6.0)),
+                        );
+                        if save.clicked() {
+                            if let Ok(mut s) = self.settings.write() {
+                                *s = self.draft_settings.clone();
+                                let _ = s.save(&self.config_path);
                             }
-                            Err(msg) => {
-                                self.settings_error = Some(msg.clone());
-                            }
+                            self.settings_saved = true;
                         }
 
-                        if let Some(ref err) = self.settings_error {
-                            callout(ui, CalloutKind::Warning, err);
-                            ui.add_space(6.0);
-                        }
-
-                        ui.horizontal(|ui| {
-                            let can_save = self.settings_error.is_none();
-                            let save = ui.add_enabled(
-                                can_save,
-                                egui::Button::new(
-                                    egui::RichText::new(format!("{} {}", ic::FLOPPY_DISK, format_persian_display("ذخیره تنظیمات")))
-                                        .size(11.5)
-                                        .color(palette::WHITE),
-                                ),
-                            );
-                            if save.clicked() {
+                        if ui
+                            .button(
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    ic::ARROWS_CLOCKWISE,
+                                    format_persian_display("بارگذاری مجدد")
+                                ))
+                                .size(11.0),
+                            )
+                            .clicked()
+                        {
+                            if let Ok(loaded) = Settings::load_or_create(&self.config_path) {
                                 if let Ok(mut s) = self.settings.write() {
-                                    *s = self.draft_settings.clone();
-                                    let _ = s.save(&self.config_path);
+                                    *s = loaded.clone();
                                 }
-                                self.settings_saved = true;
+                                self.draft_settings = loaded;
+                                self.settings_error = None;
+                                self.settings_saved = false;
                             }
-                            if ui.button(format_persian_display("بارگذاری مجدد از فایل")).clicked() {
-                                if let Ok(loaded) = Settings::load_or_create(&self.config_path) {
-                                    if let Ok(mut s) = self.settings.write() {
-                                        *s = loaded.clone();
-                                    }
-                                    self.draft_settings = loaded;
-                                    self.settings_error = None;
-                                    self.settings_saved = false;
-                                }
-                            }
-                        });
-
-                        if self.settings_saved {
-                            ui.add_space(4.0);
-                            status_chip(
-                                ui,
-                                "تنظیمات ذخیره شد",
-                                palette::SUCCESS_FILL,
-                                palette::SUCCESS,
-                                10.5,
-                                ChipFamily::Tiny,
-                            );
                         }
+                    });
+
+                    if self.settings_saved {
+                        ui.add_space(6.0);
+                        status_chip(
+                            ui,
+                            "تنظیمات با موفقیت ذخیره شد",
+                            palette::SUCCESS_FILL,
+                            palette::SUCCESS,
+                            10.5,
+                            ChipFamily::Tiny,
+                        );
+                    }
+                });
+            }
+        });
     }
 
     /// Renders the one-time cloud-consent prompt: audio must not leave the
@@ -2389,6 +2668,60 @@ impl OverlayApp {
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(6.0);
+
+                        // ── Update Notification Banner (if newer version available) ──
+                        let update_info_opt = {
+                            if let Ok(st) = self.update_state.read() {
+                                if let crate::updates::UpdateState::Available(ref info) = *st {
+                                    Some(info.clone())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(info) = update_info_opt {
+                            manager_card(palette::CARD_BG_ALT, palette::ACCENT).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{} نسخه جدید در دسترس است: v{}", ic::CLOUD_ARROW_DOWN, info.latest_version))
+                                            .size(11.5)
+                                            .strong()
+                                            .color(palette::ACCENT),
+                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if let Some(ref installer_url) = info.installer_url {
+                                            if ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("دانلود فایل نصب")
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(palette::WHITE),
+                                                )
+                                                .fill(palette::ACCENT_ACTION)
+                                                .rounding(egui::Rounding::same(5.0)),
+                                            ).clicked() {
+                                                crate::updates::open_url_in_browser(installer_url);
+                                            }
+                                        }
+                                        if ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new("مشاهده در گیت‌هاب")
+                                                    .size(10.5)
+                                                    .color(palette::TEXT_SECONDARY),
+                                            )
+                                            .fill(palette::CHIP_BG)
+                                            .rounding(egui::Rounding::same(5.0)),
+                                        ).clicked() {
+                                            crate::updates::open_url_in_browser(&info.release_url);
+                                        }
+                                    });
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
 
                         // ── Active tab body (scrollable) ──
                         egui::ScrollArea::vertical()
@@ -2587,7 +2920,7 @@ impl OverlayApp {
             }
         }
         self.refresh_toast_countdowns(now);
-        if self.live_toasts.is_empty() {
+        if self.live_toasts.is_empty() && self.toasts.toasts_mut().is_empty() {
             return;
         }
 
@@ -2621,9 +2954,14 @@ impl OverlayApp {
                 // A plain release inside the preview copies the newest
                 // transcript (in practice the card under the pointer); the
                 // library ✕ still dismisses through its own hit-test.
+                // Clicking an update toast opens the dashboard settings tab.
                 if toast_ctx.input(|i| i.pointer.primary_released()) {
                     if let Some((_, raw, _, _)) = self.live_toasts.back() {
                         toast_ctx.copy_text(raw.clone());
+                    } else {
+                        self.show_dashboard = true;
+                        self.dashboard_tab = DashboardTab::Settings;
+                        self.visible = true;
                     }
                 }
 
@@ -2708,6 +3046,43 @@ impl eframe::App for OverlayApp {
         if self.quit_flag.load(std::sync::atomic::Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+
+        // Trigger update notification toast if a newer release is detected
+        let update_to_toast = {
+            if let Ok(st) = self.update_state.read() {
+                if let crate::updates::UpdateState::Available(ref info) = *st {
+                    if self.update_toast_notified.as_deref() != Some(&info.latest_version) {
+                        Some(info.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(info) = update_to_toast {
+            self.update_toast_notified = Some(info.latest_version.clone());
+            let msg = format!(
+                "نسخه جدید {} منتشر شد\nبرای مشاهده و دریافت کلیک کنید",
+                info.latest_version
+            );
+            let display = format_persian_display(&msg);
+            let mut toast = Toast::custom(
+                display,
+                ToastLevel::Custom(ic::BELL.to_string(), palette::ACCENT),
+            );
+            toast.set_duration(Some(Duration::from_secs(12)));
+            toast.set_closable(true);
+            toast.set_show_progress_bar(true);
+            toast.set_max_width(Some(TOAST_MAX_WIDTH));
+            self.toasts.add(toast);
+
+            #[cfg(windows)]
+            apply_window_shapes_all();
         }
 
         // Always render secondary viewports if open
@@ -3267,6 +3642,7 @@ mod tests {
         let settings = Arc::new(RwLock::new(Settings::default()));
         let config_path = PathBuf::from("config.toml");
         let settings_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let update_state = crate::updates::new_shared_state();
         let mut app = OverlayApp::new(
             Arc::new(StatusClient::new(rx)),
             events_tx,
@@ -3280,6 +3656,7 @@ mod tests {
             router,
             settings,
             config_path,
+            update_state,
         );
         assert!(app.visible);
         app.toggle_visible();

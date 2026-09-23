@@ -47,6 +47,8 @@ pub struct Settings {
     pub active_engine: String,
     #[serde(default)]
     pub custom_providers: Vec<CustomProvider>,
+    #[serde(default)]
+    pub updates: UpdateSettings,
 }
 
 impl Default for Settings {
@@ -61,6 +63,24 @@ impl Default for Settings {
             google: GoogleConfig::default(),
             active_engine: "auto".into(),
             custom_providers: Vec::new(),
+            updates: UpdateSettings::default(),
+        }
+    }
+}
+
+/// Auto-update checker configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UpdateSettings {
+    pub check_on_startup: bool,
+    pub auto_check_interval_hours: u64,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+            auto_check_interval_hours: 6,
         }
     }
 }
@@ -344,6 +364,8 @@ mod tests {
         assert_eq!(s.hotkey.record, "CapsLock");
         assert!(s.google.enabled);
         assert_eq!(s.google.language, "fa-IR");
+        assert!(s.updates.check_on_startup);
+        assert_eq!(s.updates.auto_check_interval_hours, 6);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod output;
 pub mod paths;
 pub mod processing;
 pub mod state;
+pub mod updates;
 pub mod vad;
 
 use std::sync::atomic::AtomicBool;
@@ -175,6 +176,7 @@ pub fn run() -> Result<()> {
     let history_flag = Arc::new(AtomicBool::new(false));
     let settings_flag = Arc::new(AtomicBool::new(false));
     let quit_flag = Arc::new(AtomicBool::new(false));
+    let update_state = updates::new_shared_state();
     gui::spawn_tray(
         events_tx.clone(),
         overlay_flag.clone(),
@@ -183,7 +185,15 @@ pub fn run() -> Result<()> {
         history_flag.clone(),
         settings_flag.clone(),
         quit_flag.clone(),
+        update_state.clone(),
     )?;
+
+    // Spawn background update checker (honors settings.updates.check_on_startup)
+    updates::spawn_background_checker(
+        update_state.clone(),
+        settings_rwlock.clone(),
+        env!("CARGO_PKG_VERSION"),
+    );
 
     // ---- bridge: std channel → tokio channel ---------------------------------
     let bridge_tx = events_tx.clone();
@@ -416,6 +426,7 @@ pub fn run() -> Result<()> {
     let gui_settings = settings_rwlock.clone();
     let gui_config_path = config_path.clone();
     let gui_events_tx = events_tx.clone();
+    let gui_update_state = update_state.clone();
     eframe::run_native(
         "voice-ptt",
         native_options,
@@ -475,6 +486,7 @@ pub fn run() -> Result<()> {
                 gui_router,
                 gui_settings,
                 gui_config_path,
+                gui_update_state,
             )) as Box<dyn eframe::App>)
         }),
     )

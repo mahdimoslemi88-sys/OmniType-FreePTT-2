@@ -19,6 +19,7 @@ use crate::hotkey::HotkeyEvent;
 /// * `history_toggle` — set when the user asks to open the transcript history GUI.
 /// * `settings_toggle` — set when the user asks to open the in-app settings GUI.
 /// * `quit_flag` — set when the user asks to quit (GUI watches it to close).
+/// * `update_state` — shared update state for checking/downloading releases.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     hotkey_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
@@ -28,6 +29,7 @@ pub fn spawn(
     history_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     settings_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     quit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    update_state: crate::updates::SharedUpdateState,
 ) -> Result<()> {
     // Tray labels follow the skill's section-8 contract. Routine config and
     // dictionary editing happens in the unified dashboard — no external editors.
@@ -36,6 +38,7 @@ pub fn spawn(
     let engine_gui = MenuItem::new("Active Engine — Models (مدیریت مدل‌ها)", true, None);
     let dict_gui = MenuItem::new("Dictionary (واژگان)", true, None);
     let settings_gui = MenuItem::new("Settings (تنظیمات)", true, None);
+    let update_gui = MenuItem::new("Check for Updates (بررسی و دانلود به‌روزرسانی)", true, None);
     let quit = MenuItem::new("Exit completely (خروج کامل)", true, None);
 
     let show_id = show_hide.id().clone();
@@ -43,6 +46,7 @@ pub fn spawn(
     let engine_gui_id = engine_gui.id().clone();
     let dict_gui_id = dict_gui.id().clone();
     let settings_gui_id = settings_gui.id().clone();
+    let update_gui_id = update_gui.id().clone();
     let quit_id = quit.id().clone();
 
     let menu = Menu::new();
@@ -52,6 +56,8 @@ pub fn spawn(
     menu.append(&dict_gui)?;
     menu.append(&settings_gui)?;
     menu.append(&history_gui)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&update_gui)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
 
@@ -69,6 +75,7 @@ pub fn spawn(
     Box::leak(_tray);
 
     // Event polling thread (MenuEvent receiver is global).
+    let update_state_tray = update_state.clone();
     std::thread::Builder::new()
         .name("tray-events".into())
         .spawn(move || {
@@ -84,6 +91,29 @@ pub fn spawn(
                     dict_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
                 } else if event.id == settings_gui_id {
                     settings_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                } else if event.id == update_gui_id {
+                    // Open settings where the update card is visible
+                    settings_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Check if an update URL is ready to open immediately
+                    let url_to_open = {
+                        if let Ok(st) = update_state_tray.read() {
+                            if let crate::updates::UpdateState::Available(ref info) = *st {
+                                Some(info.installer_url.clone().unwrap_or_else(|| info.release_url.clone()))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(url) = url_to_open {
+                        crate::updates::open_url_in_browser(&url);
+                    } else {
+                        let st = update_state_tray.clone();
+                        tokio::spawn(async move {
+                            crate::updates::perform_check(&st, env!("CARGO_PKG_VERSION")).await;
+                        });
+                    }
                 } else if event.id == quit_id {
                     quit_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = hotkey_tx.send(HotkeyEvent::Quit);
