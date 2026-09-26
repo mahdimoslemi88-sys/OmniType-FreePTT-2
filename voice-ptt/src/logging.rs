@@ -36,6 +36,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// How many days of daily log files to keep.
 const LOG_RETENTION_DAYS: u64 = 7;
 
+/// Hard size cap for `logs/crash.log`. A panic that fires on every frame can
+/// otherwise produce gigabytes in minutes; past this we keep only the tail.
+const CRASH_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// The plain-text crash/error sidecar log, next to the daily files.
 const CRASH_LOG_NAME: &str = "crash.log";
 
@@ -43,6 +47,13 @@ const CRASH_LOG_NAME: &str = "crash.log";
 /// [`record_fatal_error`] so crash reports land next to the daily logs
 /// even if the failure happens before/without tracing.
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Per-panic-site occurrence counts, so a panic that fires on every frame is
+/// logged once with a "occurrence N" counter instead of spamming thousands of
+/// identical sections. Keyed by `location: payload`.
+static PANIC_COUNTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Installs Rust-side callbacks for whisper.cpp *and* ggml native logs.
 ///
@@ -190,16 +201,39 @@ fn install_panic_hook() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "<unknown>".to_string());
-        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        // Deduplicate a panic *loop*: the same site firing on every repaint
+        // (a known egui 0.28 hit_test panic, see docs) otherwise writes one
+        // report per frame — thousands per second. The first occurrence is
+        // always logged in full; repeats only refresh a "N times" counter.
+        let key = format!("{location}: {payload}");
+        let mut counter = PANIC_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        let count = counter.entry(key.clone()).or_insert(0);
+        *count += 1;
+        let occurrence = *count;
+        drop(counter);
+
+        // The last occurrence before the process dies needs its backtrace so
+        // we can see the real stack; pure repeats add nothing.
+        let backtrace = if occurrence == 1 || occurrence.is_power_of_two() {
+            format!(
+                "\nbacktrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            )
+        } else {
+            String::new()
+        };
 
         // 1) Main daily log (formatted like every other event).
-        tracing::error!("PANIC at {location}: {payload}\n{backtrace}");
+        if occurrence == 1 || occurrence.is_power_of_two() {
+            tracing::error!("PANIC at {location}: {payload} (occurrence {occurrence}){backtrace}");
+        }
 
         // 2) Dedicated crash.log — plain synchronous append, independent of
         //    the tracing machinery (survives a wedged logger/aborted unwind).
         append_to_crash_log(
             "PANIC",
-            &format!("at {location}\n{payload}\nbacktrace:\n{backtrace}"),
+            &format!("at {location}\n{payload}\noccurrence {occurrence}{backtrace}"),
         );
 
         // 3) Keep default behavior (stderr) for console launches.
@@ -221,10 +255,45 @@ fn append_to_crash_log(title: &str, body: &str) {
 fn append_to_crash_log_in(dir: &Path, title: &str, body: &str) {
     let _ = fs::create_dir_all(dir.join("logs"));
     let path = dir.join("logs").join(CRASH_LOG_NAME);
+    // Bound the file: a panic storm (e.g. one per frame) would otherwise grow
+    // it without limit. If it is already huge, drop the oldest half by
+    // rewriting only the tail.
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > CRASH_LOG_MAX_BYTES as u64 {
+            truncate_crash_log_to_tail(&path);
+        }
+    }
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
-        let _ = writeln!(f, "----- {} | {} -----", unix_now(), title);
+        let _ = writeln!(
+            f,
+            "===== {} | {} | v{} | pid {} =====",
+            iso_now(),
+            title,
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        );
         let _ = writeln!(f, "{body}");
+    }
+}
+
+/// Rewrite `crash.log` keeping only its most recent entries, so a panic loop
+/// cannot fill the disk. Best effort.
+fn truncate_crash_log_to_tail(path: &Path) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let keep_from = bytes.len().saturating_sub(CRASH_LOG_MAX_BYTES / 2);
+    // Start at the next entry boundary so we never cut mid-section.
+    let start = bytes[keep_from..]
+        .iter()
+        .position(|&b| b == b'=')
+        .map(|i| keep_from + i)
+        .unwrap_or(keep_from);
+    let tail = &bytes[start..];
+    if fs::write(path, tail).is_err() {
+        // Corrupt/unreadable: start fresh rather than lose future reports.
+        let _ = fs::write(path, b"");
     }
 }
 
@@ -242,16 +311,59 @@ fn fallback_data_dir() -> Option<PathBuf> {
     Some(PathBuf::from("."))
 }
 
-fn unix_now() -> u64 {
+fn iso_now() -> String {
+    // ISO-8601 local-ish timestamp: self-contained and greppable, unlike a
+    // raw epoch that needs a converter to be read.
+    let secs = unix_secs();
+    let (y, mo, d, h, mi, s) = epoch_to_ymdhms(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
+fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
+/// Civil-time breakdown of a Unix epoch second (UTC).
+///
+/// Why not `chrono`: this is the *only* place the binary needs date math, and
+/// pulling a crate in for one function is not worth it. Algorithm is Howard
+/// Hinnant's `civil_from_days`.
+fn epoch_to_ymdhms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let h = (rem / 3600) as u32;
+    let mi = ((rem % 3600) / 60) as u32;
+    let s = (rem % 60) as u32;
+
+    // Days since 1970-01-01 → (year, month, day).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    // NOTE: the trailing `/ 365` below is load-bearing. Without it `yoe`
+    // runs away and every later field is garbage. Verified against known
+    // epochs in the unit tests at the bottom of this file.
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (
+        y as i32 + if m <= 2 { 1 } else { 0 },
+        m as u32,
+        d as u32,
+        h,
+        mi,
+        s,
+    )
+}
+
 /// Deletes daily log files older than the retention window (best effort).
 fn prune_old_logs(logs_dir: &Path) {
-    let cutoff = unix_now().saturating_sub(LOG_RETENTION_DAYS * 24 * 3600);
+    let cutoff = unix_secs().saturating_sub(LOG_RETENTION_DAYS * 24 * 3600);
     let Ok(entries) = fs::read_dir(logs_dir) else {
         return;
     };
@@ -297,5 +409,59 @@ mod tests {
         let content =
             fs::read_to_string(dir.join("logs").join("crash.log")).expect("crash.log exists");
         assert!(content.contains("TEST") && content.contains("hello"));
+    }
+
+    #[test]
+    fn crash_log_entries_carry_version_and_iso_timestamp() {
+        let dir = std::env::temp_dir().join("voice-ptt-crashlog-meta-test");
+        let _ = fs::remove_dir_all(&dir);
+        append_to_crash_log_in(&dir, "PANIC", "at src/x.rs:1:1\nboom");
+        let line = fs::read_to_string(dir.join("logs").join("crash.log"))
+            .expect("crash.log exists")
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        // ISO-8601 UTC + version + pid, not a bare epoch.
+        assert!(line.starts_with("===== 20"), "header was: {line}");
+        assert!(line.contains("UTC"), "header was: {line}");
+        assert!(
+            line.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "header was: {line}"
+        );
+        assert!(line.contains("pid "), "header was: {line}");
+    }
+
+    #[test]
+    fn crash_log_is_capped_under_a_panic_storm() {
+        let dir = std::env::temp_dir().join("voice-ptt-crashlog-cap-test");
+        let _ = fs::remove_dir_all(&dir);
+        // Simulate a per-frame panic: far more sections than the cap allows.
+        for i in 0..2_000 {
+            append_to_crash_log_in(&dir, "PANIC", &format!("at x.rs:1:1\noccurrence {i}"));
+        }
+        let len = fs::metadata(dir.join("logs").join("crash.log"))
+            .expect("crash.log exists")
+            .len();
+        assert!(
+            len <= 2 * CRASH_LOG_MAX_BYTES as u64,
+            "crash.log grew to {len} bytes"
+        );
+    }
+
+    #[test]
+    fn epoch_to_ymdhms_matches_known_dates() {
+        // 2026-09-26 00:00:00 UTC
+        assert_eq!(epoch_to_ymdhms(1_790_380_800), (2026, 9, 26, 0, 0, 0));
+        // 1970-01-01 00:00:00 UTC (the epoch itself)
+        assert_eq!(epoch_to_ymdhms(0), (1970, 1, 1, 0, 0, 0));
+        // Leap day: 2024-02-29 12:30:05 UTC
+        assert_eq!(epoch_to_ymdhms(1_709_209_805), (2024, 2, 29, 12, 30, 5));
+        // Year rollover: 2025-01-01 00:00:00 UTC
+        assert_eq!(epoch_to_ymdhms(1_735_689_600), (2025, 1, 1, 0, 0, 0));
+        // 2026-09-14 00:24:25 UTC — a real crash.log timestamp
+        assert_eq!(epoch_to_ymdhms(1_789_345_465), (2026, 9, 14, 0, 24, 25));
+        // 2000-02-29 (leap century rule: 2000 IS a leap year)
+        assert_eq!(epoch_to_ymdhms(951_782_400), (2000, 2, 29, 0, 0, 0));
     }
 }
