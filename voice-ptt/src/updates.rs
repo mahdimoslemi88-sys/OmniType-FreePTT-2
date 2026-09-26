@@ -209,12 +209,17 @@ pub async fn perform_check(state: &SharedUpdateState, current_version: &str) {
 
 /// Spawns a background task that executes an initial delayed check (5s)
 /// and subsequent periodic checks according to user settings.
+///
+/// Must be spawned onto an existing runtime via `rt.spawn(...)`, because
+/// `tokio::spawn` requires a runtime context and this function runs on the
+/// plain main thread during startup.
 pub fn spawn_background_checker(
+    rt: &tokio::runtime::Runtime,
     state: SharedUpdateState,
     settings: Arc<RwLock<crate::config::settings::Settings>>,
     current_version: &'static str,
 ) {
-    tokio::spawn(async move {
+    rt.spawn(async move {
         // Initial delay to never compete with startup, audio, or tray initialization
         tokio::time::sleep(Duration::from_secs(5)).await;
 
