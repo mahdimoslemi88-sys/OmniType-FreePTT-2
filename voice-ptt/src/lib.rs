@@ -167,7 +167,8 @@ pub fn run() -> Result<()> {
     // Spawned before the whisper download so first-launch users see the tray
     // right away; the big model streams in behind the UI.
     let (hk_tx, hk_rx) = std::sync::mpsc::channel::<HotkeyEvent>();
-    let listener = HotkeyListener::spawn(hk_tx)?;
+    let hotkey_config = HotkeyListener::config_from_settings(&settings.hotkey);
+    let listener = HotkeyListener::spawn_with_config(hk_tx, hotkey_config)?;
 
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<HotkeyEvent>();
     let overlay_flag = Arc::new(AtomicBool::new(false));
@@ -188,8 +189,10 @@ pub fn run() -> Result<()> {
         update_state.clone(),
     )?;
 
-    // Spawn background update checker (honors settings.updates.check_on_startup)
+    // Spawn background update checker (honors settings.updates.check_on_startup).
+    // Spawned onto the runtime handle (tokio::spawn needs runtime context).
     updates::spawn_background_checker(
+        &rt,
         update_state.clone(),
         settings_rwlock.clone(),
         env!("CARGO_PKG_VERSION"),
@@ -259,7 +262,11 @@ pub fn run() -> Result<()> {
     let models_dir = paths::resolve_models_dir();
     tracing::info!(models = %models_dir.display(), "models directory resolved");
     let model_path = models_dir.join(format!("ggml-{model_name}.bin"));
-    let whisper = Arc::new(WhisperEngine::load(&model_path, opts));
+    // Cold start: the ggml model file (up to ~1.6 GB for large-v3-turbo) is
+    // deliberately NOT loaded here. `WhisperEngine::cold` maps it only on the
+    // first transcription that actually routes to local ASR, so a user on a
+    // cloud engine (Google/Groq/…) never pays that memory cost at all.
+    let whisper = Arc::new(WhisperEngine::cold(model_path.clone(), opts));
     let health = asr::AsrEngine::health(whisper.as_ref());
     let engine_ready = health.is_available();
     tracing::info!(?health, ready = engine_ready, "whisper engine status");

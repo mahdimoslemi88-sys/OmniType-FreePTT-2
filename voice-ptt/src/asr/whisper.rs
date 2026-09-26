@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -55,20 +55,22 @@ pub struct WhisperEngine {
     opts: WhisperOptions,
     active_transcriptions: Arc<AtomicUsize>,
     load_error: RwLock<Option<String>>,
+    /// Serializes the one-time lazy model load: concurrent transcriptions must
+    /// not each map the ~1.6 GB model file into RAM. Kept separate from
+    /// `context` so the (very common) read of an already-loaded context stays
+    /// a cheap read lock.
+    load_lock: Mutex<()>,
 }
 
 impl Clone for WhisperEngine {
     fn clone(&self) -> Self {
         Self {
-            context: RwLock::new(
-                self.context.read().expect("context lock poisoned").clone(),
-            ),
+            context: RwLock::new(self.context.read().expect("context lock poisoned").clone()),
             model_path: RwLock::new(self.model_path().clone()),
             opts: self.opts.clone(),
             active_transcriptions: self.active_transcriptions.clone(),
-            load_error: RwLock::new(
-                self.load_error.read().expect("load_error lock poisoned").clone(),
-            ),
+            load_error: RwLock::new(self.load_error.read().expect("load_error lock poisoned").clone()),
+            load_lock: Mutex::new(()),
         }
     }
 }
@@ -94,6 +96,7 @@ impl WhisperEngine {
                 load_error: RwLock::new(Some(
                     "model file not present yet (background download pending)".into(),
                 )),
+                load_lock: Mutex::new(()),
             };
         }
         match Self::load_inner(model_path) {
@@ -103,6 +106,7 @@ impl WhisperEngine {
                 opts,
                 active_transcriptions: Arc::new(AtomicUsize::new(0)),
                 load_error: RwLock::new(None),
+                load_lock: Mutex::new(()),
             },
             Err(e) => Self {
                 context: RwLock::new(None),
@@ -110,7 +114,28 @@ impl WhisperEngine {
                 opts,
                 active_transcriptions: Arc::new(AtomicUsize::new(0)),
                 load_error: RwLock::new(Some(format!("{e:#}"))),
+                load_lock: Mutex::new(()),
             },
+        }
+    }
+
+    /// Creates an engine that starts **cold**: the model file is *not*
+    /// loaded until the first transcription that actually routes to this
+    /// engine ([`Self::ensure_loaded`]).
+    ///
+    /// Why: a `large-v3-turbo` ggml model maps almost 1:1 into private
+    /// process memory (~1.6 GB). Loading it eagerly at startup commits all
+    /// of that RAM even when the user has selected a cloud engine and the
+    /// local one never runs. Starting cold keeps the memory uncommitted
+    /// until it is genuinely needed.
+    pub fn cold(model_path: PathBuf, opts: WhisperOptions) -> Self {
+        Self {
+            context: RwLock::new(None),
+            model_path: RwLock::new(model_path),
+            opts,
+            active_transcriptions: Arc::new(AtomicUsize::new(0)),
+            load_error: RwLock::new(None),
+            load_lock: Mutex::new(()),
         }
     }
 
@@ -145,6 +170,58 @@ impl WhisperEngine {
         }
     }
 
+    /// Loads the model on first use. On a cold engine ([`Self::cold`]) the
+    /// model file is deliberately absent from memory until the router actually
+    /// routes an utterance to this engine — committing ~1.6 GB of RAM only
+    /// then. Idempotent once loaded, and never panics.
+    fn ensure_loaded(&self) {
+        // Fast path: already loaded (cheap read lock, no contention).
+        if self.context.read().expect("context lock poisoned").is_some() {
+            return;
+        }
+
+        // Only the first caller maps the model; the rest wait on this guard
+        // and then see the context the winner installed.
+        let _guard = self.load_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Re-check under the exclusive lock (double-checked locking).
+        if self.context.read().expect("context lock poisoned").is_some() {
+            return;
+        }
+        // A previous load failed: keep its reason instead of hammering the
+        // file on every transcription attempt.
+        if self.load_error.read().map(|e| e.is_some()).unwrap_or(false) {
+            return;
+        }
+
+        let path = self.model_path();
+        if !path.is_file() {
+            if let Ok(mut err) = self.load_error.write() {
+                *err = Some("model file not present yet (background download pending)".into());
+            }
+            return;
+        }
+
+        tracing::info!(model = %path.display(), "loading whisper model on first use");
+        match Self::load_inner(&path) {
+            Ok(context) => {
+                if let Ok(mut ctx) = self.context.write() {
+                    *ctx = Some(context);
+                }
+                if let Ok(mut err) = self.load_error.write() {
+                    *err = None;
+                }
+                tracing::info!(model = %path.display(), "whisper model loaded (lazy)");
+            }
+            Err(e) => {
+                if let Ok(mut err) = self.load_error.write() {
+                    *err = Some(format!("{e:#}"));
+                }
+                tracing::error!(model = %path.display(), error = %e, "lazy whisper model load failed");
+            }
+        }
+    }
+
     pub fn model_path(&self) -> PathBuf {
         self.model_path.read().expect("model_path lock poisoned").clone()
     }
@@ -155,12 +232,25 @@ impl WhisperEngine {
     }
 
     fn transcribe_blocking(&self, audio: &AudioUtterance) -> Result<String> {
+        // Load the model now, on the transcription's blocking thread. This is
+        // the whole point of the cold-start engine: the ~1.6 GB mapping lands
+        // only when a user actually needs local ASR.
+        self.ensure_loaded();
+
         let context = self
             .context
             .read()
             .expect("context lock poisoned")
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("whisper model not loaded"))?
+            .ok_or_else(|| {
+                let reason = self
+                    .load_error
+                    .read()
+                    .ok()
+                    .and_then(|e| e.clone())
+                    .unwrap_or_else(|| "whisper model not loaded".to_string());
+                anyhow::anyhow!("{reason}")
+            })?
             .clone();
 
         let samples = &audio.samples;
@@ -229,13 +319,21 @@ impl AsrEngine for WhisperEngine {
 
     fn health(&self) -> AsrHealth {
         let ctx = self.context.read().expect("context lock poisoned");
-        let err = self.load_error.read().expect("load_error lock poisoned");
-        match (&*ctx, &*err) {
-            (Some(_), _) => AsrHealth::Ready,
-            (None, Some(e)) => AsrHealth::Failed {
-                reason: e.clone(),
-            },
-            (None, None) => AsrHealth::NoModel,
+        match &*ctx {
+            // Loaded.
+            Some(_) => AsrHealth::Ready,
+            // Cold: report Ready whenever the model file is on disk and no
+            // load has failed yet — the ~1.6 GB is simply not mapped until
+            // the first transcription. Otherwise the router/dashboard would
+            // treat a perfectly usable engine as permanently offline.
+            None => {
+                let err = self.load_error.read().expect("load_error lock poisoned");
+                match &*err {
+                    None if self.model_path().is_file() => AsrHealth::Ready,
+                    Some(e) => AsrHealth::Failed { reason: e.clone() },
+                    None => AsrHealth::NoModel,
+                }
+            }
         }
     }
 
@@ -338,5 +436,80 @@ mod tests {
         // A failed reload keeps the engine cold and doesn't panic.
         assert!(!engine.reload(&path));
         assert!(!engine.health().is_available());
+    }
+
+    /// A cold engine whose model file *does* exist advertises Ready: the file
+    /// is loadable, it just has not been mapped into RAM yet.
+    #[test]
+    fn cold_engine_with_file_present_reports_ready() {
+        let dir = std::env::temp_dir().join("voice-ptt-whisper-cold-ready");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.bin");
+        std::fs::write(&path, b"not a ggml model").unwrap();
+
+        let engine = WhisperEngine::cold(path, WhisperOptions::default());
+        assert_eq!(
+            engine.health(),
+            AsrHealth::Ready,
+            "a loadable model file must not look offline to the router"
+        );
+
+        // The first transcription triggers the load, records the parse
+        // failure, and then correctly reports a failed engine.
+        let utt = AudioUtterance {
+            samples: vec![0.0; 16_000],
+            sample_rate: 16_000,
+        };
+        assert!(AsrEngine::transcribe(&engine, &utt).is_err());
+        assert!(!engine.health().is_available());
+    }
+
+    /// A cold engine with no file on disk stays NoModel, not Failed.
+    #[test]
+    fn cold_engine_without_file_reports_no_model() {
+        let dir = std::env::temp_dir().join("voice-ptt-whisper-cold-nomodel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = WhisperEngine::cold(dir.join("model.bin"), WhisperOptions::default());
+        assert_eq!(engine.health(), AsrHealth::NoModel);
+    }
+
+    /// Repeated health() calls on a cold engine must be stable and cheap
+    /// (each one probes the file only until a load has been attempted).
+    #[test]
+    fn cold_engine_health_is_stable() {
+        let dir = std::env::temp_dir().join("voice-ptt-whisper-cold-stable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = WhisperEngine::cold(dir.join("model.bin"), WhisperOptions::default());
+        assert_eq!(engine.health(), AsrHealth::NoModel);
+        assert_eq!(engine.health(), AsrHealth::NoModel);
+    }
+
+    /// `cold` and `load` see the same model file; only the eager load maps it.
+    #[test]
+    fn cold_and_load_report_consistently_for_present_file() {
+        let dir = std::env::temp_dir().join("voice-ptt-whisper-cold-vs-load");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.bin");
+        std::fs::write(&path, b"not a ggml model").unwrap();
+
+        // Both engines will fail to parse this file, so both end up Failed;
+        // the point is they agree after a load attempt.
+        let cold = WhisperEngine::cold(path.clone(), WhisperOptions::default());
+        assert!(AsrEngine::transcribe(&cold, &AudioUtterance {
+            samples: vec![0.0; 16_000],
+            sample_rate: 16_000,
+        })
+        .is_err());
+        let eager = WhisperEngine::load(&path, WhisperOptions::default());
+        assert!(AsrEngine::transcribe(&eager, &AudioUtterance {
+            samples: vec![0.0; 16_000],
+            sample_rate: 16_000,
+        })
+        .is_err());
+        assert_eq!(cold.health(), eager.health());
     }
 }

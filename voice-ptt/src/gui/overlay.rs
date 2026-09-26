@@ -16,6 +16,7 @@ use unicode_bidi::BidiInfo;
 use crate::asr::engine::AsrHealth;
 use crate::asr::router::AsrRouter;
 use crate::config::settings::{CustomProvider, Settings};
+use crate::hotkey::binding::HotkeyBinding;
 use crate::hotkey::HotkeyEvent;
 use crate::processing::Dictionary;
 use crate::state::{AppState, AppStatus};
@@ -51,14 +52,23 @@ fn validate_settings(s: &Settings) -> Result<(), String> {
     if s.vad.silence_timeout_ms == 0 {
         return Err(format_persian_display("مدت سکوت باید بزرگتر از صفر باشد"));
     }
-    if s.hotkey.record.trim().is_empty() {
-        return Err(format_persian_display("کلید ضبط نمی‌تواند خالی باشد"));
+    // Hotkey strings are parsed into virtual-key codes at startup; a string
+    // that cannot be parse is rejected here so the user sees the problem in the
+    // settings UI instead of silently falling back to the default.
+    if let Err(e) = HotkeyBinding::parse(&s.hotkey.record) {
+        return Err(format_persian_display(&format!(
+            "کلید ضبط نامعتبر است: {e}"
+        )));
     }
-    if s.hotkey.toggle_overlay.trim().is_empty() {
-        return Err(format_persian_display("کلید نمایش/مخفی نمی‌تواند خالی باشد"));
+    if let Err(e) = HotkeyBinding::parse(&s.hotkey.toggle_overlay) {
+        return Err(format_persian_display(&format!(
+            "کلید نمایش/مخفی نامعتبر است: {e}"
+        )));
     }
-    if s.hotkey.quit.trim().is_empty() {
-        return Err(format_persian_display("کلید خروج نمی‌تواند خالی باشد"));
+    if let Err(e) = HotkeyBinding::parse(&s.hotkey.quit) {
+        return Err(format_persian_display(&format!(
+            "کلید خروج نامعتبر است: {e}"
+        )));
     }
     Ok(())
 }
@@ -85,13 +95,162 @@ pub fn format_persian_display(text: &str) -> String {
     let bidi_info = BidiInfo::new(&reshaped, None);
     let mut visual = String::new();
     for para in &bidi_info.paragraphs {
-        let line = bidi_info.reorder_line(para, para.range.clone());
+        let mut line = bidi_info.reorder_line(para, para.range.clone()).into_owned();
+        // Rule L4 (mirroring): inside an RTL paragraph, mirrored characters
+        // such as ( ) [ ] { } < > must be visually swapped. unicode-bidi
+        // deliberately leaves this to the engine; without it, parentheses in
+        // Persian text render as `)(` — reversed.
+        if para.level.is_rtl() {
+            mirror_chars(&mut line);
+        }
         if !visual.is_empty() {
             visual.push(' ');
         }
         visual.push_str(&line);
     }
     visual
+}
+
+/// Replaces each mirrored-punctuation character with its mirror image
+/// (Unicode Bidi Rule L4). Only applied to RTL paragraphs.
+fn mirror_chars(s: &mut String) {
+    let mirrored: Vec<char> = s
+        .chars()
+        .map(|c| match c {
+            '(' => ')',
+            ')' => '(',
+            '[' => ']',
+            ']' => '[',
+            '{' => '}',
+            '}' => '{',
+            '<' => '>',
+            '>' => '<',
+            '‹' => '›',
+            '›' => '‹',
+            '«' => '»',
+            '»' => '«',
+            '⁅' => '⁆',
+            '⁆' => '⁅',
+            '⁽' => '⁾',
+            '⁾' => '⁽',
+            _ => c,
+        })
+        .collect();
+    *s = mirrored.into_iter().collect();
+}
+
+/// A `TextEdit` layouter that reshapes Persian text so letters connect
+/// properly. egui has no built-in Arabic shaping, so a raw `TextEdit` shows
+/// every Persian letter disconnected ("ک ل م ه" instead of "کلمه"). This lays
+/// the buffer's text out through `format_persian_display`, while the editable
+/// buffer itself keeps the original keystrokes.
+pub fn persian_text_edit_layouter(
+    ui: &egui::Ui,
+    text: &str,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let shaped = format_persian_display(text);
+    let valign = ui.layout().vertical_align();
+    let mut layout_job = egui::text::LayoutJob::single_section(
+        shaped,
+        egui::text::TextFormat {
+            font_id: egui::FontSelection::Default.resolve(ui.style()),
+            color: ui.visuals().text_color(),
+            ..Default::default()
+        },
+    );
+    layout_job.wrap = egui::text::TextWrapping::wrap_at_width(wrap_width);
+    layout_job.sections[0].format.valign = valign;
+    ui.fonts(|f| f.layout_job(layout_job))
+}
+
+/// Converts the latest egui key press into a hotkey binding token such as
+/// "CapsLock", "Ctrl+Alt+S", or "Shift+F5". Returns  until a real
+/// (non-modifier) key goes down.
+///
+/// egui 0.28 has no , so the physical key is detected from the
+/// raw  stream by its logical-key value, which winit reports for
+/// CapsLock even though egui does not model it.
+fn egui_key_to_hotkey_token(ctx: &egui::Context) -> Option<String> {
+    let modifiers = ctx.input(|i| i.modifiers);
+    let key = ctx.input(|i| {
+        i.events.iter().find_map(|ev| match ev {
+            egui::Event::Key { key, pressed: true, .. } => Some(*key),
+            _ => None,
+        })
+    })?;
+
+    // egui only reports modifier keys here when they are pressed alone; we
+    // wait for the actual key the user binds.
+    match key {
+        egui::Key::A
+        | egui::Key::B
+        | egui::Key::C
+        | egui::Key::D
+        | egui::Key::E
+        | egui::Key::F
+        | egui::Key::G
+        | egui::Key::H
+        | egui::Key::I
+        | egui::Key::J
+        | egui::Key::K
+        | egui::Key::L
+        | egui::Key::M
+        | egui::Key::N
+        | egui::Key::O
+        | egui::Key::P
+        | egui::Key::Q
+        | egui::Key::R
+        | egui::Key::S
+        | egui::Key::T
+        | egui::Key::U
+        | egui::Key::V
+        | egui::Key::W
+        | egui::Key::X
+        | egui::Key::Y
+        | egui::Key::Z => {}
+        egui::Key::Space
+        | egui::Key::Tab
+        | egui::Key::Enter
+        | egui::Key::Escape
+        | egui::Key::Backspace
+        | egui::Key::Delete
+        | egui::Key::Insert
+        | egui::Key::Home
+        | egui::Key::End
+        | egui::Key::PageUp
+        | egui::Key::PageDown
+        | egui::Key::ArrowUp
+        | egui::Key::ArrowDown
+        | egui::Key::ArrowLeft
+        | egui::Key::ArrowRight
+        | egui::Key::F1
+        | egui::Key::F2
+        | egui::Key::F3
+        | egui::Key::F4
+        | egui::Key::F5
+        | egui::Key::F6
+        | egui::Key::F7
+        | egui::Key::F8
+        | egui::Key::F9
+        | egui::Key::F10
+        | egui::Key::F11
+        | egui::Key::F12 => {}
+        _ => return None,
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if modifiers.ctrl {
+        parts.push("Ctrl".into());
+    }
+    if modifiers.alt {
+        parts.push("Alt".into());
+    }
+    if modifiers.shift {
+        parts.push("Shift".into());
+    }
+    parts.push(format!("{:?}", key));
+    Some(parts.join("+"))
 }
 
 /// OmniType UI palette. Two complete themes behind identical role names,
@@ -332,7 +491,6 @@ const TOAST_ACCENT: egui::Color32 = palette::ACCENT;
 /// Height of the transparent glass host viewport; sized for two stacked
 /// compact cards (max 4 caption rows each: 3 text + footer) with headroom,
 /// so even the tallest preview never clips.
-const TOAST_HOST_HEIGHT: f32 = 190.0;
 const TOAST_TOTAL_SECS: u64 = 10;
 
 /// Width cap for a toast card (vendored egui-notify width-cap port of
@@ -379,23 +537,52 @@ fn restore_toast_style(ctx: &egui::Context, original: std::sync::Arc<egui::Style
 /// with a live countdown footer (`⏱ Ns`). Only the preview is truncated —
 /// the full raw text is what click-to-copy puts on the clipboard.
 ///
-/// No blank spacer row is emitted between body and footer: egui-notify
-/// measures each card from its laid-out galley every frame, so a tight
-/// caption directly shrinks short previews (1-line text => 2-row card).
-fn toast_caption(display: &str, remaining_secs: u64) -> String {
+/// Wrapping is done on the *raw* source text at word boundaries (never
+/// mid-word), then each completed line is shaped. Splits on the raw text so
+/// that `format_persian_display` (reshaping + bidi) is applied per finished
+/// line; splitting the already-shaped string breaks the ligatures.
+fn toast_caption(raw: &str, remaining_secs: u64) -> String {
     const CHARS_PER_LINE: usize = 44;
     const MAX_LINES: usize = 3;
 
-    let mut out = String::new();
-    for (i, ch) in display.chars().enumerate() {
-        if i / CHARS_PER_LINE >= MAX_LINES {
-            out.push('…');
-            break;
+    // Greedy word-wrap: accumulate words while the line stays within budget.
+    // A single word longer than the budget is emitted whole rather than cut.
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in raw.split_whitespace() {
+        let extra = if current.is_empty() { 0 } else { 1 };
+        if current.chars().count() + extra + word.chars().count() > CHARS_PER_LINE
+            && !current.is_empty()
+        {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() == MAX_LINES {
+                break;
+            }
         }
-        if i > 0 && i % CHARS_PER_LINE == 0 {
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() && lines.len() < MAX_LINES {
+        lines.push(current);
+    }
+
+    // Truncation marker when the transcript needed more than MAX_LINES.
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
             out.push('\n');
         }
-        out.push(ch);
+        out.push_str(&format_persian_display(line));
+    }
+    if raw.split_whitespace().count() > 0 && lines.len() == MAX_LINES {
+        // Greedy wrap stops after 3 lines; detect overflow by comparing the
+        // characters the lines cover against the whole source.
+        let covered: usize = lines.iter().map(|l| l.chars().count()).sum::<usize>() + MAX_LINES - 1;
+        if covered < raw.chars().count() {
+            out.push_str(&format_persian_display(" …"));
+        }
     }
     out.push('\n');
     out.push_str(&format!("{} {}s", ic::TIMER, remaining_secs));
@@ -460,6 +647,7 @@ fn manager_subtitle(ui: &mut egui::Ui, text: &str) {
 /// Masks a secret for safe display (`gsk_...3a1f`): keeps the first 4 and
 /// last 4 characters, replacing the middle with an ellipsis. Short or empty
 /// secrets collapse to a neutral placeholder so no key is ever shown in full.
+#[allow(dead_code)]
 fn mask_secret(secret: &str) -> String {
     let trimmed = secret.trim();
     if trimmed.is_empty() {
@@ -512,8 +700,9 @@ impl CalloutKind {
 }
 
 /// Inline callout: an icon + body text inside a tinted, stroked frame.
-/// The shadcn `Callout` equivalent, rendered with the centralized palette so
-/// no color is ever hardcoded outside `mod palette`.
+/// Uses `ui.horizontal` with explicit `.wrap()` on the label instead of
+/// `horizontal_wrapped`, because `horizontal_wrapped` in egui 0.28 sets
+/// `cursor.max.x = f32::NAN` when wrapping in a `RightToLeft` layout.
 fn callout(ui: &mut egui::Ui, kind: CalloutKind, body: &str) {
     let (bg, stroke, icon_color) = kind.colors();
     let icon = kind.icon();
@@ -523,38 +712,62 @@ fn callout(ui: &mut egui::Ui, kind: CalloutKind, body: &str) {
         .rounding(egui::Rounding::same(6.0))
         .inner_margin(egui::Margin::symmetric(10.0, 7.0))
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(icon).size(13.0).color(icon_color));
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format_persian_display(body))
-                        .size(11.0)
-                        .color(palette::TEXT_PRIMARY),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format_persian_display(body))
+                            .size(11.0)
+                            .color(palette::TEXT_PRIMARY),
+                    )
+                    .wrap(),
                 );
             });
         });
 }
 
-/// Paints a styled table-header row into an existing `egui::Grid`. Call this
-/// as the first row of the grid; it consumes one row via `end_row()`.
-/// Each header cell sits on `palette::TABLE_HEADER_BG` so the header reads as
-/// a distinct band even with the grid's own zebra striping below it.
-fn table_header_row(ui: &mut egui::Ui, columns: &[&str]) {
-    for col in columns {
-        egui::Frame::none()
-            .fill(palette::TABLE_HEADER_BG)
-            .inner_margin(egui::Margin::symmetric(4.0, 2.0))
-            .rounding(egui::Rounding::same(3.0))
-            .show(ui, |ui| {
+/// Renders a single right-to-left form row without `egui::Grid` (because `Grid`
+/// in egui 0.28 sets `cursor.min.x = -INFINITY` on row 0 inside RTL parent
+/// layouts, corrupting `max_rect` and panicking during hit-testing).
+/// Places the Persian label on the visual right in a fixed-width slot and runs
+/// `add_control` immediately to its left so controls align vertically.
+fn rtl_form_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    label_width: f32,
+    add_control: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(label_width, 22.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.set_min_width(label_width);
                 ui.label(
-                    egui::RichText::new(format_persian_display(col))
-                        .strong()
-                        .size(10.5)
+                    egui::RichText::new(format_persian_display(label))
+                        .size(11.0)
                         .color(palette::TEXT_LABEL),
                 );
-            });
-    }
-    ui.end_row();
+            },
+        );
+        add_control(ui);
+    });
+}
+
+/// Renders a fixed-width cell inside an RTL horizontal table row, enforcing
+/// `min_width` so subsequent cells in the row start at a deterministic X offset.
+fn rtl_table_cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    layout: egui::Layout,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    ui.allocate_ui_with_layout(egui::vec2(width, 22.0), layout, |ui| {
+        ui.set_min_width(width);
+        add_contents(ui);
+    });
 }
 
 /// Geometry families for [`status_chip`].
@@ -742,6 +955,21 @@ pub fn enable_true_transparency(hwnd: isize) {
     }
 }
 
+/// True screen dimensions in physical pixels. Used to center the dashboard
+/// viewport: inside a child viewport, `ctx.screen_rect()` returns the *parent*
+/// viewport's rect (the tiny capsule), not the monitor, so positioning from it
+/// pins the dashboard to the capsule's corner.
+#[cfg(windows)]
+fn true_screen_size_px() -> Option<(i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    unsafe { Some((GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))) }
+}
+
+#[cfg(not(windows))]
+fn true_screen_size_px() -> Option<(i32, i32)> {
+    None
+}
+
 #[cfg(windows)]
 static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
@@ -907,6 +1135,11 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     history_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Set externally (tray menu) to request opening the settings window.
     settings_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// True for a few frames after the dashboard is asked to open: the OS
+    /// window shape must be re-applied (it was sized like the capsule).
+    dashboard_needs_shape: bool,
+    /// Counts frames since the last dashboard open request (bounds the reshaping work).
+    dashboard_shape_frames: u32,
     /// Set externally (tray menu / hotkey) to request application quit.
     quit_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Shared technical dictionary for real-time rule management.
@@ -954,6 +1187,9 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     dict_edit_cat: String,
     /// Pending settings edits, applied to `Settings` only on a validated save.
     draft_settings: Settings,
+    /// Per-field hotkey capture state: when true, the next key press is
+    /// recorded into the corresponding setting instead of being typed.
+    capturing_hotkey: [bool; 3],
     /// True while the draft was validated and saved since the last disk reload.
     settings_saved: bool,
     /// Inline validation error for the current draft (empty = valid).
@@ -1011,6 +1247,9 @@ impl OverlayApp {
             engine_flag,
             history_flag,
             settings_flag,
+            dashboard_needs_shape: false,
+            dashboard_shape_frames: 0,
+            capturing_hotkey: [false; 3],
             quit_flag,
             dictionary,
             router,
@@ -1075,6 +1314,12 @@ impl OverlayApp {
     /// Renders the standalone Dictionary Manager window in an immediate viewport.
     /// Dictionary tab body for the unified dashboard (viewport wrapper removed).
     fn render_dict_body(&mut self, ui: &mut egui::Ui) {
+                        // egui has no Arabic shaping, so every TextEdit here
+                        // lays its text out through the Persian reshaper via a
+                        // shared closure, keeping letters connected.
+                        let mut persian_layouter =
+                            |ui: &egui::Ui, text: &str, w: f32| persian_text_edit_layouter(ui, text, w);
+
                         // ── Header & Title ──
                         let total_rules = self.dictionary.read().map(|d| d.len()).unwrap_or(0);
                         manager_header(
@@ -1112,8 +1357,9 @@ impl OverlayApp {
 
                         // ── Card 1: Add New Word ──
                         manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.label(
-                                    egui::RichText::new(format!("{} {}", ic::PLUS, format_persian_display("افزودن یا ویرایش کلمه جدید:")))
+                                    egui::RichText::new(format!("{}  {}", format_persian_display("افزودن یا ویرایش کلمه جدید:"), ic::PLUS))
                                         .size(12.0)
                                         .strong()
                                         .color(palette::TEXT_SECTION),
@@ -1128,8 +1374,11 @@ impl OverlayApp {
                                     );
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.new_from)
-                                            .hint_text("پاتون / سی ان سی")
-                                            .desired_width(140.0),
+                                            .hint_text(format_persian_display(
+                                                "پاتون / سی ان سی",
+                                            ))
+                                            .desired_width(140.0)
+                                            .layouter(&mut persian_layouter),
                                     );
 
                                     ui.label(
@@ -1139,8 +1388,9 @@ impl OverlayApp {
                                     );
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.new_to)
-                                            .hint_text("پایتون / CNC")
-                                            .desired_width(140.0),
+                                            .hint_text(format_persian_display("پایتون / CNC"))
+                                            .desired_width(140.0)
+                                            .layouter(&mut persian_layouter),
                                     );
                                 });
 
@@ -1153,8 +1403,11 @@ impl OverlayApp {
                                     );
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.new_cat)
-                                            .hint_text("برنامه‌نویسی / مکانیک")
-                                            .desired_width(130.0),
+                                            .hint_text(format_persian_display(
+                                                "برنامه‌نویسی / مکانیک",
+                                            ))
+                                            .desired_width(130.0)
+                                            .layouter(&mut persian_layouter),
                                     );
 
                                     ui.add_space(8.0);
@@ -1194,127 +1447,284 @@ impl OverlayApp {
                         // ── Search Bar ──
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("{} {}", ic::MAGNIFYING_GLASS, format_persian_display("جستجو:")))
+                                egui::RichText::new(format!("{}  {}", format_persian_display("جستجو:"), ic::MAGNIFYING_GLASS))
                                     .size(11.5)
                                     .color(palette::TEXT_LABEL),
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.search_query)
-                                    .hint_text("جستجو در بین کلمات...")
-                                    .desired_width(ui.available_width() - 10.0),
+                                    .hint_text(format_persian_display("جستجو در بین کلمات..."))
+                                    .desired_width((ui.available_width() - 10.0).max(120.0))
+                                    .layouter(&mut persian_layouter),
                             );
                         });
 
                         ui.add_space(6.0);
 
-                        // ── Scrollable List of Rules ──
+                        // ── Scrollable RTL Table of Rules ──
+                        // Uses explicit RTL horizontal rows instead of `egui::Grid` because
+                        // `Grid` in egui 0.28 sets `cursor.min.x = -INFINITY` on row 0 inside
+                        // RTL parent layouts and forces LTR left-alignment.
                         let mut rule_to_remove: Option<String> = None;
                         let mut rule_to_edit: Option<usize> = None;
                         let query = self.search_query.trim().to_lowercase();
 
                         if let Ok(dict) = self.dictionary.read() {
                             let rules = dict.rules();
+                            // Header band (Right-to-Left: از → ← → به → دسته → عملیات)
+                            egui::Frame::none()
+                                .fill(palette::TABLE_HEADER_BG)
+                                .rounding(egui::Rounding::same(5.0))
+                                .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        rtl_table_cell(
+                                            ui,
+                                            150.0,
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format_persian_display("کلمه گفتاری (از)"))
+                                                        .strong()
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_LABEL),
+                                                );
+                                            },
+                                        );
+                                        rtl_table_cell(
+                                            ui,
+                                            28.0,
+                                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new("←")
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_FAINT),
+                                                );
+                                            },
+                                        );
+                                        rtl_table_cell(
+                                            ui,
+                                            150.0,
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format_persian_display("معادل صحیح (به)"))
+                                                        .strong()
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_LABEL),
+                                                );
+                                            },
+                                        );
+                                        rtl_table_cell(
+                                            ui,
+                                            110.0,
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format_persian_display("دسته"))
+                                                        .strong()
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_LABEL),
+                                                );
+                                            },
+                                        );
+                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format_persian_display("عملیات"))
+                                                    .strong()
+                                                    .size(10.5)
+                                                    .color(palette::TEXT_LABEL),
+                                            );
+                                        });
+                                    });
+                                });
+
+                            ui.add_space(3.0);
+
                             egui::ScrollArea::vertical()
+                                .id_source("dict_rules_scroll")
                                 .max_height(210.0)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    // Zebra stripe color driven by the palette
-                                    ui.style_mut().visuals.faint_bg_color = palette::TABLE_ROW_ALT;
-                                    egui::Grid::new("dict_rules_grid")
-                                        .striped(true)
-                                        .spacing([12.0, 6.0])
-                                        .min_col_width(80.0)
-                                        .show(ui, |ui| {
-                                            // Table Header
-                                            table_header_row(ui, &["کلمه گفتاری (از)", "", "معادل صحیح (به)", "دسته", "ویرایش", "حذف"]);
-
-                                            for (idx, r) in rules.iter().enumerate() {
-                                                if !query.is_empty() {
-                                                    let matches_from = r.from.to_lowercase().contains(&query);
-                                                    let matches_to = r.to.to_lowercase().contains(&query);
-                                                    let matches_cat = r.category.as_deref().unwrap_or("").to_lowercase().contains(&query);
-                                                    if !matches_from && !matches_to && !matches_cat {
-                                                        continue;
-                                                    }
-                                                }
-
-                                                if Some(idx) == self.dict_edit_index {
-                                                    // ── Inline editing row ──
-                                                    ui.add(
-                                                        egui::TextEdit::singleline(&mut self.dict_edit_from)
-                                                            .desired_width(90.0),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new("→")
-                                                            .size(11.0)
-                                                            .color(palette::TEXT_FAINT),
-                                                    );
-                                                    ui.add(
-                                                        egui::TextEdit::singleline(&mut self.dict_edit_to)
-                                                            .desired_width(90.0),
-                                                    );
-                                                    ui.add(
-                                                        egui::TextEdit::singleline(&mut self.dict_edit_cat)
-                                                            .desired_width(70.0),
-                                                    );
-                                                    if ui.button(egui::RichText::new(ic::CHECK).size(10.5)).clicked() {
-                                                        let from = self.dict_edit_from.trim().to_string();
-                                                        let to = self.dict_edit_to.trim().to_string();
-                                                        let cat = if self.dict_edit_cat.trim().is_empty() {
-                                                            None
-                                                        } else {
-                                                            Some(self.dict_edit_cat.trim().to_string())
-                                                        };
-                                                        if !from.is_empty() && !to.is_empty() && from != to {
-                                                            if let Ok(mut dict) = self.dictionary.write() {
-                                                                dict.remove_rule(idx);
-                                                                dict.add_rule(from, to, cat);
-                                                                let _ = dict.save_to_file();
-                                                                self.dict_msg = Some((
-                                                                    format_persian_display("قاعده به‌روزرسانی شد"),
-                                                                    Instant::now(),
-                                                                ));
-                                                            }
-                                                            self.dict_edit_index = None;
-                                                        }
-                                                    }
-                                                    if ui.button(egui::RichText::new(ic::X).size(10.5)).clicked() {
-                                                        self.dict_edit_index = None;
-                                                    }
-                                                } else {
-                                                    ui.label(
-                                                        egui::RichText::new(format_persian_display(&r.from))
-                                                            .size(11.0)
-                                                            .color(palette::TEXT_TABLE),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new("→")
-                                                            .size(11.0)
-                                                            .color(palette::TEXT_FAINT),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new(format_persian_display(&r.to))
-                                                            .size(11.0)
-                                                            .strong()
-                                                            .color(palette::ACCENT),
-                                                    );
-                                                    let cat_str = r.category.as_deref().unwrap_or("-");
-                                                    ui.label(
-                                                        egui::RichText::new(format_persian_display(cat_str))
-                                                            .size(9.5)
-                                                            .color(palette::TEXT_MUTED),
-                                                    );
-
-                                                    if ui.button(egui::RichText::new(ic::NOTE_PENCIL).size(10.5)).clicked() {
-                                                        rule_to_edit = Some(idx);
-                                                    }
-                                                    if ui.button(egui::RichText::new(ic::TRASH).size(10.5)).clicked() {
-                                                        rule_to_remove = Some(r.from.clone());
-                                                    }
-                                                }
-                                                ui.end_row();
+                                    for (idx, r) in rules.iter().enumerate() {
+                                        if !query.is_empty() {
+                                            let matches_from = r.from.to_lowercase().contains(&query);
+                                            let matches_to = r.to.to_lowercase().contains(&query);
+                                            let matches_cat = r.category.as_deref().unwrap_or("").to_lowercase().contains(&query);
+                                            if !matches_from && !matches_to && !matches_cat {
+                                                continue;
                                             }
-                                        });
+                                        }
+
+                                        let row_bg = if idx % 2 == 1 {
+                                            palette::TABLE_ROW_ALT
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        };
+
+                                        egui::Frame::none()
+                                            .fill(row_bg)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(ui.available_width());
+                                                ui.push_id(idx, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        if Some(idx) == self.dict_edit_index {
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                150.0,
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    ui.add(
+                                                                        egui::TextEdit::singleline(&mut self.dict_edit_from)
+                                                                            .desired_width(140.0)
+                                                                            .layouter(&mut persian_layouter),
+                                                                    );
+                                                                },
+                                                            );
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                28.0,
+                                                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new("←")
+                                                                            .size(11.0)
+                                                                            .color(palette::TEXT_FAINT),
+                                                                    );
+                                                                },
+                                                            );
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                150.0,
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    ui.add(
+                                                                        egui::TextEdit::singleline(&mut self.dict_edit_to)
+                                                                            .desired_width(140.0)
+                                                                            .layouter(&mut persian_layouter),
+                                                                    );
+                                                                },
+                                                            );
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                110.0,
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    ui.add(
+                                                                        egui::TextEdit::singleline(&mut self.dict_edit_cat)
+                                                                            .desired_width(100.0)
+                                                                            .layouter(&mut persian_layouter),
+                                                                    );
+                                                                },
+                                                            );
+                                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                                if ui
+                                                                    .button(egui::RichText::new(ic::X).size(10.5))
+                                                                    .clicked()
+                                                                {
+                                                                    self.dict_edit_index = None;
+                                                                }
+                                                                if ui
+                                                                    .button(egui::RichText::new(ic::CHECK).size(10.5))
+                                                                    .clicked()
+                                                                {
+                                                                    let from = self.dict_edit_from.trim().to_string();
+                                                                    let to = self.dict_edit_to.trim().to_string();
+                                                                    let cat = if self.dict_edit_cat.trim().is_empty() {
+                                                                        None
+                                                                    } else {
+                                                                        Some(self.dict_edit_cat.trim().to_string())
+                                                                    };
+                                                                    if !from.is_empty() && !to.is_empty() && from != to {
+                                                                        if let Ok(mut dict) = self.dictionary.write() {
+                                                                            dict.remove_rule(idx);
+                                                                            dict.add_rule(from, to, cat);
+                                                                            let _ = dict.save_to_file();
+                                                                            self.dict_msg = Some((
+                                                                                format_persian_display(
+                                                                                    "قاعده به‌روزرسانی شد",
+                                                                                ),
+                                                                                Instant::now(),
+                                                                            ));
+                                                                        }
+                                                                        self.dict_edit_index = None;
+                                                                    }
+                                                                }
+                                                            });
+                                                        } else {
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                150.0,
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format_persian_display(&r.from))
+                                                                            .size(11.0)
+                                                                            .color(palette::TEXT_TABLE),
+                                                                    );
+                                                                },
+                                                            );
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                28.0,
+                                                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new("←")
+                                                                            .size(11.0)
+                                                                            .color(palette::TEXT_FAINT),
+                                                                    );
+                                                                },
+                                                            );
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                150.0,
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format_persian_display(&r.to))
+                                                                            .size(11.0)
+                                                                            .strong()
+                                                                            .color(palette::ACCENT),
+                                                                    );
+                                                                },
+                                                            );
+                                                            let cat_str = r.category.as_deref().unwrap_or("-");
+                                                            rtl_table_cell(
+                                                                ui,
+                                                                110.0,
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format_persian_display(cat_str))
+                                                                            .size(9.5)
+                                                                            .color(palette::TEXT_MUTED),
+                                                                    );
+                                                                },
+                                                            );
+                                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                                if ui
+                                                                    .button(egui::RichText::new(ic::TRASH).size(10.5))
+                                                                    .clicked()
+                                                                {
+                                                                    rule_to_remove = Some(r.from.clone());
+                                                                }
+                                                                if ui
+                                                                    .button(egui::RichText::new(ic::NOTE_PENCIL).size(10.5))
+                                                                    .clicked()
+                                                                {
+                                                                    rule_to_edit = Some(idx);
+                                                                }
+                                                            });
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                    }
                                 });
                         }
 
@@ -1348,7 +1758,7 @@ impl OverlayApp {
 
                         // ── Bottom Action Buttons ──
                         ui.horizontal(|ui| {
-                            if ui.button(egui::RichText::new(format!("{} {}", ic::FLOPPY_DISK, format_persian_display("ذخیره در فایل"))).size(11.0)).clicked() {
+                            if ui.button(egui::RichText::new(format!("{}  {}", format_persian_display("ذخیره در فایل"), ic::FLOPPY_DISK)).size(11.0)).clicked() {
                                 if let Ok(dict) = self.dictionary.read() {
                                     if dict.save_to_file().is_ok() {
                                         self.dict_msg = Some((
@@ -1359,7 +1769,7 @@ impl OverlayApp {
                                 }
                             }
 
-                            if ui.button(egui::RichText::new(format!("{} {}", ic::ARROWS_CLOCKWISE, format_persian_display("بارگذاری مجدد"))).size(11.0)).clicked() {
+                            if ui.button(egui::RichText::new(format!("{}  {}", format_persian_display("بارگذاری مجدد"), ic::ARROWS_CLOCKWISE)).size(11.0)).clicked() {
                                 if let Ok(mut dict) = self.dictionary.write() {
                                     if dict.reload_from_file().is_ok() {
                                         self.dict_msg = Some((
@@ -1423,7 +1833,9 @@ impl OverlayApp {
                         let current_active = self.router.active_engine();
 
                         egui::ScrollArea::vertical()
-                            .max_height(220.0)
+                            .id_source("engines_list_scroll")
+                            .max_height(240.0)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 // Auto Fallback Option
                                 let is_auto = current_active == "auto";
@@ -1435,55 +1847,62 @@ impl OverlayApp {
                                         palette::CARD_STROKE
                                     },
                                 )
-                                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                                 .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            if ui.radio(is_auto, "").clicked() && !is_auto {
-                                                self.router.set_active_engine("auto");
-                                                if let Ok(mut s) = self.settings.write() {
-                                                    s.active_engine = "auto".to_string();
-                                                    let _ = s.save(&self.config_path);
-                                                }
-                                                self.engine_msg = Some((
-                                                    format_persian_display("حالت خودکار هوشمند (Auto) فعال شد."),
-                                                    Instant::now(),
-                                                ));
+                                    ui.set_min_width(ui.available_width());
+                                    // `ui.horizontal` inside `top_down(Align::RIGHT)` is already
+                                    // `right_to_left`. Place right-side items first so the
+                                    // `left_to_right` status chip at the end only claims the
+                                    // remaining left space instead of collapsing `cursor.max.x`.
+                                    ui.horizontal(|ui| {
+                                        if ui.radio(is_auto, "").clicked() && !is_auto {
+                                            self.router.set_active_engine("auto");
+                                            if let Ok(mut s) = self.settings.write() {
+                                                s.active_engine = "auto".to_string();
+                                                let _ = s.save(&self.config_path);
                                             }
+                                            self.engine_msg = Some((
+                                                format_persian_display("حالت خودکار هوشمند (Auto) فعال شد."),
+                                                Instant::now(),
+                                            ));
+                                        }
 
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(format_persian_display(
-                                                        "حالت خودکار هوشمند (Auto Fallback)",
-                                                    ))
-                                                    .strong()
-                                                    .size(12.0)
-                                                    .color(palette::TEXT_PRIMARY),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(format_persian_display(
-                                                        "اولویت‌بندی خودکار بین ابری و محلی؛ سوییچ بدون وقفه در قطعی شبکه",
-                                                    ))
-                                                    .size(10.0)
-                                                    .color(palette::TEXT_MUTED),
-                                                );
-                                            });
+                                        ui.add_space(4.0);
 
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                if is_auto {
-                                                    status_chip(
-                                                        ui,
-                                                        "انتخاب‌شده",
-                                                        palette::SUCCESS_PILL,
-                                                        palette::SUCCESS_OK,
-                                                        9.5,
-                                                        ChipFamily::Tiny,
-                                                    );
-                                                }
-                                            });
+                                        ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format_persian_display(
+                                                    "حالت خودکار هوشمند (Auto Fallback)",
+                                                ))
+                                                .strong()
+                                                .size(12.0)
+                                                .color(palette::TEXT_PRIMARY),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format_persian_display(
+                                                    "اولویت‌بندی خودکار بین ابری و محلی؛ سوییچ بدون وقفه در قطعی شبکه",
+                                                ))
+                                                .size(10.0)
+                                                .color(palette::TEXT_MUTED),
+                                            );
+                                        });
+
+                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            if is_auto {
+                                                status_chip(
+                                                    ui,
+                                                    "انتخاب‌شده",
+                                                    palette::SUCCESS_PILL,
+                                                    palette::SUCCESS_OK,
+                                                    9.5,
+                                                    ChipFamily::Tiny,
+                                                );
+                                            }
                                         });
                                     });
+                                });
 
-                                ui.add_space(4.0);
+                                ui.add_space(5.0);
 
                                 let mut to_delete: Option<String> = None;
                                 for (id, display_name, kind, health, _is_selected) in &engines {
@@ -1500,9 +1919,12 @@ impl OverlayApp {
                                             palette::CARD_STROKE
                                         },
                                     )
-                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                                     .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.push_id(id, |ui| {
                                             ui.horizontal(|ui| {
+                                                // Right side placed first in the RTL horizontal row
                                                 if ui.radio(is_active, "").clicked() && !is_active {
                                                     self.router.set_active_engine(id);
                                                     if let Ok(mut s) = self.settings.write() {
@@ -1537,9 +1959,11 @@ impl OverlayApp {
 
                                                 let (resp, painter) = ui.allocate_painter(egui::vec2(10.0, 10.0), egui::Sense::hover());
                                                 painter.circle_filled(resp.rect.center(), 3.5, dot_color);
-                                                resp.on_hover_text(&health_desc);
+                                                resp.on_hover_text(format_persian_display(&health_desc));
 
-                                                ui.vertical(|ui| {
+                                                ui.add_space(4.0);
+
+                                                ui.with_layout(egui::Layout::top_down(egui::Align::RIGHT), |ui| {
                                                     ui.horizontal(|ui| {
                                                         ui.label(
                                                             egui::RichText::new(display_name)
@@ -1565,7 +1989,8 @@ impl OverlayApp {
                                                     );
                                                 });
 
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                // Left side: Delete button (if custom) and Active status chip
+                                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                                     if *kind == "Cloud (Custom)" {
                                                         let del_btn = ui.add(
                                                             egui::Button::new(
@@ -1594,6 +2019,7 @@ impl OverlayApp {
                                                 });
                                             });
                                         });
+                                    });
                                     ui.add_space(4.0);
                                 }
 
@@ -1619,182 +2045,194 @@ impl OverlayApp {
                         ui.add_space(8.0);
 
                         // ── Add New API Provider Form ──
-                        ui.label(
-                            egui::RichText::new(format_persian_display("افزودن API / سرور دلخواه (سازگار با OpenAI):"))
-                                .size(12.5)
-                                .strong()
-                                .color(palette::TEXT_STRONG_SOFT),
-                        );
-                        ui.add_space(6.0);
-
-                        egui::Grid::new("add_provider_grid")
-                            .num_columns(2)
-                            .spacing([10.0, 6.0])
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE)
+                            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
                             .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}  {}",
+                                            format_persian_display("افزودن API / سرور دلخواه (سازگار با OpenAI):"),
+                                            ic::KEY
+                                        ))
+                                        .size(12.5)
+                                        .strong()
+                                        .color(palette::TEXT_SECTION),
+                                    );
+                                });
+                                ui.add_space(3.0);
                                 ui.label(
-                                    egui::RichText::new(format_persian_display("شناسه یکتا (ID):"))
-                                        .size(11.0)
-                                        .color(palette::TEXT_LABEL),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.new_engine_id)
-                                        .hint_text("e.g. custom_openai")
-                                        .desired_width(340.0),
-                                );
-                                ui.end_row();
-
-                                ui.label(
-                                    egui::RichText::new(format_persian_display("نام نمایشی:"))
-                                        .size(11.0)
-                                        .color(palette::TEXT_LABEL),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.new_engine_name)
-                                        .hint_text("e.g. OpenAI Whisper Large")
-                                        .desired_width(340.0),
-                                );
-                                ui.end_row();
-
-                                ui.label(
-                                    egui::RichText::new(format_persian_display("آدرس Base URL:"))
-                                        .size(11.0)
-                                        .color(palette::TEXT_LABEL),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.new_engine_url)
-                                        .hint_text("e.g. https://api.openai.com/v1")
-                                        .desired_width(340.0),
-                                );
-                                ui.end_row();
-
-                                ui.label(
-                                    egui::RichText::new(format_persian_display("کلید API:"))
-                                        .size(11.0)
-                                        .color(palette::TEXT_LABEL),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.new_engine_key)
-                                        .password(true)
-                                        .hint_text("sk-...")
-                                        .desired_width(340.0),
-                                );
-                                // Safe status line: the key is never echoed in full.
-                                let key_status = if self.new_engine_key.trim().is_empty() {
-                                    format_persian_display("کلید وارد نشده")
-                                } else {
-                                    format!("{} {}", mask_secret(&self.new_engine_key), format_persian_display("— ذخیره‌شده به‌صورت ماسک"))
-                                };
-                                ui.label(
-                                    egui::RichText::new(key_status)
-                                        .size(9.5)
+                                    egui::RichText::new(format_persian_display("اتصال به سرورهای محلی، Ollama، vLLM یا ارائه‌دهندگان ابری (OpenAI، Groq، Together و ...)"))
+                                        .size(10.0)
                                         .color(palette::TEXT_MUTED),
                                 );
-                                ui.end_row();
+                                ui.add_space(8.0);
 
-                                ui.label(
-                                    egui::RichText::new(format_persian_display("نام مدل:"))
-                                        .size(11.0)
-                                        .color(palette::TEXT_LABEL),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.new_engine_model)
-                                        .hint_text("whisper-1 / whisper-large-v3-turbo")
-                                        .desired_width(340.0),
-                                );
-                                ui.end_row();
+                                // 2-column RTL form layout instead of `egui::Grid` so all 6 fields
+                                // sit balanced across the card and never trigger `Grid`'s `-INFINITY`
+                                // row-0 cursor bug inside RTL layouts.
+                                ui.columns(2, |cols| {
+                                    cols[1].push_id("api_form_right_col", |ui| {
+                                        ui.with_layout(
+                                            egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
+                                            |ui| {
+                                                let field_w = (ui.available_width() - 108.0).max(120.0);
+                                                rtl_form_row(ui, "شناسه یکتا (ID):", 98.0, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.new_engine_id)
+                                                            .hint_text("e.g. custom_openai")
+                                                            .desired_width(field_w),
+                                                    );
+                                                });
+                                                ui.add_space(5.0);
+                                                rtl_form_row(ui, "نام نمایشی:", 98.0, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.new_engine_name)
+                                                            .hint_text("e.g. OpenAI Whisper Large")
+                                                            .desired_width(field_w),
+                                                    );
+                                                });
+                                                ui.add_space(5.0);
+                                                rtl_form_row(ui, "آدرس Base URL:", 98.0, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.new_engine_url)
+                                                            .hint_text("e.g. https://api.openai.com/v1")
+                                                            .desired_width(field_w),
+                                                    );
+                                                });
+                                            },
+                                        );
+                                    });
 
-                                ui.label(
-                                    egui::RichText::new(format_persian_display("زبان (Language):"))
-                                        .size(11.0)
-                                        .color(palette::TEXT_LABEL),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.new_engine_lang)
-                                        .hint_text("fa")
-                                        .desired_width(340.0),
-                                );
-                                ui.end_row();
-                            });
+                                    cols[0].push_id("api_form_left_col", |ui| {
+                                        ui.with_layout(
+                                            egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
+                                            |ui| {
+                                                let field_w = (ui.available_width() - 108.0).max(120.0);
+                                                rtl_form_row(ui, "کلید API:", 98.0, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.new_engine_key)
+                                                            .password(true)
+                                                            .hint_text("sk-...")
+                                                            .desired_width((field_w - 85.0).max(90.0)),
+                                                    );
+                                                    let key_status = if self.new_engine_key.trim().is_empty() {
+                                                        format_persian_display("وارد نشده")
+                                                    } else {
+                                                        format_persian_display("ماسک‌شده")
+                                                    };
+                                                    ui.label(
+                                                        egui::RichText::new(key_status)
+                                                            .size(9.5)
+                                                            .color(palette::TEXT_MUTED),
+                                                    );
+                                                });
+                                                ui.add_space(5.0);
+                                                rtl_form_row(ui, "نام مدل:", 98.0, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.new_engine_model)
+                                                            .hint_text("whisper-1 / whisper-large-v3-turbo")
+                                                            .desired_width(field_w),
+                                                    );
+                                                });
+                                                ui.add_space(5.0);
+                                                rtl_form_row(ui, "زبان (Language):", 98.0, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.new_engine_lang)
+                                                            .hint_text("fa")
+                                                            .desired_width(field_w),
+                                                    );
+                                                });
+                                            },
+                                        );
+                                    });
+                                });
 
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            let add_btn = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(format_persian_display("ثبت و فعال‌سازی این موتور"))
-                                        .strong()
-                                        .size(11.5)
-                                        .color(palette::WHITE),
-                                )
-                                .fill(palette::ACCENT_ACTION)
-                                .rounding(egui::Rounding::same(6.0)),
-                            );
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    let add_btn = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new(format!(
+                                                "{}  {}",
+                                                format_persian_display("ثبت و فعال‌سازی این موتور"),
+                                                ic::PLUS
+                                            ))
+                                            .strong()
+                                            .size(11.5)
+                                            .color(palette::WHITE),
+                                        )
+                                        .fill(palette::ACCENT_ACTION)
+                                        .rounding(egui::Rounding::same(6.0))
+                                        .min_size(egui::vec2(160.0, 26.0)),
+                                    );
 
-                            if add_btn.clicked() {
-                                let id = self.new_engine_id.trim().to_lowercase();
-                                let url = self.new_engine_url.trim().to_string();
-                                if id.is_empty() || url.is_empty() {
-                                    self.engine_msg = Some((
-                                        format_persian_display("خطا: شناسه (ID) و آدرس URL الزامی هستند."),
-                                        Instant::now(),
-                                    ));
-                                } else {
-                                    let name = if self.new_engine_name.trim().is_empty() {
-                                        id.clone()
-                                    } else {
-                                        self.new_engine_name.trim().to_string()
-                                    };
-                                    let model = if self.new_engine_model.trim().is_empty() {
-                                        "whisper-large-v3-turbo".to_string()
-                                    } else {
-                                        self.new_engine_model.trim().to_string()
-                                    };
-                                    let lang = if self.new_engine_lang.trim().is_empty() {
-                                        "fa".to_string()
-                                    } else {
-                                        self.new_engine_lang.trim().to_string()
-                                    };
-                                    let provider = CustomProvider {
-                                        id: id.clone(),
-                                        name,
-                                        base_url: url,
-                                        api_key: self.new_engine_key.trim().to_string(),
-                                        model,
-                                        language: lang,
-                                        timeout_secs: 20,
-                                    };
+                                    if add_btn.clicked() {
+                                        let id = self.new_engine_id.trim().to_lowercase();
+                                        let url = self.new_engine_url.trim().to_string();
+                                        if id.is_empty() || url.is_empty() {
+                                            self.engine_msg = Some((
+                                                format_persian_display("خطا: شناسه (ID) و آدرس URL الزامی هستند."),
+                                                Instant::now(),
+                                            ));
+                                        } else {
+                                            let name = if self.new_engine_name.trim().is_empty() {
+                                                id.clone()
+                                            } else {
+                                                self.new_engine_name.trim().to_string()
+                                            };
+                                            let model = if self.new_engine_model.trim().is_empty() {
+                                                "whisper-large-v3-turbo".to_string()
+                                            } else {
+                                                self.new_engine_model.trim().to_string()
+                                            };
+                                            let lang = if self.new_engine_lang.trim().is_empty() {
+                                                "fa".to_string()
+                                            } else {
+                                                self.new_engine_lang.trim().to_string()
+                                            };
+                                            let provider = CustomProvider {
+                                                id: id.clone(),
+                                                name,
+                                                base_url: url,
+                                                api_key: self.new_engine_key.trim().to_string(),
+                                                model,
+                                                language: lang,
+                                                timeout_secs: 20,
+                                            };
 
-                                    let usage_path = crate::paths::resolve_usage_path();
-                                    let engine = Arc::new(crate::asr::CloudEngine::new_custom(&provider, usage_path));
-                                    self.router.register_engine(engine);
-                                    self.router.set_active_engine(&id);
+                                            let usage_path = crate::paths::resolve_usage_path();
+                                            let engine = Arc::new(crate::asr::CloudEngine::new_custom(&provider, usage_path));
+                                            self.router.register_engine(engine);
+                                            self.router.set_active_engine(&id);
 
-                                    if let Ok(mut s) = self.settings.write() {
-                                        s.active_engine = id.clone();
-                                        s.add_or_update_provider(provider);
-                                        let _ = s.save(&self.config_path);
+                                            if let Ok(mut s) = self.settings.write() {
+                                                s.active_engine = id.clone();
+                                                s.add_or_update_provider(provider);
+                                                let _ = s.save(&self.config_path);
+                                            }
+
+                                            self.engine_msg = Some((
+                                                format_persian_display("مدل جدید ثبت و به عنوان موتور فعال انتخاب شد."),
+                                                Instant::now(),
+                                            ));
+                                            self.new_engine_id.clear();
+                                            self.new_engine_name.clear();
+                                            self.new_engine_url.clear();
+                                            self.new_engine_key.clear();
+                                        }
                                     }
 
-                                    self.engine_msg = Some((
-                                        format_persian_display("مدل جدید ثبت و به عنوان موتور فعال انتخاب شد."),
-                                        Instant::now(),
-                                    ));
-                                    self.new_engine_id.clear();
-                                    self.new_engine_name.clear();
-                                    self.new_engine_url.clear();
-                                    self.new_engine_key.clear();
-                                }
-                            }
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button(format_persian_display("تنظیمات")).clicked() {
-                                    if let Ok(s) = self.settings.read() {
-                                        self.draft_settings = s.clone();
+                                    ui.add_space(8.0);
+                                    if ui.button(egui::RichText::new(format!("{}  {}", format_persian_display("تنظیمات"), ic::GEAR)).size(11.0)).clicked() {
+                                        if let Ok(s) = self.settings.read() {
+                                            self.draft_settings = s.clone();
+                                        }
+                                        self.settings_error = None;
+                                        self.dashboard_tab = DashboardTab::Settings;
                                     }
-                                    self.settings_error = None;
-                                    self.dashboard_tab = DashboardTab::Settings;
-                                }
+                                });
                             });
-                        });
     }
 
     /// Renders the standalone Speech History & Clipboard manager window in an immediate viewport.
@@ -1826,7 +2264,7 @@ impl OverlayApp {
                             );
 
                             if !self.history.is_empty() {
-                                if ui.button(egui::RichText::new(format!("{} {}", ic::CLIPBOARD_TEXT, format_persian_display("کپی همه متن‌ها")))
+                                if ui.button(egui::RichText::new(format!("{}  {}", format_persian_display("کپی همه متن‌ها"), ic::CLIPBOARD_TEXT))
                                             .size(11.5)).clicked() {
                                     let all_texts = self.history
                                         .iter()
@@ -1838,7 +2276,7 @@ impl OverlayApp {
                                 }
 
                                 if ui.button(
-                                        egui::RichText::new(format!("{} {}", ic::TRASH_SIMPLE, format_persian_display("پاکسازی")))
+                                        egui::RichText::new(format!("{}  {}", format_persian_display("پاکسازی"), ic::TRASH_SIMPLE))
                                             .size(11.5)
                                             .color(palette::DANGER_SOFT),
                                     ).clicked() {
@@ -1900,6 +2338,7 @@ impl OverlayApp {
                             });
                         } else {
                             egui::ScrollArea::vertical()
+                                .id_source("history_list_scroll")
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     let mut delete_idx = None;
@@ -1907,31 +2346,32 @@ impl OverlayApp {
                                         let item = &self.history[idx];
                                         manager_card(palette::CARD_TRANSLUCENT, palette::HAIRLINE)
                                             .show(ui, |ui| {
-                                                // Meta row: Time, Engine, Actions
+                                                ui.set_min_width(ui.available_width());
+                                                // Meta row: Time & Engine on the right, Actions on the left
                                                 ui.horizontal(|ui| {
                                                     ui.label(
-                                                        egui::RichText::new(format!("⏱ {}", item.timestamp))
+                                                        egui::RichText::new(format!("⏱ {}", format_persian_display(&item.timestamp)))
                                                             .size(10.5)
                                                             .color(palette::TEXT_MUTED),
                                                     );
 
                                                     ui.label(
-                                                        egui::RichText::new(format!("⚡ {}", item.engine))
+                                                        egui::RichText::new(format!("⚡ {}", format_persian_display(&item.engine)))
                                                             .size(10.0)
                                                             .color(palette::ACCENT_SOFT),
                                                     );
 
-                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        if ui.button(egui::RichText::new(ic::TRASH).size(11.0)).on_hover_text("حذف این مورد").clicked() {
+                                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                        if ui.button(egui::RichText::new(ic::TRASH).size(11.0)).on_hover_text(format_persian_display("حذف این مورد")).clicked() {
                                                             delete_idx = Some(idx);
                                                         }
 
-                                                        let copy_btn = ui.button(egui::RichText::new(format!("{} {}", ic::COPY, format_persian_display("کپی متن"))).size(11.5));
+                                                        let copy_btn = ui.button(egui::RichText::new(format!("{}  {}", format_persian_display("کپی متن"), ic::COPY)).size(11.5));
                                                         if copy_btn.clicked() {
                                                             ctx.copy_text(item.text.clone());
                                                             self.history_copy_msg = Some(("متن در کلیپ‌بورد کپی شد!".into(), now));
                                                         }
-                                                        copy_btn.on_hover_text("کپی کردن این رونوشت صوتی در کلیپ‌بورد");
+                                                        copy_btn.on_hover_text(format_persian_display("کپی کردن این رونوشت صوتی در کلیپ‌بورد"));
                                                     });
                                                 });
 
@@ -1957,6 +2397,32 @@ impl OverlayApp {
     /// Settings tab body for the unified dashboard (Bento / 2-column masonry layout).
     /// At most 2 cards placed side by side with staggered natural heights.
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
+        // Hotkey capture: if a field is armed, the next real key press (with
+        // its modifiers) becomes the new binding. Escape cancels the capture.
+        if self.capturing_hotkey.iter().any(|c| *c) {
+            let ctx = ui.ctx().clone();
+            let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            if escape {
+                self.capturing_hotkey = [false; 3];
+                ctx.request_repaint();
+            } else if let Some(token) = egui_key_to_hotkey_token(&ctx) {
+                // Capture the armed slot index BEFORE clearing it so we assign
+                // the new key binding to the actual armed hotkey field.
+                let armed_idx = self.capturing_hotkey.iter().position(|c| *c);
+                self.capturing_hotkey = [false; 3];
+                let target = match armed_idx {
+                    Some(0) => &mut self.draft_settings.hotkey.record,
+                    Some(1) => &mut self.draft_settings.hotkey.toggle_overlay,
+                    _ => &mut self.draft_settings.hotkey.quit,
+                };
+                *target = token;
+                ctx.request_repaint();
+            } else {
+                // Keep consuming frames while the user holds modifiers only.
+                ctx.request_repaint();
+            }
+        }
+
         let engine_count = self
             .settings
             .read()
@@ -1988,584 +2454,572 @@ impl OverlayApp {
             }
         }
 
-        // 2-Column Bento / Masonry Layout (at most 2 boxes per row)
-        // In Persian RTL order:
-        // cols[1] is the Right Column (Primary: ASR Engine, Hotkeys & UI, Software Updates)
-        // cols[0] is the Left Column (Hardware & Actions: Audio, VAD, Save Hub)
+        // 2-Column Bento / Masonry Layout, RTL:
+        // `ui.columns(2, ...)` resets each column's layout to LTR top_down_justified(Align::LEFT),
+        // so we explicitly wrap each column in `push_id` and `Layout::top_down(Align::RIGHT)`
+        // and avoid `egui::Grid` (which produces `-f32::INFINITY` cursor coordinates in RTL).
         ui.columns(2, |cols| {
-            // ── Right Column (cols[1]): AI Core, Hotkeys, Updates ──
-            {
-                let ui = &mut cols[1];
-
-                // ── Card 1: ASR Engine (موتور تشخیص گفتار) ──
-                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            ic::BRAIN,
-                            format_persian_display("موتور تشخیص گفتار")
-                        ))
-                        .size(12.5)
-                        .strong()
-                        .color(palette::TEXT_SECTION),
-                    );
-                    ui.add_space(6.0);
-
-                    // 2x2 grid for engine radio selection (never overflows card width)
-                    egui::Grid::new("settings_engine_radios")
-                        .spacing([10.0, 6.0])
-                        .show(ui, |ui| {
-                            for (id, label) in [("auto", "خودکار"), ("google", "گوگل رایگان")] {
-                                if ui
-                                    .radio(
-                                        self.draft_settings.active_engine == *id,
-                                        format_persian_display(label),
-                                    )
-                                    .clicked()
-                                {
-                                    self.draft_settings.active_engine = (*id).to_string();
-                                }
-                            }
-                            ui.end_row();
-                            for (id, label) in [
-                                ("local_whisper", "ویسپر محلی"),
-                                ("groq", "ابر (Groq)"),
-                            ] {
-                                if ui
-                                    .radio(
-                                        self.draft_settings.active_engine == *id,
-                                        format_persian_display(label),
-                                    )
-                                    .clicked()
-                                {
-                                    self.draft_settings.active_engine = (*id).to_string();
-                                }
-                            }
-                            ui.end_row();
-                        });
-
-                    ui.add_space(4.0);
-                    if self.draft_settings.active_engine == "groq" {
-                        callout(
-                            ui,
-                            CalloutKind::Warning,
-                            "با انتخاب موتور ابری، صوت شما برای پردازش به سرور خارجی ارسال می‌شود.",
-                        );
-                    } else if self.draft_settings.active_engine == "google" {
-                        callout(
-                            ui,
-                            CalloutKind::Info,
-                            "گوگل رایگان نیازی به کلید API ندارد، اما به اینترنت متصل می‌ماند.",
-                        );
-                    } else if self.draft_settings.active_engine == "local_whisper" {
-                        callout(
-                            ui,
-                            CalloutKind::Info,
-                            "ویسپر محلی کاملاً آفلاین است؛ هیچ صوتی ماشین شما را ترک نمی‌کند.",
-                        );
-                    }
-                    ui.add_space(4.0);
-
-                    egui::Grid::new("settings_asr_grid")
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
+            // ── Right Column: AI Core, Hotkeys, Updates (cols[1]) ──
+            cols[1].push_id("settings_col_right", |ui| {
+                ui.with_layout(
+                    egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
+                    |ui| {
+                        // ── Card 1: ASR Engine (موتور تشخیص گفتار) ──
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
                             ui.label(
-                                egui::RichText::new(format_persian_display("مدل محلی:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    format_persian_display("موتور تشخیص گفتار"),
+                                    ic::BRAIN
+                                ))
+                                .size(12.5)
+                                .strong()
+                                .color(palette::TEXT_SECTION),
                             );
-                            let model = egui::ComboBox::from_id_source("settings_local_model")
-                                .selected_text(self.draft_settings.asr.model.clone())
-                                .show_ui(ui, |ui| {
-                                    for m in [
-                                        "auto",
-                                        "tiny",
-                                        "base",
-                                        "small",
-                                        "medium",
-                                        "large-v3",
-                                        "large-v3-turbo",
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut self.draft_settings.asr.model,
-                                            (*m).to_string(),
-                                            m,
-                                        );
-                                    }
-                                });
-                            let _ = model;
-                            ui.end_row();
+                            ui.add_space(6.0);
 
-                            ui.label(
-                                egui::RichText::new(format_persian_display("زبان تشخیص:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.draft_settings.asr.language)
-                                    .desired_width(70.0),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display("سقف روزانه ابر:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut self.draft_settings.cloud.daily_limit)
-                                    .range(1..=10_000),
-                            );
-                            ui.end_row();
-                        });
-                });
-
-                ui.add_space(8.0);
-
-                // ── Card 2: Hotkeys & GUI (کلیدهای میانبر و رابط کاربری) ──
-                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            ic::KEYBOARD,
-                            format_persian_display("کلیدهای میانبر و رابط کاربری")
-                        ))
-                        .size(12.5)
-                        .strong()
-                        .color(palette::TEXT_SECTION),
-                    );
-                    ui.add_space(6.0);
-
-                    egui::Grid::new("settings_hotkey_grid")
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format_persian_display("کلید ضبط:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.draft_settings.hotkey.record)
-                                    .desired_width(110.0),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display("نمایش/مخفی کپسول:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(
-                                    &mut self.draft_settings.hotkey.toggle_overlay,
-                                )
-                                .desired_width(110.0),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display("کلید خروج:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.draft_settings.hotkey.quit)
-                                    .desired_width(110.0),
-                            );
-                            ui.end_row();
-                        });
-
-                    ui.add_space(4.0);
-                    ui.checkbox(
-                        &mut self.draft_settings.gui.show_overlay,
-                        format_persian_display("نمایش کپسول شناور"),
-                    );
-                });
-
-                ui.add_space(8.0);
-
-                // ── Card 3: Software Updates (به‌روزرسانی نرم‌افزار) ──
-                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            ic::CLOUD_ARROW_DOWN,
-                            format_persian_display("به‌روزرسانی نرم‌افزار")
-                        ))
-                        .size(12.5)
-                        .strong()
-                        .color(palette::TEXT_SECTION),
-                    );
-                    ui.add_space(6.0);
-
-                    let current_ver = env!("CARGO_PKG_VERSION");
-                    ui.label(
-                        egui::RichText::new(format_persian_display(&format!(
-                            "نگارش فعلی: v{current_ver}"
-                        )))
-                        .size(11.0)
-                        .color(palette::TEXT_LABEL),
-                    );
-                    ui.add_space(4.0);
-
-                    let current_state = {
-                        if let Ok(st) = self.update_state.read() {
-                            (*st).clone()
-                        } else {
-                            crate::updates::UpdateState::Idle
-                        }
-                    };
-
-                    match current_state {
-                        crate::updates::UpdateState::Checking => {
+                            // 2x2 RTL rows for engine radio selection (without egui::Grid)
                             ui.horizontal(|ui| {
-                                ui.add(egui::Spinner::new().size(12.0).color(palette::ACCENT));
-                                ui.label(
-                                    egui::RichText::new(format_persian_display(
-                                        "در حال بررسی سرور...",
-                                    ))
-                                    .size(10.5)
-                                    .color(palette::TEXT_MUTED),
-                                );
-                            });
-                        }
-                        crate::updates::UpdateState::Available(ref info) => {
-                            ui.horizontal(|ui| {
-                                status_chip(
-                                    ui,
-                                    &format!("نسخه جدید: v{}", info.latest_version),
-                                    palette::SUCCESS_FILL,
-                                    palette::SUCCESS,
-                                    10.5,
-                                    ChipFamily::Small,
-                                );
-                            });
-                            ui.add_space(3.0);
-                            ui.horizontal(|ui| {
-                                if let Some(ref installer_url) = info.installer_url {
+                                for (id, label) in [("auto", "خودکار"), ("google", "گوگل رایگان")] {
                                     if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("دانلود فایل نصب")
-                                                    .size(10.5)
-                                                    .strong()
-                                                    .color(palette::WHITE),
-                                            )
-                                            .fill(palette::ACCENT_ACTION)
-                                            .rounding(egui::Rounding::same(5.0)),
+                                        .radio(
+                                            self.draft_settings.active_engine == *id,
+                                            format_persian_display(label),
                                         )
                                         .clicked()
                                     {
-                                        crate::updates::open_url_in_browser(installer_url);
+                                        self.draft_settings.active_engine = (*id).to_string();
                                     }
+                                    ui.add_space(8.0);
                                 }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new("مشاهده در GitHub")
-                                                .size(10.5)
-                                                .color(palette::TEXT_SECONDARY),
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                for (id, label) in [
+                                    ("local_whisper", "ویسپر محلی"),
+                                    ("groq", "ابر (Groq)"),
+                                ] {
+                                    if ui
+                                        .radio(
+                                            self.draft_settings.active_engine == *id,
+                                            format_persian_display(label),
                                         )
-                                        .fill(palette::CHIP_BG)
-                                        .rounding(egui::Rounding::same(5.0)),
+                                        .clicked()
+                                    {
+                                        self.draft_settings.active_engine = (*id).to_string();
+                                    }
+                                    ui.add_space(8.0);
+                                }
+                            });
+
+                            ui.add_space(6.0);
+                            if self.draft_settings.active_engine == "groq" {
+                                callout(
+                                    ui,
+                                    CalloutKind::Warning,
+                                    "با انتخاب موتور ابری، صوت شما برای پردازش به سرور خارجی ارسال می‌شود.",
+                                );
+                            } else if self.draft_settings.active_engine == "google" {
+                                callout(
+                                    ui,
+                                    CalloutKind::Info,
+                                    "گوگل رایگان نیازی به کلید API ندارد، اما به اینترنت متصل می‌ماند.",
+                                );
+                            } else if self.draft_settings.active_engine == "local_whisper" {
+                                callout(
+                                    ui,
+                                    CalloutKind::Info,
+                                    "ویسپر محلی کاملاً آفلاین است؛ هیچ صوتی ماشین شما را ترک نمی‌کند.",
+                                );
+                            }
+                            ui.add_space(6.0);
+
+                            let label_w = 98.0;
+                            rtl_form_row(ui, "مدل محلی:", label_w, |ui| {
+                                let _ = egui::ComboBox::from_id_source("settings_local_model")
+                                    .width(140.0)
+                                    .selected_text(self.draft_settings.asr.model.clone())
+                                    .show_ui(ui, |ui| {
+                                        for m in [
+                                            "auto",
+                                            "tiny",
+                                            "base",
+                                            "small",
+                                            "medium",
+                                            "large-v3",
+                                            "large-v3-turbo",
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.draft_settings.asr.model,
+                                                (*m).to_string(),
+                                                m,
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.add_space(6.0);
+
+                            rtl_form_row(ui, "زبان تشخیص:", label_w, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft_settings.asr.language)
+                                        .desired_width(90.0),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            rtl_form_row(ui, "سقف روزانه ابر:", label_w, |ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.draft_settings.cloud.daily_limit)
+                                        .range(1..=10_000),
+                                );
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── Card 2: Hotkeys & GUI (کلیدهای میانبر و رابط کاربری) ──
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    format_persian_display("کلیدهای میانبر و رابط کاربری"),
+                                    ic::KEYBOARD
+                                ))
+                                .size(12.5)
+                                .strong()
+                                .color(palette::TEXT_SECTION),
+                            );
+                            ui.add_space(6.0);
+
+                            let hk_label_w = 115.0;
+                            let render_hk_row = |ui: &mut egui::Ui,
+                                                 label: &str,
+                                                 value: &mut String,
+                                                 capturing: &mut bool| {
+                                rtl_form_row(ui, label, hk_label_w, |ui| {
+                                    let btn_text = if *capturing {
+                                        "...".to_string()
+                                    } else {
+                                        format_persian_display(value)
+                                    };
+                                    let btn = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new(btn_text)
+                                                .size(11.0)
+                                                .color(if *capturing {
+                                                    palette::ACCENT
+                                                } else {
+                                                    palette::TEXT_TABLE
+                                                }),
+                                        )
+                                        .fill(if *capturing {
+                                            palette::SELECTED_BG
+                                        } else {
+                                            palette::CHIP_BG
+                                        })
+                                        .rounding(egui::Rounding::same(5.0))
+                                        .min_size(egui::vec2(130.0, 24.0)),
+                                    );
+                                    if btn.clicked() {
+                                        *capturing = true;
+                                    }
+                                });
+                            };
+
+                            render_hk_row(
+                                ui,
+                                "کلید ضبط:",
+                                &mut self.draft_settings.hotkey.record,
+                                &mut self.capturing_hotkey[0],
+                            );
+                            ui.add_space(6.0);
+                            render_hk_row(
+                                ui,
+                                "نمایش/مخفی کپسول:",
+                                &mut self.draft_settings.hotkey.toggle_overlay,
+                                &mut self.capturing_hotkey[1],
+                            );
+                            ui.add_space(6.0);
+                            render_hk_row(
+                                ui,
+                                "کلید خروج:",
+                                &mut self.draft_settings.hotkey.quit,
+                                &mut self.capturing_hotkey[2],
+                            );
+
+                            ui.add_space(6.0);
+                            ui.checkbox(
+                                &mut self.draft_settings.gui.show_overlay,
+                                format_persian_display("نمایش کپسول شناور"),
+                            );
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── Card 3: Software Updates (به‌روزرسانی نرم‌افزار) ──
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    format_persian_display("به‌روزرسانی نرم‌افزار"),
+                                    ic::CLOUD_ARROW_DOWN
+                                ))
+                                .size(12.5)
+                                .strong()
+                                .color(palette::TEXT_SECTION),
+                            );
+                            ui.add_space(6.0);
+
+                            let current_ver = env!("CARGO_PKG_VERSION");
+                            ui.label(
+                                egui::RichText::new(format_persian_display(&format!(
+                                    "نگارش فعلی: v{current_ver}"
+                                )))
+                                .size(11.0)
+                                .color(palette::TEXT_LABEL),
+                            );
+                            ui.add_space(4.0);
+
+                            let current_state = {
+                                if let Ok(st) = self.update_state.read() {
+                                    (*st).clone()
+                                } else {
+                                    crate::updates::UpdateState::Idle
+                                }
+                            };
+
+                            match current_state {
+                                crate::updates::UpdateState::Checking => {
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::Spinner::new().size(12.0).color(palette::ACCENT));
+                                        ui.label(
+                                            egui::RichText::new(format_persian_display(
+                                                "در حال بررسی سرور...",
+                                            ))
+                                            .size(10.5)
+                                            .color(palette::TEXT_MUTED),
+                                        );
+                                    });
+                                }
+                                crate::updates::UpdateState::Available(ref info) => {
+                                    ui.horizontal(|ui| {
+                                        status_chip(
+                                            ui,
+                                            &format!("نسخه جدید: v{}", info.latest_version),
+                                            palette::SUCCESS_FILL,
+                                            palette::SUCCESS,
+                                            10.5,
+                                            ChipFamily::Small,
+                                        );
+                                    });
+                                    ui.add_space(3.0);
+                                    ui.horizontal(|ui| {
+                                        if let Some(ref installer_url) = info.installer_url {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new(format_persian_display("دانلود فایل نصب"))
+                                                            .size(10.5)
+                                                            .strong()
+                                                            .color(palette::WHITE),
+                                                    )
+                                                    .fill(palette::ACCENT_ACTION)
+                                                    .rounding(egui::Rounding::same(5.0)),
+                                                )
+                                                .clicked()
+                                            {
+                                                crate::updates::open_url_in_browser(installer_url);
+                                            }
+                                        }
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(format_persian_display("مشاهده در GitHub"))
+                                                        .size(10.5)
+                                                        .color(palette::TEXT_SECONDARY),
+                                                )
+                                                .fill(palette::CHIP_BG)
+                                                .rounding(egui::Rounding::same(5.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            crate::updates::open_url_in_browser(&info.release_url);
+                                        }
+                                    });
+                                }
+                                crate::updates::UpdateState::UpToDate { ref checked_at } => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}  {}",
+                                            format_persian_display(&format!("نسخه شما به‌روز است ({})", checked_at)),
+                                            ic::CHECK_CIRCLE
+                                        ))
+                                        .size(10.5)
+                                        .color(palette::SUCCESS),
+                                    );
+                                }
+                                crate::updates::UpdateState::Error(ref err) => {
+                                    ui.label(
+                                        egui::RichText::new(format!("{}  {}", format_persian_display(&format!("خطا: {err}")), ic::WARNING))
+                                            .size(10.0)
+                                            .color(palette::WARNING),
+                                    );
+                                }
+                                crate::updates::UpdateState::Idle => {
+                                    ui.label(
+                                        egui::RichText::new(format_persian_display(
+                                            "هنوز بررسی انجام نشده است",
+                                        ))
+                                        .size(10.5)
+                                        .color(palette::TEXT_MUTED),
+                                    );
+                                }
+                            }
+
+                            ui.add_space(4.0);
+                            if ui
+                                .button(
+                                    egui::RichText::new(format!(
+                                        "{}  {}",
+                                        format_persian_display("بررسی به‌روزرسانی اکنون"),
+                                        ic::ARROWS_CLOCKWISE
+                                    ))
+                                    .size(10.5),
+                                )
+                                .clicked()
+                            {
+                                let st = self.update_state.clone();
+                                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                    handle.spawn(async move {
+                                        crate::updates::perform_check(&st, env!("CARGO_PKG_VERSION")).await;
+                                    });
+                                } else {
+                                    tracing::error!("no tokio runtime for manual update check");
+                                }
+                            }
+                            ui.add_space(2.0);
+                            ui.checkbox(
+                                &mut self.draft_settings.updates.check_on_startup,
+                                format_persian_display("بررسی خودکار در شروع برنامه"),
+                            );
+                        });
+                    },
+                );
+            });
+
+            // ── Left Column: Audio, VAD, Save Hub (cols[0]) ──
+            cols[0].push_id("settings_col_left", |ui| {
+                ui.with_layout(
+                    egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
+                    |ui| {
+                        // ── Card 4: Audio (صوت) ──
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    format_persian_display("صوت"),
+                                    ic::MICROPHONE
+                                ))
+                                .size(12.5)
+                                .strong()
+                                .color(palette::TEXT_SECTION),
+                            );
+                            ui.add_space(6.0);
+
+                            let audio_label_w = 105.0;
+                            rtl_form_row(ui, "دستگاه ورودی:", audio_label_w, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft_settings.audio.device)
+                                        .hint_text("default")
+                                        .desired_width(140.0),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            rtl_form_row(ui, "نرخ نمونه‌برداری:", audio_label_w, |ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.draft_settings.audio.sample_rate)
+                                        .range(8_000..=96_000)
+                                        .suffix(" Hz"),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            rtl_form_row(ui, "تقویت صدا:", audio_label_w, |ui| {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.draft_settings.audio.gain_db,
+                                        -12.0..=24.0,
+                                    )
+                                    .suffix(" dB")
+                                    .fixed_decimals(1),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            rtl_form_row(ui, "حافظه حلقه:", audio_label_w, |ui| {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.draft_settings.audio.ring_seconds,
+                                        5..=120,
+                                    )
+                                    .suffix(" s"),
+                                );
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── Card 5: VAD (تشخیص سکوت) ──
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    format_persian_display("تشخیص سکوت (VAD)"),
+                                    ic::WAVE_SINE
+                                ))
+                                .size(12.5)
+                                .strong()
+                                .color(palette::TEXT_SECTION),
+                            );
+                            ui.add_space(6.0);
+
+                            let vad_label_w = 120.0;
+                            rtl_form_row(ui, "آستانه سکوت:", vad_label_w, |ui| {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.draft_settings.vad.threshold,
+                                        0.05..=0.95,
+                                    )
+                                    .fixed_decimals(2),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            rtl_form_row(ui, "مدت سکوت برای توقف:", vad_label_w, |ui| {
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.draft_settings.vad.silence_timeout_ms,
+                                    )
+                                    .range(200..=10_000)
+                                    .suffix(" ms"),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            rtl_form_row(ui, "حداقل مدت گفتار:", vad_label_w, |ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.draft_settings.vad.min_speech_ms)
+                                        .range(50..=2_000)
+                                        .suffix(" ms"),
+                                );
+                            });
+
+                            ui.add_space(6.0);
+                            if ui
+                                .checkbox(
+                                    &mut self.draft_settings.vad.cutoff_on_hold,
+                                    format_persian_display("توقف ضبط با سکوت، حتی با نگه‌داشتن کلید"),
+                                )
+                                .changed()
+                            {
+                                self.settings_error = None;
+                            }
+                        });
+
+                        ui.add_space(8.0);
+
+                        // ── Card 6: Save & Action Hub (ذخیره و مدیریت تنظیمات) ──
+                        manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    format_persian_display("ذخیره و اعمال تنظیمات"),
+                                    ic::FLOPPY_DISK
+                                ))
+                                .size(12.5)
+                                .strong()
+                                .color(palette::TEXT_SECTION),
+                            );
+                            ui.add_space(6.0);
+
+                            if let Some(ref err) = self.settings_error {
+                                callout(ui, CalloutKind::Warning, err);
+                                ui.add_space(6.0);
+                            }
+
+                            ui.horizontal(|ui| {
+                                let can_save = self.settings_error.is_none();
+                                let save = ui.add_enabled(
+                                    can_save,
+                                    egui::Button::new(
+                                        egui::RichText::new(format!(
+                                            "{}  {}",
+                                            format_persian_display("ذخیره تنظیمات"),
+                                            ic::FLOPPY_DISK
+                                        ))
+                                        .size(11.5)
+                                        .strong()
+                                        .color(palette::WHITE),
+                                    )
+                                    .fill(if can_save {
+                                        palette::ACCENT_ACTION
+                                    } else {
+                                        palette::CHIP_BG
+                                    })
+                                    .rounding(egui::Rounding::same(6.0)),
+                                );
+                                if save.clicked() {
+                                    if let Ok(mut s) = self.settings.write() {
+                                        *s = self.draft_settings.clone();
+                                        let _ = s.save(&self.config_path);
+                                    }
+                                    self.settings_saved = true;
+                                }
+
+                                if ui
+                                    .button(
+                                        egui::RichText::new(format!(
+                                            "{}  {}",
+                                            format_persian_display("بارگذاری مجدد"),
+                                            ic::ARROWS_CLOCKWISE
+                                        ))
+                                        .size(11.0),
                                     )
                                     .clicked()
                                 {
-                                    crate::updates::open_url_in_browser(&info.release_url);
+                                    if let Ok(loaded) = Settings::load_or_create(&self.config_path) {
+                                        if let Ok(mut s) = self.settings.write() {
+                                            *s = loaded.clone();
+                                        }
+                                        self.draft_settings = loaded;
+                                        self.settings_error = None;
+                                        self.settings_saved = false;
+                                    }
                                 }
                             });
-                        }
-                        crate::updates::UpdateState::UpToDate { ref checked_at } => {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} نسخه شما به‌روز است ({})",
-                                    ic::CHECK_CIRCLE,
-                                    checked_at
-                                ))
-                                .size(10.5)
-                                .color(palette::SUCCESS),
-                            );
-                        }
-                        crate::updates::UpdateState::Error(ref err) => {
-                            ui.label(
-                                egui::RichText::new(format!("{} خطا: {}", ic::WARNING, err))
-                                    .size(10.0)
-                                    .color(palette::WARNING),
-                            );
-                        }
-                        crate::updates::UpdateState::Idle => {
-                            ui.label(
-                                egui::RichText::new(format_persian_display(
-                                    "هنوز بررسی انجام نشده است",
-                                ))
-                                .size(10.5)
-                                .color(palette::TEXT_MUTED),
-                            );
-                        }
-                    }
 
-                    ui.add_space(4.0);
-                    if ui
-                        .button(
-                            egui::RichText::new(format!(
-                                "{} {}",
-                                ic::ARROWS_CLOCKWISE,
-                                format_persian_display("بررسی به‌روزرسانی اکنون")
-                            ))
-                            .size(10.5),
-                        )
-                        .clicked()
-                    {
-                        let st = self.update_state.clone();
-                        tokio::spawn(async move {
-                            crate::updates::perform_check(&st, env!("CARGO_PKG_VERSION")).await;
-                        });
-                    }
-                    ui.add_space(2.0);
-                    ui.checkbox(
-                        &mut self.draft_settings.updates.check_on_startup,
-                        format_persian_display("بررسی خودکار در شروع برنامه"),
-                    );
-                });
-            }
-
-            // ── Left Column (cols[0]): Audio, VAD, Save Hub ──
-            {
-                let ui = &mut cols[0];
-
-                // ── Card 4: Audio (صوت) ──
-                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            ic::MICROPHONE,
-                            format_persian_display("صوت")
-                        ))
-                        .size(12.5)
-                        .strong()
-                        .color(palette::TEXT_SECTION),
-                    );
-                    ui.add_space(6.0);
-
-                    egui::Grid::new("settings_audio_grid")
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format_persian_display("دستگاه ورودی:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.draft_settings.audio.device)
-                                    .hint_text("default")
-                                    .desired_width(120.0),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display("نرخ نمونه‌برداری:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut self.draft_settings.audio.sample_rate)
-                                    .range(8_000..=96_000)
-                                    .suffix(" Hz"),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display("تقویت صدا:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.draft_settings.audio.gain_db,
-                                    -12.0..=24.0,
-                                )
-                                .suffix(" dB")
-                                .fixed_decimals(1),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display("حافظه حلقه:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.draft_settings.audio.ring_seconds,
-                                    5..=120,
-                                )
-                                .suffix(" s"),
-                            );
-                            ui.end_row();
-                        });
-                });
-
-                ui.add_space(8.0);
-
-                // ── Card 5: VAD (تشخیص سکوت) ──
-                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            ic::WAVE_SINE,
-                            format_persian_display("تشخیص سکوت (VAD)")
-                        ))
-                        .size(12.5)
-                        .strong()
-                        .color(palette::TEXT_SECTION),
-                    );
-                    ui.add_space(6.0);
-
-                    egui::Grid::new("settings_vad_grid")
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format_persian_display("آستانه سکوت:"))
-                                    .size(11.0)
-                                    .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.draft_settings.vad.threshold,
-                                    0.05..=0.95,
-                                )
-                                .fixed_decimals(2),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display(
-                                    "مدت سکوت برای توقف:",
-                                ))
-                                .size(11.0)
-                                .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::DragValue::new(
-                                    &mut self.draft_settings.vad.silence_timeout_ms,
-                                )
-                                .range(200..=10_000)
-                                .suffix(" ms"),
-                            );
-                            ui.end_row();
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display(
-                                    "حداقل مدت گفتار:",
-                                ))
-                                .size(11.0)
-                                .color(palette::TEXT_LABEL),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut self.draft_settings.vad.min_speech_ms)
-                                    .range(50..=2_000)
-                                    .suffix(" ms"),
-                            );
-                            ui.end_row();
-                        });
-
-                    ui.add_space(4.0);
-                    if ui
-                        .checkbox(
-                            &mut self.draft_settings.vad.cutoff_on_hold,
-                            format_persian_display("توقف ضبط با سکوت، حتی با نگه‌داشتن کلید"),
-                        )
-                        .changed()
-                    {
-                        self.settings_error = None;
-                    }
-                });
-
-                ui.add_space(8.0);
-
-                // ── Card 6: Save & Action Hub (ذخیره و مدیریت تنظیمات) ──
-                manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            ic::FLOPPY_DISK,
-                            format_persian_display("ذخیره و اعمال تنظیمات")
-                        ))
-                        .size(12.5)
-                        .strong()
-                        .color(palette::TEXT_SECTION),
-                    );
-                    ui.add_space(6.0);
-
-                    if let Some(ref err) = self.settings_error {
-                        callout(ui, CalloutKind::Warning, err);
-                        ui.add_space(6.0);
-                    }
-
-                    ui.horizontal(|ui| {
-                        let can_save = self.settings_error.is_none();
-                        let save = ui.add_enabled(
-                            can_save,
-                            egui::Button::new(
-                                egui::RichText::new(format!(
-                                    "{} {}",
-                                    ic::FLOPPY_DISK,
-                                    format_persian_display("ذخیره تنظیمات")
-                                ))
-                                .size(11.5)
-                                .strong()
-                                .color(palette::WHITE),
-                            )
-                            .fill(if can_save {
-                                palette::ACCENT_ACTION
-                            } else {
-                                palette::CHIP_BG
-                            })
-                            .rounding(egui::Rounding::same(6.0)),
-                        );
-                        if save.clicked() {
-                            if let Ok(mut s) = self.settings.write() {
-                                *s = self.draft_settings.clone();
-                                let _ = s.save(&self.config_path);
+                            if self.settings_saved {
+                                ui.add_space(6.0);
+                                status_chip(
+                                    ui,
+                                    "تنظیمات با موفقیت ذخیره شد",
+                                    palette::SUCCESS_FILL,
+                                    palette::SUCCESS,
+                                    10.5,
+                                    ChipFamily::Tiny,
+                                );
                             }
-                            self.settings_saved = true;
-                        }
-
-                        if ui
-                            .button(
-                                egui::RichText::new(format!(
-                                    "{} {}",
-                                    ic::ARROWS_CLOCKWISE,
-                                    format_persian_display("بارگذاری مجدد")
-                                ))
-                                .size(11.0),
-                            )
-                            .clicked()
-                        {
-                            if let Ok(loaded) = Settings::load_or_create(&self.config_path) {
-                                if let Ok(mut s) = self.settings.write() {
-                                    *s = loaded.clone();
-                                }
-                                self.draft_settings = loaded;
-                                self.settings_error = None;
-                                self.settings_saved = false;
-                            }
-                        }
-                    });
-
-                    if self.settings_saved {
-                        ui.add_space(6.0);
-                        status_chip(
-                            ui,
-                            "تنظیمات با موفقیت ذخیره شد",
-                            palette::SUCCESS_FILL,
-                            palette::SUCCESS,
-                            10.5,
-                            ChipFamily::Tiny,
-                        );
-                    }
-                });
-            }
+                        });
+                    },
+                );
+            });
         });
     }
 
@@ -2581,9 +3035,21 @@ impl OverlayApp {
         }
 
         let (dash_w, dash_h) = (720.0, 640.0);
-        let screen = ctx.screen_rect();
-        let pos_x = (screen.center().x - dash_w / 2.0).round();
-        let pos_y = (screen.center().y - dash_h / 2.0).round();
+        // Center on the true monitor, not `ctx.screen_rect()`: from inside the
+        // child viewport that returns the parent (capsule) rect.
+        let (pos_x, pos_y) = if let Some((sw, sh)) = true_screen_size_px() {
+            let ppp = ctx.pixels_per_point();
+            (
+                ((sw as f32 / ppp) / 2.0 - dash_w / 2.0).round(),
+                ((sh as f32 / ppp) / 2.0 - dash_h / 2.0).round(),
+            )
+        } else {
+            let screen = ctx.screen_rect();
+            (
+                (screen.center().x - dash_w / 2.0).round(),
+                (screen.center().y - dash_h / 2.0).round(),
+            )
+        };
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("omnitype_dashboard_viewport"),
@@ -2604,7 +3070,20 @@ impl OverlayApp {
                 egui::CentralPanel::default()
                     .frame(manager_central_panel())
                     .show(dash_ctx, |ui| {
-                        // ── Title row ──
+                        // Persian UI: lay out right-to-left. egui 0.28 has no
+                        // global direction flag, so the whole panel body runs
+                        // inside a top-down layout whose cross axis grows
+                        // leftward — every `ui.horizontal` row and every grid
+                        // column then mirrors automatically.
+                        ui.with_layout(
+                            egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
+                            |ui| {
+                                // No manual width fiddling: the panel frame's
+                                // 14 px symmetric margin already bounds the
+                                // available width; subtracting again would
+                                // shrink content and leave the right side
+                                // visibly empty.
+                                // ── Title row ──
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("{} OmniType", ic::MICROPHONE))
@@ -2612,7 +3091,7 @@ impl OverlayApp {
                                     .strong()
                                     .color(palette::TEXT_PRIMARY),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 let active = self.router.active_engine();
                                 let engine_label = if active == "auto" {
                                     "خودکار (Auto)".to_string()
@@ -2643,7 +3122,7 @@ impl OverlayApp {
                                 let selected = self.dashboard_tab == tab;
                                 let btn = ui.add(
                                     egui::Button::new(
-                                        egui::RichText::new(format!("{} {}", tab.icon(), format_persian_display(tab.label())))
+                                        egui::RichText::new(format!("{}  {}", format_persian_display(tab.label()), tab.icon()))
                                             .size(11.5)
                                             .color(if selected {
                                                 palette::WHITE
@@ -2684,18 +3163,23 @@ impl OverlayApp {
 
                         if let Some(info) = update_info_opt {
                             manager_card(palette::CARD_BG_ALT, palette::ACCENT).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new(format!("{} نسخه جدید در دسترس است: v{}", ic::CLOUD_ARROW_DOWN, info.latest_version))
+                                        egui::RichText::new(format!(
+                                            "{}  {}",
+                                            format_persian_display(&format!("نسخه جدید در دسترس است: v{}", info.latest_version)),
+                                            ic::CLOUD_ARROW_DOWN
+                                        ))
                                             .size(11.5)
                                             .strong()
                                             .color(palette::ACCENT),
                                     );
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                         if let Some(ref installer_url) = info.installer_url {
                                             if ui.add(
                                                 egui::Button::new(
-                                                    egui::RichText::new("دانلود فایل نصب")
+                                                    egui::RichText::new(format_persian_display("دانلود فایل نصب"))
                                                         .size(11.0)
                                                         .strong()
                                                         .color(palette::WHITE),
@@ -2708,7 +3192,7 @@ impl OverlayApp {
                                         }
                                         if ui.add(
                                             egui::Button::new(
-                                                egui::RichText::new("مشاهده در گیت‌هاب")
+                                                egui::RichText::new(format_persian_display("مشاهده در گیت‌هاب"))
                                                     .size(10.5)
                                                     .color(palette::TEXT_SECONDARY),
                                             )
@@ -2725,6 +3209,7 @@ impl OverlayApp {
 
                         // ── Active tab body (scrollable) ──
                         egui::ScrollArea::vertical()
+                            .id_source("dashboard_main_scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| match self.dashboard_tab {
                                 DashboardTab::Engines => self.render_engine_body(ui),
@@ -2777,7 +3262,7 @@ impl OverlayApp {
                                 );
                             }
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.label(
                                     egui::RichText::new(format_persian_display("نسخه ۰.۱"))
                                         .size(10.0)
@@ -2785,6 +3270,7 @@ impl OverlayApp {
                                 );
                             });
                         });
+                            });
                     });
             },
         );
@@ -2857,8 +3343,8 @@ impl OverlayApp {
     }
 
     /// Builds a dark OmniType notification card for a transcript.
-    fn make_toast(display: String, remaining_secs: u64, lifetime: Duration) -> Toast {
-        let mut toast = Toast::basic(toast_caption(&display, remaining_secs));
+    fn make_toast(raw: String, remaining_secs: u64, lifetime: Duration) -> Toast {
+        let mut toast = Toast::basic(toast_caption(&raw, remaining_secs));
         toast.set_duration(Some(lifetime));
         toast.set_closable(true);
         toast.set_show_progress_bar(true);
@@ -2889,9 +3375,8 @@ impl OverlayApp {
         // caption is reconstructed exactly, so the right card is found even
         // when several transcripts share the same text.
         for (raw, old, new) in changed {
-            let display = format_persian_display(&raw);
-            let old_caption = toast_caption(&display, old);
-            let new_caption = toast_caption(&display, new);
+            let old_caption = toast_caption(&raw, old);
+            let new_caption = toast_caption(&raw, new);
             for toast in self.toasts.toasts_mut() {
                 if toast.caption() == old_caption {
                     toast.set_caption(new_caption);
@@ -2899,6 +3384,25 @@ impl OverlayApp {
                 }
             }
         }
+    }
+
+    /// Whether the 30 fps repaint loop must keep running this frame.
+    ///
+    /// Running it unconditionally keeps a frame's worth of allocations and
+    /// textures alive forever (and the GPU busy) while the app sits idle in
+    /// the tray. Only these states genuinely need per-frame updates:
+    fn needs_animation_frames(&mut self) -> bool {
+        // Recording draws a live waveform from the audio ring buffer.
+        matches!(self.status.get().state, AppState::Recording | AppState::Processing | AppState::Typing)
+            // Live toasts carry a per-second countdown that must tick.
+            || !self.live_toasts.is_empty()
+            || !self.toasts.toasts_mut().is_empty()
+            // An open dashboard is fully interactive (hover, text edits,
+            // scroll): it must not freeze after the last mouse move.
+            || self.show_dashboard
+            || self.show_consent_window
+            // Viewports still settling their OS window shape.
+            || self.dashboard_needs_shape
     }
 
     /// Shows the toast preview window. The OS window itself is a bare glass
@@ -2924,6 +3428,9 @@ impl OverlayApp {
             return;
         }
 
+        let n = self.live_toasts.len();
+        let host_h = if n == 0 { 40.0 } else { 12.0 + n as f32 * 58.0 };
+
         // Position directly above the docked capsule at the bottom.
         let main_rect = ctx.input(|i| i.viewport().outer_rect);
         let (pos_x, pos_y) = if let Some(rect) = main_rect {
@@ -2931,38 +3438,45 @@ impl OverlayApp {
             // newest card (drawn at the viewport's BottomRight) hugs it.
             (
                 (rect.center().x - 190.0).round(),
-                (rect.min.y - TOAST_HOST_HEIGHT - 8.0).round(),
+                (rect.min.y - host_h - 8.0).round(),
             )
         } else {
             (100.0, 100.0)
         };
+
+        // Size the host to the *actual* stack of cards instead of a fixed
+        // 190 px block: each card is a title+body+footer triplet measured by
+        // the library as 3 rows plus its own padding. Tight sizing keeps the
+        // transparent window from blanketing 380×190 of the screen and
+        // blocking clicks on whatever is underneath.
+        let n = self.live_toasts.len();
+        let host_h = if n == 0 { 40.0 } else { 12.0 + n as f32 * 58.0 };
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("preview_toast_viewport"),
             egui::ViewportBuilder::default()
                 .with_title("OmniType_Preview")
                 .with_position([pos_x, pos_y])
-                .with_inner_size([380.0, TOAST_HOST_HEIGHT])
+                .with_inner_size([380.0, host_h])
                 .with_decorations(false)
                 .with_transparent(true)
                 .with_always_on_top()
                 .with_resizable(false),
-            |toast_ctx, _class| {
+            move |toast_ctx, _class| {
                 #[cfg(windows)]
                 apply_window_shapes_all();
 
-                // A plain release inside the preview copies the newest
-                // transcript (in practice the card under the pointer); the
-                // library ✕ still dismisses through its own hit-test.
-                // Clicking an update toast opens the dashboard settings tab.
-                if toast_ctx.input(|i| i.pointer.primary_released()) {
-                    if let Some((_, raw, _, _)) = self.live_toasts.back() {
-                        toast_ctx.copy_text(raw.clone());
-                    } else {
-                        self.show_dashboard = true;
-                        self.dashboard_tab = DashboardTab::Settings;
-                        self.visible = true;
-                    }
+                // Clicking the preview never touches the clipboard — the user's
+                // clipboard is private data and must only be overwritten by an
+                // explicit copy action in the History tab. A bare click that
+                // hits no card opens the dashboard Settings tab (e.g. update
+                // notices), everything else just dismisses via the card's ✕.
+                if toast_ctx.input(|i| i.pointer.primary_released())
+                    && self.live_toasts.is_empty()
+                {
+                    self.show_dashboard = true;
+                    self.dashboard_tab = DashboardTab::Settings;
+                    self.visible = true;
                 }
 
                 egui::CentralPanel::default()
@@ -3000,6 +3514,7 @@ impl eframe::App for OverlayApp {
             self.show_dashboard = true;
             self.dashboard_tab = DashboardTab::Engines;
             self.visible = true;
+            self.dashboard_needs_shape = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
         if self
@@ -3009,6 +3524,7 @@ impl eframe::App for OverlayApp {
             self.show_dashboard = true;
             self.dashboard_tab = DashboardTab::Dictionary;
             self.visible = true;
+            self.dashboard_needs_shape = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
         if self
@@ -3018,6 +3534,7 @@ impl eframe::App for OverlayApp {
             self.show_dashboard = true;
             self.dashboard_tab = DashboardTab::Engines;
             self.visible = true;
+            self.dashboard_needs_shape = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
         if self
@@ -3027,6 +3544,7 @@ impl eframe::App for OverlayApp {
             self.show_dashboard = true;
             self.dashboard_tab = DashboardTab::History;
             self.visible = true;
+            self.dashboard_needs_shape = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
         if self
@@ -3041,7 +3559,24 @@ impl eframe::App for OverlayApp {
             self.show_dashboard = true;
             self.dashboard_tab = DashboardTab::Settings;
             self.visible = true;
+            self.dashboard_needs_shape = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+
+        // The dashboard is an immediate viewport: on first open the OS window
+        // region/shape is stale (it was last shaped as the tiny capsule), so
+        // the window looks half-rendered and swallows input until resized.
+        // Re-apply the shape for a few frames after each open request, and
+        // force a repaint so the content actually paints.
+        if self.dashboard_needs_shape {
+            self.dashboard_shape_frames += 1;
+            if self.dashboard_shape_frames > 10 {
+                self.dashboard_needs_shape = false;
+                self.dashboard_shape_frames = 0;
+            }
+            #[cfg(windows)]
+            apply_window_shapes_all();
+            ctx.request_repaint();
         }
         if self.quit_flag.load(std::sync::atomic::Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3090,8 +3625,15 @@ impl eframe::App for OverlayApp {
         self.render_consent_window(ctx);
         self.render_preview_toast_window(ctx);
 
-        // 30 fps gives buttery smooth waveform animations and accurate 10s countdown
-        ctx.request_repaint_after(Duration::from_millis(33));
+        // Repaint loop. A continuous 30 fps loop was applied unconditionally
+        // here (a fresh shape/allocation pass every frame), which kept the GPU
+        // busy and every transient buffer alive even while the app sat idle
+        // in the tray. Now the animation loop runs only when something on
+        // screen actually changes every frame: an active recording (waveform),
+        // a live toast countdown, an open dashboard, or pending viewport work.
+        if self.needs_animation_frames() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
 
         if !self.visible {
             return;
@@ -3145,9 +3687,10 @@ impl eframe::App for OverlayApp {
 
                 // Dark OmniType card: near-white caption with a live 10 s
                 // countdown footer, accent mic glyph, progress bar, ✕.
-                let display = format_persian_display(trimmed);
+                // toast_caption shapes the raw text itself (per finished
+                // line, so ligatures stay intact).
                 let toast = Self::make_toast(
-                    display,
+                    trimmed.to_string(),
                     TOAST_TOTAL_SECS,
                     Duration::from_secs(TOAST_TOTAL_SECS),
                 );
@@ -3306,13 +3849,13 @@ impl eframe::App for OverlayApp {
                             }
                             let _ = mic_resp
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text("شروع ضبط گفتار");
+                                .on_hover_text(format_persian_display("شروع ضبط گفتار"));
 
                             ui.add_space(2.0);
 
                             // Shortcut badge
                             ui.label(
-                                egui::RichText::new("CapsLock")
+                                egui::RichText::new(format_persian_display("CapsLock"))
                                     .size(10.5)
                                     .strong()
                                     .color(palette::TEXT_STRONG_SOFT),
@@ -3378,7 +3921,7 @@ impl eframe::App for OverlayApp {
                                     }
                                     let _ = hist_resp
                                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text("تاریخچه گفتار (History)");
+                                        .on_hover_text(format_persian_display("تاریخچه گفتار (History)"));
                                 },
                             );
                         });
@@ -3423,7 +3966,7 @@ impl eframe::App for OverlayApp {
                             }
                             let _ = cancel_resp
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text("لغو ضبط (بدون ارسال متن)");
+                                .on_hover_text(format_persian_display("لغو ضبط (بدون ارسال متن)"));
 
                             ui.add_space(2.0);
 
@@ -3497,7 +4040,7 @@ impl eframe::App for OverlayApp {
                                     }
                                     let _ = submit_resp
                                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text("پایان ضبط و تایپ متن");
+                                        .on_hover_text(format_persian_display("پایان ضبط و تایپ متن"));
                                 },
                             );
                         });
@@ -3551,6 +4094,23 @@ impl eframe::App for OverlayApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Settings;
+
+    #[test]
+    fn validate_rejects_unparseable_hotkey() {
+        let mut s = Settings::default();
+        s.hotkey.record = "not a key".into();
+        assert!(validate_settings(&s).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_user_hotkey_combination() {
+        let mut s = Settings::default();
+        s.hotkey.record = "Shift+F5".into();
+        s.hotkey.toggle_overlay = "Ctrl+Alt+P".into();
+        s.hotkey.quit = "Ctrl+Shift+Q".into();
+        assert!(validate_settings(&s).is_ok());
+    }
 
     #[test]
     fn test_format_persian_display_handles_persian() {
@@ -3568,13 +4128,49 @@ mod tests {
         assert_eq!(short.lines().count(), 2);
         assert_eq!(short, format!("Hello\n{} 10s", ic::TIMER));
 
-        // Long text: wrapped to 3 lines of 44 chars, then ellipsis + footer.
+        // Long single-word text: wraps without ever cutting mid-word. One
+        // 200-char word fills one line per toast_caption call, so the caption
+        // is body + footer (the word is a single unbreakable token).
         let long_text = "x".repeat(200);
         let long = toast_caption(&long_text, 7);
         let body_lines = long.lines().count() - 1; // minus footer
-        assert_eq!(body_lines, 3); // 3 rows; ellipsis ends the 3rd row
-        assert!(long.contains('…'));
+        assert_eq!(body_lines, 1);
+        assert!(!long.contains('…'));
         assert!(long.ends_with(" 7s"));
+
+        // Many words across the 44-char budget wrap at word boundaries and
+        // cap at 3 lines; the truncation marker appears when the source needs
+        // a 4th line.
+        let words = "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz 11 22 33 44 55 66 77 88 99 q1 q2 q3 q4 q5 q6 q7 q8 q9 q0 z1 z2 z3 z4 z5 z6 z7 z8 z9 z0 y1 y2 y3 y4 y5 y6 y7 y8 y9 y0";
+        let capped = toast_caption(words, 7);
+        let body_lines = capped.lines().count() - 1;
+        assert_eq!(body_lines, 3);
+        assert!(capped.contains('…'), "no truncation marker");
+        assert!(capped.ends_with(" 7s"));
+    }
+
+    #[test]
+    fn test_toast_caption_never_splits_words() {
+        // A 44-char budget must fit "aa bb cc dd ee ff gg hh ii jj kk ll"
+        // (12 words × 2 + 11 spaces = 35) on one line, never breaking inside
+        // a word.
+        let words = "aa bb cc dd ee ff gg hh ii jj kk ll";
+        let caption = toast_caption(words, 5);
+        let first_line = caption.lines().next().unwrap();
+        assert!(first_line.contains("ll"), "line 1 = {first_line}");
+        assert!(!first_line.contains("lm"), "word split across lines");
+        assert!(caption.ends_with(" 5s"));
+    }
+
+    #[test]
+    fn test_toast_caption_keeps_line_order() {
+        // First word must stay on the FIRST line, not the last — the old
+        // char-chopping implementation reversed the visual order for RTL.
+        // The output is shaped, so compare against the shaped expectation.
+        let caption = toast_caption("اول وسط آخر", 3);
+        let first_line = caption.lines().next().unwrap();
+        assert_eq!(first_line, format_persian_display("اول وسط آخر"));
+        assert!(caption.ends_with(" 3s"));
     }
 
     /// Theme sanity for whichever theme this binary was built with: every
@@ -3663,6 +4259,64 @@ mod tests {
         assert!(!app.visible);
         app.toggle_visible();
         assert!(app.visible);
+    }
+
+    #[test]
+    fn test_render_dashboard_does_not_panic() {
+        let (_tx, rx) = tokio::sync::watch::channel(AppStatus {
+            state: AppState::Idle,
+            last_text: None,
+            vad_engine: "silero",
+        });
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let flags = (
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let dict = Arc::new(RwLock::new(Dictionary::with_defaults()));
+        let router = AsrRouter::new(vec![]);
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let config_path = PathBuf::from("config.toml");
+        let settings_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let update_state = crate::updates::new_shared_state();
+        let mut app = OverlayApp::new(
+            Arc::new(StatusClient::new(rx)),
+            events_tx,
+            flags.0,
+            flags.1,
+            flags.2,
+            flags.3,
+            flags.4,
+            settings_flag,
+            dict,
+            router,
+            settings,
+            config_path,
+            update_state,
+        );
+        app.show_dashboard = true;
+        app.history.push(HistoryItem {
+            id: 1,
+            text: "نمونه متن تستی در تاریخچه".into(),
+            timestamp: "12:00:00".into(),
+            engine: "google".into(),
+        });
+        let ctx = egui::Context::default();
+        for tab in [DashboardTab::Engines, DashboardTab::Dictionary, DashboardTab::History, DashboardTab::Settings] {
+            app.dashboard_tab = tab;
+            for x in [50.0, 150.0, 300.0, 450.0, 600.0] {
+                for y in [50.0, 150.0, 250.0, 350.0, 450.0] {
+                    let mut input = egui::RawInput::default();
+                    input.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+                    let _ = ctx.run(input, |ctx| {
+                        app.render_dashboard(ctx);
+                    });
+                }
+            }
+        }
     }
 
     #[tokio::test]
