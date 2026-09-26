@@ -6,7 +6,7 @@
 ; first launch. For offline media, use the voice-ptt-dist folder directly.
 
 #define MyAppName "OmniType FreePTT"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "OmniType"
 #define MyAppExeName "voice-ptt.exe"
 #define DistRoot "..\voice-ptt-dist"
