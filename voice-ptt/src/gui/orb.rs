@@ -13,15 +13,13 @@ use super::orb_animation::{ease_out_cubic, lerp_color, smoothstep, OrbAnimation,
 use super::orb_palette::OrbPalette;
 
 /// Window side = orb diameter * factor + 2 * padding (room for glow/rings/overshoot).
-const CANVAS_FACTOR: f32 = 1.75;
-const CANVAS_PADDING: f32 = 8.0;
+const CANVAS_FACTOR: f32 = 1.85;
+const CANVAS_PADDING: f32 = 16.0;
 const GLOW_EXTENT: f32 = 0.55;
 const GLOW_LAYERS: usize = 12;
-const MIN_HIT_RADIUS: f32 = 16.0;
+const MIN_HIT_RADIUS: f32 = 24.0;
 const COMPLETE_HOLD_SECS: f32 = 0.9;
 const ERROR_SHAKE_SECS: f32 = 0.55;
-/// 1.0 = recording glides all the way to the primary screen center.
-const RECORDING_CENTER_PULL: f32 = 1.0;
 
 /// What happened this frame; the overlay decides what to do with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,7 +103,8 @@ impl Orb {
             self.on_mode_enter(mode);
             self.shown_mode = mode;
         }
-        if matches!(mode, OrbMode::Idle | OrbMode::Error) && self.drag.is_none() {
+        // Always keep orb anchored at user-placed home position (no jumping to screen center)
+        if self.drag.is_none() {
             self.anim.set_target_position(self.home);
         }
         self.anim.set_mode(mode);
@@ -116,7 +115,7 @@ impl Orb {
         let mut out = OrbOutput::default();
 
         eframe::egui::CentralPanel::default()
-            .frame(Frame::none())
+            .frame(Frame::none().fill(Color32::TRANSPARENT))
             .show(ctx, |ui| {
                 let screen = ui.ctx().screen_rect();
                 let radius = BASE_DIAMETER * 0.5 * self.anim.current_scale;
@@ -175,18 +174,9 @@ impl Orb {
     }
 
     fn on_mode_enter(&mut self, mode: OrbMode) {
+        // Desktop companion: stays in place at user-dragged home location across all modes
         match mode {
-            OrbMode::Recording => {
-                let center = win::primary_screen_center();
-                let from = self.anim.current_position;
-                self.anim
-                    .set_target_position(from + (center - from) * RECORDING_CENTER_PULL);
-            }
-            OrbMode::Processing => {
-                let here = self.anim.current_position;
-                self.anim.set_target_position(here);
-            }
-            OrbMode::Complete | OrbMode::Idle => {
+            OrbMode::Recording | OrbMode::Processing | OrbMode::Complete | OrbMode::Idle => {
                 self.anim.set_target_position(self.home);
             }
             OrbMode::Error => {

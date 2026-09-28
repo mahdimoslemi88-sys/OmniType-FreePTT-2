@@ -440,6 +440,30 @@ pub fn run() -> Result<()> {
     // ---- GUI (main thread) ------------------------------------------------------
     let status_client = Arc::new(StatusClient::new(machine.subscribe()));
     let (icon_rgba, icon_w, icon_h) = gui::tray::app_icon_rgba();
+    // Zero-flash launch: compute initial window position from saved settings or screen center
+    let initial_side = 220.0_f32;
+    let (init_x, init_y) = match (settings.gui.orb_position_x, settings.gui.orb_position_y) {
+        (Some(x), Some(y)) => (
+            x as f32 - initial_side * 0.5,
+            y as f32 - initial_side * 0.5,
+        ),
+        _ => {
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+                };
+                let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) } as f32;
+                let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) } as f32;
+                (sw * 0.5 - initial_side * 0.5, sh * 0.5 - initial_side * 0.5)
+            }
+            #[cfg(not(windows))]
+            {
+                (200.0, 200.0)
+            }
+        }
+    };
+
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_decorations(false)
@@ -447,7 +471,8 @@ pub fn run() -> Result<()> {
             .with_always_on_top()
             .with_resizable(false)
             .with_visible(settings.gui.show_overlay)
-            .with_inner_size([38.0, 6.0])
+            .with_position([init_x, init_y])
+            .with_inner_size([initial_side, initial_side])
             .with_title("OmniType")
             .with_icon(std::sync::Arc::new(eframe::egui::IconData {
                 rgba: icon_rgba,

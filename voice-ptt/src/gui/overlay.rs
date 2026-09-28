@@ -498,8 +498,11 @@ mod palette {
 // `widgets.noninteractive.fg_stroke` for the caption, ✕ and progress bar;
 // all three come straight from the app palette, with the accent carried by
 // a Phosphor microphone glyph (same visual language as the capsule).
+#[allow(dead_code)]
 const TOAST_CARD_BG: egui::Color32 = palette::TOAST_BG;
+#[allow(dead_code)]
 const TOAST_TEXT: egui::Color32 = palette::TEXT_PRIMARY;
+#[allow(dead_code)]
 const TOAST_ACCENT: egui::Color32 = palette::ACCENT;
 
 /// Height of the transparent glass host viewport; sized for two stacked
@@ -512,6 +515,7 @@ const TOAST_TOTAL_SECS: u64 = 10;
 /// tokens) and grow the card vertically instead of stretching; uncapped
 /// toasts keep the library's snug auto width. Fits the 380 px host
 /// viewport with margin.
+#[allow(dead_code)]
 const TOAST_MAX_WIDTH: f32 = 320.0;
 
 // Compile-time sanity: the cap must fit the 380 px host viewport with room
@@ -522,6 +526,7 @@ const _: () = {
 };
 
 /// Fresh `egui_notify` channel with the app's dark bottom-right layout.
+#[allow(dead_code)]
 fn new_toast_channel() -> Toasts {
     Toasts::new()
         .with_anchor(Anchor::BottomRight)
@@ -533,6 +538,7 @@ fn new_toast_channel() -> Toasts {
 /// Applies the OmniType dark palette to `ctx` for the duration of one pass,
 /// returning the previous style for [`restore_toast_style`]. Scoped so the
 /// main capsule and the other manager windows are never re-styled.
+#[allow(dead_code)]
 fn apply_toast_style(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
     let original = ctx.style();
     let mut styled = (*original).clone();
@@ -543,6 +549,7 @@ fn apply_toast_style(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
 }
 
 /// Restores the style captured by [`apply_toast_style`].
+#[allow(dead_code)]
 fn restore_toast_style(ctx: &egui::Context, original: std::sync::Arc<egui::Style>) {
     ctx.set_style(original);
 }
@@ -910,15 +917,8 @@ struct WinMargins {
 }
 
 #[cfg(windows)]
-#[link(name = "gdi32")]
-extern "system" {
-    fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> isize;
-}
-
-#[cfg(windows)]
 #[link(name = "user32")]
 extern "system" {
-    fn SetWindowRgn(hwnd: isize, hrgn: isize, b_redraw: i32) -> i32;
     fn SystemParametersInfoW(
         ui_action: u32,
         ui_param: u32,
@@ -989,7 +989,7 @@ fn true_screen_size_px() -> Option<(i32, i32)> {
 static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 #[cfg(windows)]
-pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, corner_px: i32) {
+pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, _corner_px: i32) {
     use windows::Win32::Foundation::RECT;
 
     let mut work_area = RECT::default();
@@ -1004,11 +1004,6 @@ pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, corner
         unsafe {
             // SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040
             SetWindowPos(hwnd, -1 /* HWND_TOPMOST */, left, top, width_px, height_px, 0x0010 | 0x0040);
-            let corner_dia = corner_px * 2;
-            let hrgn = CreateRoundRectRgn(0, 0, width_px, height_px, corner_dia, corner_dia);
-            if hrgn != 0 {
-                SetWindowRgn(hwnd, hrgn, 1);
-            }
         }
         enable_true_transparency(hwnd);
     }
@@ -1027,10 +1022,10 @@ fn local_time_str() -> String {
 
 #[cfg(windows)]
 fn apply_window_shapes_all() {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumThreadWindows, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
+        EnumThreadWindows, GetWindowTextLengthW, GetWindowTextW,
     };
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
@@ -1045,20 +1040,6 @@ fn apply_window_shapes_all() {
                 enable_true_transparency(hwnd.0 as isize);
             } else if title.contains("OmniType_Preview") {
                 enable_true_transparency(hwnd.0 as isize);
-                let mut rect = RECT::default();
-                if GetClientRect(hwnd, &mut rect).is_ok() {
-                    let w = rect.right - rect.left;
-                    let h = rect.bottom - rect.top;
-                    if w > 0 && h > 0 {
-                        // Toast has egui corner radius 12.0 -> scale to physical pixels
-                        let ppp_est = (h as f32 / 90.0_f32).max(1.0);
-                        let corner_dia = ((12.0_f32 * ppp_est).round() as i32) * 2;
-                        let hrgn = CreateRoundRectRgn(0, 0, w, h, corner_dia, corner_dia);
-                        if hrgn != 0 {
-                            SetWindowRgn(hwnd.0 as isize, hrgn, 1);
-                        }
-                    }
-                }
             }
         }
         BOOL(1)
@@ -3546,6 +3527,7 @@ impl OverlayApp {
     /// changes) the live toast's caption is rewritten **in place** — no
     /// toast is added or dismissed, so no appear/disappear animation runs
     /// and the host window never rebuilds (fixes the sub-second flicker).
+    #[allow(dead_code)]
     fn refresh_toast_countdowns(&mut self, now: Instant) {
         // Collect (raw text, old remaining, new remaining) for entries whose
         // countdown digit just changed.
@@ -3600,52 +3582,81 @@ impl OverlayApp {
     fn render_preview_toast_window(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
 
-        // Mirror the library's 10 s lifetime locally: every card's mirror
-        // entry is anchored to its first version's enqueue time, so the FIFO
-        // and the library queue stay in step. The extra 0.4 s covers the
-        // slide-out animation before the host window closes.
-        while let Some((_, _, shown_at, _)) = self.live_toasts.front() {
-            if now.duration_since(*shown_at) >= Duration::from_millis(10_400) {
+        // Expire finished transcripts
+        while let Some((_, _, shown_at, total_secs)) = self.live_toasts.front() {
+            if now.duration_since(*shown_at) >= Duration::from_secs(*total_secs) {
                 self.live_toasts.pop_front();
             } else {
                 break;
             }
         }
-        self.refresh_toast_countdowns(now);
-        if self.live_toasts.is_empty() && self.toasts.toasts_mut().is_empty() {
+        if self.live_toasts.is_empty() {
             return;
         }
 
-        let n = self.live_toasts.len();
-        let host_h = if n == 0 { 40.0 } else { 12.0 + n as f32 * 58.0 };
+        // Active transcript entry
+        let (_, ref text, shown_at, total_secs) = *self.live_toasts.back().unwrap();
+        let elapsed = now.duration_since(shown_at).as_secs_f32();
+        let total = total_secs as f32;
 
-        // Position directly above the docked capsule at the bottom.
-        let main_rect = ctx.input(|i| i.viewport().outer_rect);
-        let (pos_x, pos_y) = if let Some(rect) = main_rect {
-            // Anchor the host's *bottom edge* just above the capsule so the
-            // newest card (drawn at the viewport's BottomRight) hugs it.
-            (
-                (rect.center().x - 190.0).round(),
-                (rect.min.y - host_h - 8.0).round(),
-            )
+        let fade_in = (elapsed / 0.35).clamp(0.0, 1.0);
+        let fade_out = ((total - elapsed) / 0.8).clamp(0.0, 1.0);
+        let fade_alpha = (fade_in * fade_out).clamp(0.0, 1.0);
+
+        if fade_alpha <= 0.001 {
+            return;
+        }
+
+        let ppp = ctx.pixels_per_point();
+        let (home_px_x, home_px_y) = self.orb.home_position();
+        let orb_pt_x = home_px_x as f32 / ppp;
+        let orb_pt_y = home_px_y as f32 / ppp;
+
+        // Size the card based on text content
+        let shadow_pad = 16.0_f32;
+        let bubble_w = 380.0_f32;
+        let char_count = text.chars().count();
+        let bubble_h = if char_count > 120 {
+            88.0_f32
+        } else if char_count > 60 {
+            68.0_f32
         } else {
-            (100.0, 100.0)
+            54.0_f32
         };
 
-        // Size the host to the *actual* stack of cards instead of a fixed
-        // 190 px block: each card is a title+body+footer triplet measured by
-        // the library as 3 rows plus its own padding. Tight sizing keeps the
-        // transparent window from blanketing 380×190 of the screen and
-        // blocking clicks on whatever is underneath.
-        let n = self.live_toasts.len();
-        let host_h = if n == 0 { 40.0 } else { 12.0 + n as f32 * 58.0 };
+        let win_w = bubble_w + shadow_pad * 2.0;
+        let win_h = bubble_h + shadow_pad * 2.0;
+
+        // Position: anchor directly near the Orb
+        let mut pos_x = orb_pt_x - win_w * 0.5;
+        let mut pos_y = if orb_pt_y > 300.0 {
+            // Orb is lower on screen: float bubble gracefully above Orb
+            orb_pt_y - 75.0 - win_h
+        } else {
+            // Orb is high on screen: float bubble gracefully below Orb
+            orb_pt_y + 75.0
+        };
+
+        // Clamp to virtual screen bounds
+        let (sw_pt, sh_pt) = if let Some((sw, sh)) = true_screen_size_px() {
+            (sw as f32 / ppp, sh as f32 / ppp)
+        } else {
+            (1920.0, 1080.0)
+        };
+        pos_x = pos_x.clamp(16.0, (sw_pt - win_w - 16.0).max(16.0));
+        pos_y = pos_y.clamp(16.0, (sh_pt - win_h - 16.0).max(16.0));
+
+        let mut dismiss = false;
+        let bubble_text = text.clone();
+        let current_elapsed = elapsed;
+        let current_total = total;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("preview_toast_viewport"),
             egui::ViewportBuilder::default()
                 .with_title("OmniType_Preview")
                 .with_position([pos_x, pos_y])
-                .with_inner_size([380.0, host_h])
+                .with_inner_size([win_w, win_h])
                 .with_decorations(false)
                 .with_transparent(true)
                 .with_always_on_top()
@@ -3654,28 +3665,121 @@ impl OverlayApp {
                 #[cfg(windows)]
                 apply_window_shapes_all();
 
-                // Clicking the preview never touches the clipboard — the user's
-                // clipboard is private data and must only be overwritten by an
-                // explicit copy action in the History tab. A bare click that
-                // hits no card opens the dashboard Settings tab (e.g. update
-                // notices), everything else just dismisses via the card's ✕.
-                if toast_ctx.input(|i| i.pointer.primary_released())
-                    && self.live_toasts.is_empty()
-                {
-                    self.show_dashboard = true;
-                    self.dashboard_tab = DashboardTab::Settings;
-                    self.visible = true;
-                }
+                toast_ctx.request_repaint_after(Duration::from_millis(16));
 
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
-                    .show(toast_ctx, |_ui| {
-                        let original = apply_toast_style(toast_ctx);
-                        self.toasts.show(toast_ctx);
-                        restore_toast_style(toast_ctx, original);
+                    .show(toast_ctx, |ui| {
+                        let painter = ui.painter();
+                        let card_rect = egui::Rect::from_min_size(
+                            egui::pos2(shadow_pad, shadow_pad),
+                            egui::vec2(bubble_w, bubble_h),
+                        );
+
+                        // 1. Soft multi-layered transparent ambient shadow falloff (no hard rectangle edges)
+                        for i in 1..=4 {
+                            let sp = i as f32 * 3.5;
+                            let shadow_rect = card_rect.expand(sp);
+                            let a = ((20.0 / (i as f32 * 1.5)) * fade_alpha) as u8;
+                            painter.rect_filled(
+                                shadow_rect,
+                                16.0 + sp * 0.4,
+                                egui::Color32::from_black_alpha(a),
+                            );
+                        }
+
+                        // 2. Frosted glass body with deep translucent night tint
+                        let glass_fill = egui::Color32::from_rgba_premultiplied(
+                            18, 22, 34, (215.0 * fade_alpha) as u8,
+                        );
+                        painter.rect_filled(card_rect, 16.0, glass_fill);
+
+                        // 3. Delicate translucent glass border
+                        let border_stroke = egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_premultiplied(
+                                255, 255, 255, (38.0 * fade_alpha) as u8,
+                            ),
+                        );
+                        painter.rect_stroke(card_rect, 16.0, border_stroke);
+
+                        // 4. Subtle specular highlight line along top inner rim
+                        let sheen_y = card_rect.min.y + 1.2;
+                        painter.line_segment(
+                            [
+                                egui::pos2(card_rect.min.x + 24.0, sheen_y),
+                                egui::pos2(card_rect.max.x - 24.0, sheen_y),
+                            ],
+                            egui::Stroke::new(
+                                1.0_f32,
+                                egui::Color32::from_rgba_premultiplied(
+                                    255, 255, 255, (48.0 * fade_alpha) as u8,
+                                ),
+                            ),
+                        );
+
+                        // 5. Mint glowing status indicator cue
+                        let dot_center = egui::pos2(card_rect.max.x - 18.0, card_rect.min.y + 18.0);
+                        painter.circle_filled(
+                            dot_center,
+                            5.5,
+                            egui::Color32::from_rgba_premultiplied(52, 211, 153, (55.0 * fade_alpha) as u8),
+                        );
+                        painter.circle_filled(
+                            dot_center,
+                            2.5,
+                            egui::Color32::from_rgba_premultiplied(52, 211, 153, (230.0 * fade_alpha) as u8),
+                        );
+
+                        // 6. Persian shaped typography with graceful layout
+                        let formatted = format_persian_display(&bubble_text);
+                        let text_rect = egui::Rect::from_min_max(
+                            egui::pos2(card_rect.min.x + 16.0, card_rect.min.y + 8.0),
+                            egui::pos2(card_rect.max.x - 30.0, card_rect.max.y - 8.0),
+                        );
+                        painter.text(
+                            egui::pos2(text_rect.max.x, text_rect.min.y + 2.0),
+                            egui::Align2::RIGHT_TOP,
+                            formatted,
+                            egui::FontId::proportional(13.5),
+                            egui::Color32::from_rgba_premultiplied(
+                                245, 248, 255, (235.0 * fade_alpha) as u8,
+                            ),
+                        );
+
+                        // 7. Subtle bottom progress indicator
+                        let remaining_ratio = ((current_total - current_elapsed) / current_total).clamp(0.0, 1.0);
+                        let bar_y = card_rect.max.y - 1.5;
+                        let bar_w = (card_rect.width() - 32.0) * remaining_ratio;
+                        painter.line_segment(
+                            [
+                                egui::pos2(card_rect.min.x + 16.0, bar_y),
+                                egui::pos2(card_rect.min.x + 16.0 + bar_w, bar_y),
+                            ],
+                            egui::Stroke::new(
+                                1.5_f32,
+                                egui::Color32::from_rgba_premultiplied(
+                                    52, 211, 153, (130.0 * fade_alpha) as u8,
+                                ),
+                            ),
+                        );
+
+                        // Click anywhere on card to dismiss
+                        let resp = ui.interact(
+                            card_rect,
+                            egui::Id::new("transcript_bubble_hit"),
+                            egui::Sense::click(),
+                        );
+                        if resp.clicked() {
+                            dismiss = true;
+                        }
                     });
             },
         );
+
+        if dismiss {
+            self.live_toasts.clear();
+        }
     }
 }
 
@@ -3906,24 +4010,26 @@ impl eframe::App for OverlayApp {
             }
         }
 
-        // Render Floating AI Orb Assistant
-        #[cfg(windows)]
-        {
-            let hwnd = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-            if hwnd != 0 {
-                self.orb.set_hwnd(hwnd);
+        // Render Floating AI Orb Assistant (Hidden when Dashboard is open to prevent visual collision)
+        if !self.show_dashboard {
+            #[cfg(windows)]
+            {
+                let hwnd = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+                if hwnd != 0 {
+                    self.orb.set_hwnd(hwnd);
+                }
             }
-        }
 
-        let orb_out = self.orb.show(ctx, OrbMode::from(&status.state));
-        if let Some((x, y)) = orb_out.moved_to {
-            self.persist_orb_position(x, y);
-        }
-        if orb_out.clicked {
-            if matches!(status.state, AppState::Recording) {
-                let _ = self.events_tx.send(HotkeyEvent::RecordUp);
-            } else {
-                let _ = self.events_tx.send(HotkeyEvent::RecordDown);
+            let orb_out = self.orb.show(ctx, OrbMode::from(&status.state));
+            if let Some((x, y)) = orb_out.moved_to {
+                self.persist_orb_position(x, y);
+            }
+            if orb_out.clicked {
+                if matches!(status.state, AppState::Recording) {
+                    let _ = self.events_tx.send(HotkeyEvent::RecordUp);
+                } else {
+                    let _ = self.events_tx.send(HotkeyEvent::RecordDown);
+                }
             }
         }
     }

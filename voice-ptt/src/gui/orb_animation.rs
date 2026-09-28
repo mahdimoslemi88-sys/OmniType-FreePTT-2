@@ -9,9 +9,10 @@ use eframe::egui::{Color32, Pos2};
 use super::orb_palette::{self, OrbPalette};
 
 /// Idle orb diameter in logical points. `scale` values multiply this.
-pub const BASE_DIAMETER: f32 = 28.0;
+// Sized to 60px diameter idle per companion specifications
+pub const BASE_DIAMETER: f32 = 60.0;
 
-const HOVER_SCALE_BOOST: f32 = 0.14; // 28pt -> ~32pt on hover
+const HOVER_SCALE_BOOST: f32 = 0.08; // 60pt -> ~65pt on hover
 const SPRING_STIFFNESS: f32 = 170.0;
 const SPRING_DAMPING_RATIO: f32 = 0.62; // slight, soft overshoot
 const POSITION_SMOOTHING: f32 = 5.5; // 1/s, exponential approach
@@ -34,12 +35,13 @@ pub enum OrbMode {
 
 impl OrbMode {
     /// Target scale relative to `BASE_DIAMETER`.
+    // Idle: 60px (scale 1.0), Recording: 100px, Processing: 90px, Complete: 90px
     pub fn target_scale(self) -> f32 {
         match self {
             OrbMode::Idle | OrbMode::Error => 1.0,
-            OrbMode::Recording => 130.0 / BASE_DIAMETER,
-            OrbMode::Processing => 100.0 / BASE_DIAMETER,
-            OrbMode::Complete => 100.0 / BASE_DIAMETER,
+            OrbMode::Recording => 100.0 / BASE_DIAMETER,
+            OrbMode::Processing => 90.0 / BASE_DIAMETER,
+            OrbMode::Complete => 90.0 / BASE_DIAMETER,
         }
     }
 
