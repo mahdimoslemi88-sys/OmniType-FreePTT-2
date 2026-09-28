@@ -1087,6 +1087,35 @@ pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, _corne
 }
 
 #[cfg(windows)]
+fn taskbar_bottom_center_pt(win_w_pt: f32, win_h_pt: f32, ppp: f32) -> (f32, f32) {
+    use windows::Win32::Foundation::RECT;
+
+    let mut work_area = RECT::default();
+    let ok = unsafe { SystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, &mut work_area, 0) };
+    if ok != 0 {
+        let center_x = (work_area.left + work_area.right) / 2;
+        let taskbar_top = work_area.bottom;
+
+        let px_w = (win_w_pt * ppp).round() as i32;
+        let px_h = (win_h_pt * ppp).round() as i32;
+
+        let left = center_x - px_w / 2;
+        let top = taskbar_top - px_h - 16; // 16 physical pixels above taskbar
+        (left as f32 / ppp, top as f32 / ppp)
+    } else {
+        let (sw, sh) = true_screen_size_px().unwrap_or((1920, 1080));
+        let sw_pt = sw as f32 / ppp;
+        let sh_pt = sh as f32 / ppp;
+        ((sw_pt - win_w_pt) * 0.5, sh_pt - win_h_pt - 48.0)
+    }
+}
+
+#[cfg(not(windows))]
+fn taskbar_bottom_center_pt(win_w_pt: f32, win_h_pt: f32, _ppp: f32) -> (f32, f32) {
+    (500.0, 800.0)
+}
+
+#[cfg(windows)]
 fn local_time_str() -> String {
     let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
@@ -3683,9 +3712,6 @@ impl OverlayApp {
         }
 
         let ppp = ctx.pixels_per_point();
-        let (home_px_x, home_px_y) = self.orb.home_position();
-        let orb_pt_x = home_px_x as f32 / ppp;
-        let orb_pt_y = home_px_y as f32 / ppp;
 
         // Persian shaped typography with graceful dynamic wrapping and sizing
         let formatted = format_persian_display(text);
@@ -3718,24 +3744,8 @@ impl OverlayApp {
         let win_w = bubble_w + shadow_pad * 2.0;
         let win_h = bubble_h + shadow_pad * 2.0;
 
-        // Position: anchor directly near the Orb
-        let mut pos_x = orb_pt_x - win_w * 0.5;
-        let mut pos_y = if orb_pt_y > 300.0 {
-            // Orb is lower on screen: float bubble gracefully above Orb
-            orb_pt_y - 75.0 - win_h
-        } else {
-            // Orb is high on screen: float bubble gracefully below Orb
-            orb_pt_y + 75.0
-        };
-
-        // Clamp to virtual screen bounds
-        let (sw_pt, sh_pt) = if let Some((sw, sh)) = true_screen_size_px() {
-            (sw as f32 / ppp, sh as f32 / ppp)
-        } else {
-            (1920.0, 1080.0)
-        };
-        pos_x = pos_x.clamp(16.0, (sw_pt - win_w - 16.0).max(16.0));
-        pos_y = pos_y.clamp(16.0, (sh_pt - win_h - 16.0).max(16.0));
+        // Position: anchor cleanly at bottom center of screen, right above Windows taskbar
+        let (pos_x, pos_y) = taskbar_bottom_center_pt(win_w, win_h, ppp);
 
         let mut dismiss = false;
         let current_elapsed = elapsed;
