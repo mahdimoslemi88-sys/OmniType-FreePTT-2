@@ -43,6 +43,8 @@ pub struct Settings {
     pub gui: GuiSettings,
     pub cloud: CloudConfig,
     pub google: GoogleConfig,
+    #[serde(default)]
+    pub antigravity: AntigravityConfig,
     #[serde(default = "default_active_engine")]
     pub active_engine: String,
     #[serde(default)]
@@ -61,6 +63,7 @@ impl Default for Settings {
             gui: GuiSettings::default(),
             cloud: CloudConfig::default(),
             google: GoogleConfig::default(),
+            antigravity: AntigravityConfig::default(),
             active_engine: "auto".into(),
             custom_providers: Vec::new(),
             updates: UpdateSettings::default(),
@@ -104,6 +107,43 @@ impl Default for GoogleConfig {
             enabled: true,
             language: "fa-IR".into(),
             timeout_secs: 10,
+        }
+    }
+}
+
+/// Antigravity live-dictation bridge settings.
+///
+/// Talks to the language server of a *locally running* Antigravity app
+/// (`language_server.exe`) and borrows its cloud speech-to-text stream.
+/// No API key is involved: the token the renderer uses is read from the
+/// process command line (`--csrf_token`), and audio stays on loopback between
+/// this app and the local server. Leave `enabled = true` and select
+/// «Antigravity Live» in the engine list to use it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AntigravityConfig {
+    /// Whether the engine is registered at all.
+    pub enabled: bool,
+    /// Conversation id sent as `cascadeId`. Empty is accepted by the server.
+    pub cascade_id: String,
+    /// Seconds to wait for the stream to open (`ready`).
+    pub ready_timeout_secs: u64,
+    /// Seconds to wait for the final transcript after the last chunk.
+    pub finalize_timeout_secs: u64,
+}
+
+impl Default for AntigravityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cascade_id: String::new(),
+            // Measured on this machine: the language server takes ~13 s before
+            // it even sends response headers for a session (it does the same in
+            // its own UI — the app shows a 12.6 s stall before its first chunk),
+            // and answers within ~0.2 s once it does. Budget generously above
+            // that, otherwise every dictation fails on a healthy server.
+            ready_timeout_secs: 30,
+            finalize_timeout_secs: 12,
         }
     }
 }

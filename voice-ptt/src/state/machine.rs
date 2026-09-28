@@ -43,6 +43,9 @@ pub struct AppStatus {
     pub state: AppState,
     pub last_text: Option<String>,
     pub vad_engine: &'static str,
+    /// Live partial transcript published by a streaming engine (Antigravity).
+    /// Only populated while `state == Processing`; cleared when we leave it.
+    pub partial: Option<String>,
 }
 
 /// VAD unit: engine + endpoint state guarded by one mutex.
@@ -96,6 +99,7 @@ impl StateMachine {
             state: AppState::Idle,
             last_text: None,
             vad_engine,
+            partial: None,
         });
         Self {
             services: Arc::new(services),
@@ -111,14 +115,32 @@ impl StateMachine {
 
     fn set_state(&self, state: AppState) {
         let _ = self.status_tx.send_if_modified(|s| {
+            let mut changed = false;
             if s.state != state {
                 s.state = state.clone();
-                true
-            } else {
-                false
+                changed = true;
             }
+            // Live partials belong to the processing phase only: dropping them
+            // on the way out keeps a stale fragment from outliving its session.
+            if s.partial.is_some() && !matches!(state, AppState::Processing) {
+                s.partial = None;
+                changed = true;
+            }
+            changed
         });
         tracing::debug!(?state, "state");
+    }
+
+    /// Publishes a live partial transcript from a streaming engine
+    /// (`asr::progress`). Ignored unless we are actually processing audio.
+    pub fn publish_partial(&self, text: &str) {
+        let _ = self.status_tx.send_if_modified(|s| {
+            if s.state != AppState::Processing || s.partial.as_deref() == Some(text) {
+                return false;
+            }
+            s.partial = Some(text.to_string());
+            true
+        });
     }
 
     fn set_last_text(&self, text: String) {

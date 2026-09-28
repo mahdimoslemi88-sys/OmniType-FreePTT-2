@@ -43,6 +43,9 @@ futures-util = "0.3"
 # Pure-Rust in-memory FLAC encoder for Google Free Speech ASR
 flacenc = "0.5.1"
 
+# base64 for the Antigravity bridge: SendAudioChunk carries base64 PCM
+base64 = "0.22"
+
 # Persian/Arabic text reshaping and bidirectional layout for GUI
 ar-reshaper = "1.5.0"
 unicode-bidi = "0.3.18"
