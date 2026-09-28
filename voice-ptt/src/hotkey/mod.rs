@@ -4,4 +4,4 @@ pub mod binding;
 pub mod listener;
 
 pub use binding::{HotkeyBinding, HotkeyParseError};
-pub use listener::{HotkeyEvent, HotkeyListener};
+pub use listener::{CaptureOutcome, HotkeyConfig, HotkeyControl, HotkeyEvent, HotkeyListener};

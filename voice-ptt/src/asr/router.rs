@@ -121,8 +121,16 @@ impl AsrRouter {
         slots.iter().map(|s| (s.engine.name(), s.engine.health())).collect()
     }
 
-    /// Transcribes via the preferred / healthy engine; on total failure returns the
-    /// last error seen.
+    /// Transcribes via the selected engine.
+    ///
+    /// Two modes, deliberately different:
+    /// * `auto` — try engines in priority order, skipping ones that are
+    ///   unavailable or cooling down, until one succeeds.
+    /// * a specific engine id — that engine is the *only* one that runs. If it
+    ///   is missing, not ready, or fails, the error is returned as-is; we never
+    ///   silently switch to another engine (in particular never to the local
+    ///   whisper model, which used to happen whenever the network was down even
+    ///   though a cloud engine had been picked explicitly).
     pub async fn transcribe(&self, audio: &AudioUtterance) -> Result<String> {
         let (candidates, active, cooldown) = {
             let slots = self.slots.read().unwrap();
@@ -135,7 +143,40 @@ impl AsrRouter {
             (list, active, cooldown)
         };
 
-        let mut candidate_indices: Vec<usize> = (0..candidates.len()).collect();
+        // An explicitly selected engine is a contract: it is the only engine
+        // allowed to run, and any failure must surface to the caller instead of
+        // being papered over by a fallback. Failover chains belong to `auto`.
+        let explicit = active != "auto";
+        let mut candidate_indices: Vec<usize> = (0..candidates.len())
+            .filter(|&i| {
+                if !explicit {
+                    return true;
+                }
+                let (engine, _) = &candidates[i];
+                engine.id() == active || engine.name() == active
+            })
+            .collect();
+
+        if explicit {
+            let Some(&only) = candidate_indices.first() else {
+                let msg = format!(
+                    "engine '{active}' is selected but not registered — refusing to fall back to another engine"
+                );
+                tracing::error!("{msg}");
+                *self.last_error.lock().unwrap() = Some(msg.clone());
+                return Err(anyhow::anyhow!(msg));
+            };
+            let health = candidates[only].0.health();
+            if !health.is_available() {
+                let msg = format!(
+                    "engine '{active}' is selected but not ready ({health:?}) — refusing to fall back to another engine"
+                );
+                tracing::warn!("{msg}");
+                *self.last_error.lock().unwrap() = Some(msg.clone());
+                return Err(anyhow::anyhow!(msg));
+            }
+        }
+
         // Stable sort: if active engine is specified, prioritize it first; otherwise sort by availability & registration order
         candidate_indices.sort_by_key(|&i| {
             let (engine, failed_at_ms) = &candidates[i];
@@ -339,6 +380,84 @@ mod tests {
         let text2 = router.transcribe(&utterance()).await.unwrap();
         assert_eq!(text2, "output_b");
         assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// The bug this guards against: internet goes down while a *cloud* engine is
+    /// explicitly selected, and the app quietly answers with the local model.
+    #[tokio::test]
+    async fn explicit_engine_never_falls_back_to_another_engine() {
+        let offline = Arc::new(FakeEngine {
+            name: "google",
+            available: true,
+            result_text: String::new(), // simulates "request failed"
+            calls: AtomicUsize::new(0),
+        });
+        let local = Arc::new(FakeEngine {
+            name: "local_whisper",
+            available: true,
+            result_text: "local text".into(),
+            calls: AtomicUsize::new(0),
+        });
+
+        let router =
+            AsrRouter::new_with_active(vec![offline.clone(), local.clone()], "google".into());
+        let err = router.transcribe(&utterance()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("synthetic failure"),
+            "the selected engine's own error must surface, got: {err}"
+        );
+        assert_eq!(offline.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            local.calls.load(Ordering::Relaxed),
+            0,
+            "a local engine must never run when another engine was selected explicitly"
+        );
+    }
+
+    /// A selected engine that is not ready is an error, not a silent switch.
+    #[tokio::test]
+    async fn explicit_engine_not_ready_reports_error_instead_of_falling_back() {
+        let not_ready = Arc::new(FakeEngine {
+            name: "google",
+            available: false,
+            result_text: "unused".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let local = Arc::new(FakeEngine {
+            name: "local_whisper",
+            available: true,
+            result_text: "local text".into(),
+            calls: AtomicUsize::new(0),
+        });
+
+        let router =
+            AsrRouter::new_with_active(vec![not_ready.clone(), local.clone()], "google".into());
+        let err = router.transcribe(&utterance()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not ready"),
+            "expected a 'not ready' error, got: {err}"
+        );
+        assert_eq!(not_ready.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(local.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// Selecting an engine id that is not registered must not fall back either.
+    #[tokio::test]
+    async fn explicit_unknown_engine_is_an_error() {
+        let local = Arc::new(FakeEngine {
+            name: "local_whisper",
+            available: true,
+            result_text: "local text".into(),
+            calls: AtomicUsize::new(0),
+        });
+
+        let router = AsrRouter::new_with_active(vec![local.clone()], "google".into());
+        let err = router.transcribe(&utterance()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not registered"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(local.calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

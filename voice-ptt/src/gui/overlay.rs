@@ -17,7 +17,7 @@ use crate::asr::engine::AsrHealth;
 use crate::asr::router::AsrRouter;
 use crate::config::settings::{CustomProvider, Settings};
 use crate::hotkey::binding::HotkeyBinding;
-use crate::hotkey::HotkeyEvent;
+use crate::hotkey::{CaptureOutcome, HotkeyConfig, HotkeyControl, HotkeyEvent};
 use crate::processing::Dictionary;
 use crate::state::{AppState, AppStatus};
 
@@ -1213,6 +1213,9 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     engine_msg: Option<(String, Instant)>,
     pub update_state: crate::updates::SharedUpdateState,
     update_toast_notified: Option<String>,
+    /// Runtime handle to the global hotkey listener: live re-bind plus the
+    /// system-wide "press a key to bind it" capture.
+    hotkey: Option<HotkeyControl>,
 }
 
 impl OverlayApp {
@@ -1231,6 +1234,7 @@ impl OverlayApp {
         settings: Arc<RwLock<Settings>>,
         config_path: PathBuf,
         update_state: crate::updates::SharedUpdateState,
+        hotkey: Option<HotkeyControl>,
     ) -> Self {
         let initial_visible = settings
             .read()
@@ -1299,6 +1303,7 @@ impl OverlayApp {
             engine_msg: None,
             update_state,
             update_toast_notified: None,
+            hotkey,
         }
     }
 
@@ -1309,6 +1314,23 @@ impl OverlayApp {
             s.gui.show_overlay = self.visible;
             let _ = s.save(&self.config_path);
         }
+    }
+
+    /// Pushes the draft hotkeys into the *running* listener and persists them.
+    ///
+    /// Called right after a key is captured so the new shortcut is live
+    /// immediately (the poll thread re-reads its bindings every 10 ms); the
+    /// save button calls it too, which is idempotent.
+    fn apply_hotkeys_live(&mut self) {
+        let hotkey_settings = self.draft_settings.hotkey.clone();
+        if let Some(hotkey) = self.hotkey.clone() {
+            hotkey.set_config(HotkeyConfig::from_settings(&hotkey_settings));
+        }
+        if let Ok(mut s) = self.settings.write() {
+            s.hotkey = hotkey_settings;
+            let _ = s.save(&self.config_path);
+        }
+        self.settings_saved = true;
     }
 
     /// Renders the standalone Dictionary Manager window in an immediate viewport.
@@ -2397,29 +2419,51 @@ impl OverlayApp {
     /// Settings tab body for the unified dashboard (Bento / 2-column masonry layout).
     /// At most 2 cards placed side by side with staggered natural heights.
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
-        // Hotkey capture: if a field is armed, the next real key press (with
-        // its modifiers) becomes the new binding. Escape cancels the capture.
+        // Hotkey capture: if a field is armed, the next chord the user presses
+        // becomes the new binding. The chord is read by the *global* keyboard
+        // poller (`HotkeyControl`) because this window normally does not hold
+        // keyboard focus, so egui cannot see the keys at all; the egui path
+        // below is only a fallback for builds without a listener.
         if self.capturing_hotkey.iter().any(|c| *c) {
             let ctx = ui.ctx().clone();
-            let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-            if escape {
-                self.capturing_hotkey = [false; 3];
-                ctx.request_repaint();
-            } else if let Some(token) = egui_key_to_hotkey_token(&ctx) {
-                // Capture the armed slot index BEFORE clearing it so we assign
-                // the new key binding to the actual armed hotkey field.
-                let armed_idx = self.capturing_hotkey.iter().position(|c| *c);
-                self.capturing_hotkey = [false; 3];
-                let target = match armed_idx {
-                    Some(0) => &mut self.draft_settings.hotkey.record,
-                    Some(1) => &mut self.draft_settings.hotkey.toggle_overlay,
-                    _ => &mut self.draft_settings.hotkey.quit,
-                };
-                *target = token;
-                ctx.request_repaint();
-            } else {
-                // Keep consuming frames while the user holds modifiers only.
-                ctx.request_repaint();
+
+            let outcome: Option<CaptureOutcome> = match &self.hotkey {
+                Some(hotkey) => hotkey.take_capture(),
+                None => {
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        Some(CaptureOutcome::Cancelled)
+                    } else {
+                        egui_key_to_hotkey_token(&ctx).map(CaptureOutcome::Binding)
+                    }
+                }
+            };
+
+            match outcome {
+                Some(CaptureOutcome::Binding(token)) => {
+                    // Capture the armed slot index BEFORE clearing it so the new
+                    // binding lands in the field the user actually armed.
+                    let armed_idx = self.capturing_hotkey.iter().position(|c| *c);
+                    self.capturing_hotkey = [false; 3];
+                    // Only store chords the parser accepts, so a captured key
+                    // can never leave an unloadable config behind.
+                    if let (Some(idx), Ok(_)) = (armed_idx, HotkeyBinding::parse(&token)) {
+                        match idx {
+                            0 => self.draft_settings.hotkey.record = token,
+                            1 => self.draft_settings.hotkey.toggle_overlay = token,
+                            _ => self.draft_settings.hotkey.quit = token,
+                        }
+                        self.apply_hotkeys_live();
+                    }
+                    ctx.request_repaint();
+                }
+                Some(CaptureOutcome::Cancelled) => {
+                    self.capturing_hotkey = [false; 3];
+                    ctx.request_repaint();
+                }
+                None => {
+                    // Still waiting for the chord: keep the "..." animating.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
             }
         }
 
@@ -2594,10 +2638,15 @@ impl OverlayApp {
                             ui.add_space(6.0);
 
                             let hk_label_w = 115.0;
+                            // Set by whichever button is clicked; consumed once
+                            // the card has been laid out, so the capture arms
+                            // exactly once per click (not once per frame).
+                            let mut start_capture = false;
                             let render_hk_row = |ui: &mut egui::Ui,
                                                  label: &str,
                                                  value: &mut String,
-                                                 capturing: &mut bool| {
+                                                 capturing: &mut bool,
+                                                 start_capture: &mut bool| {
                                 rtl_form_row(ui, label, hk_label_w, |ui| {
                                     let btn_text = if *capturing {
                                         "...".to_string()
@@ -2624,6 +2673,7 @@ impl OverlayApp {
                                     );
                                     if btn.clicked() {
                                         *capturing = true;
+                                        *start_capture = true;
                                     }
                                 });
                             };
@@ -2633,6 +2683,7 @@ impl OverlayApp {
                                 "کلید ضبط:",
                                 &mut self.draft_settings.hotkey.record,
                                 &mut self.capturing_hotkey[0],
+                                &mut start_capture,
                             );
                             ui.add_space(6.0);
                             render_hk_row(
@@ -2640,6 +2691,7 @@ impl OverlayApp {
                                 "نمایش/مخفی کپسول:",
                                 &mut self.draft_settings.hotkey.toggle_overlay,
                                 &mut self.capturing_hotkey[1],
+                                &mut start_capture,
                             );
                             ui.add_space(6.0);
                             render_hk_row(
@@ -2647,7 +2699,16 @@ impl OverlayApp {
                                 "کلید خروج:",
                                 &mut self.draft_settings.hotkey.quit,
                                 &mut self.capturing_hotkey[2],
+                                &mut start_capture,
                             );
+
+                            // Arm the system-wide capture. Any single key or
+                            // chord the user presses next becomes the binding.
+                            if start_capture {
+                                if let Some(hotkey) = self.hotkey.clone() {
+                                    hotkey.begin_capture();
+                                }
+                            }
 
                             ui.add_space(6.0);
                             ui.checkbox(
@@ -2980,7 +3041,9 @@ impl OverlayApp {
                                         *s = self.draft_settings.clone();
                                         let _ = s.save(&self.config_path);
                                     }
-                                    self.settings_saved = true;
+                                    // Push the (possibly hand-edited) bindings to
+                                    // the running listener too.
+                                    self.apply_hotkeys_live();
                                 }
 
                                 if ui
@@ -3064,6 +3127,13 @@ impl OverlayApp {
             |dash_ctx, _class| {
                 if dash_ctx.input(|i| i.viewport().close_requested()) {
                     self.show_dashboard = false;
+                    // Closing the dashboard must not leave a capture armed: the
+                    // global poller would otherwise keep swallowing hotkeys
+                    // until its own timeout expires.
+                    if let Some(hotkey) = self.hotkey.clone() {
+                        hotkey.cancel_capture();
+                    }
+                    self.capturing_hotkey = [false; 3];
                 }
                 apply_theme_visuals(dash_ctx);
 
@@ -3236,12 +3306,30 @@ impl OverlayApp {
 
                             if busy {
                                 ui.add(egui::Spinner::new().size(12.0).color(palette::ACCENT));
+                                // Streaming engines (Antigravity) publish live partials;
+                                // showing the text forming beats a generic label.
+                                let live = status
+                                    .partial
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|text| !text.is_empty());
+                                let (caption, color) = match live {
+                                    Some(text) => {
+                                        let mut shown: String = text.chars().take(64).collect();
+                                        if text.chars().count() > 64 {
+                                            shown.push('…');
+                                        }
+                                        (shown, palette::TEXT_SECONDARY)
+                                    }
+                                    None => (
+                                        "در حال پردازش گفتار — کمی صبر کنید...".to_string(),
+                                        palette::TEXT_MUTED,
+                                    ),
+                                };
                                 ui.label(
-                                    egui::RichText::new(format_persian_display(
-                                        "در حال پردازش گفتار — کمی صبر کنید...",
-                                    ))
-                                    .size(10.5)
-                                    .color(palette::TEXT_MUTED),
+                                    egui::RichText::new(format_persian_display(&caption))
+                                        .size(10.5)
+                                        .color(color),
                                 );
                             } else {
                                 let (resp, painter) =
@@ -4224,6 +4312,7 @@ mod tests {
             state: AppState::Idle,
             last_text: None,
             vad_engine: "silero",
+            partial: None,
         });
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         let flags = (
@@ -4253,6 +4342,7 @@ mod tests {
             settings,
             config_path,
             update_state,
+            None,
         );
         assert!(app.visible);
         app.toggle_visible();
@@ -4267,6 +4357,7 @@ mod tests {
             state: AppState::Idle,
             last_text: None,
             vad_engine: "silero",
+            partial: None,
         });
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         let flags = (
@@ -4296,6 +4387,7 @@ mod tests {
             settings,
             config_path,
             update_state,
+            None,
         );
         app.show_dashboard = true;
         app.history.push(HistoryItem {
@@ -4325,6 +4417,7 @@ mod tests {
             state: AppState::Idle,
             last_text: None,
             vad_engine: "silero",
+            partial: None,
         });
         let client = Arc::new(StatusClient::new(rx));
         assert_eq!(client.get().state, AppState::Idle);
@@ -4332,6 +4425,7 @@ mod tests {
             state: AppState::Recording,
             last_text: None,
             vad_engine: "silero",
+            partial: None,
         })
         .unwrap();
         assert_eq!(client.get().state, AppState::Recording);

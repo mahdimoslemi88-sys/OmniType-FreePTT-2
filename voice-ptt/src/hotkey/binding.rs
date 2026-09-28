@@ -145,20 +145,47 @@ impl HotkeyBinding {
         self.key == Key::CapsLock && self.modifiers.is_empty()
     }
 
+    /// Config string for this binding: `CapsLock`, `Ctrl+Alt+S`, `Shift+F5`.
+    ///
+    /// This is exactly what the key-capture UI writes back into `config.toml`,
+    /// and it always parses back into an equal binding.
+    pub fn to_token_string(&self) -> String {
+        // Canonical modifier order (Ctrl, Alt, Shift) so `Shift+Ctrl+S` and
+        // `Ctrl+Shift+S` are stored as the same string.
+        let mut parts: Vec<String> = [Modifier::Ctrl, Modifier::Alt, Modifier::Shift]
+            .into_iter()
+            .filter(|m| self.modifiers.contains(m))
+            .map(|m| {
+                match m {
+                    Modifier::Ctrl => "Ctrl",
+                    Modifier::Alt => "Alt",
+                    Modifier::Shift => "Shift",
+                }
+                .to_string()
+            })
+            .collect();
+        parts.push(self.key.to_token());
+        parts.join("+")
+    }
+
     /// Lowercase canonical string, useful for config round-tripping and tests.
     pub fn to_canonical_string(&self) -> String {
-        let mut parts: Vec<String> = self
-            .modifiers
-            .iter()
-            .map(|m| match m {
-                Modifier::Ctrl => "ctrl",
-                Modifier::Alt => "alt",
-                Modifier::Shift => "shift",
-            })
-            .map(str::to_string)
-            .collect();
-        parts.push(key_to_str(self.key).to_string());
-        parts.join("+")
+        self.to_token_string().to_lowercase()
+    }
+}
+
+impl Key {
+    /// User-facing token for this key: `CapsLock`, `F5`, `S`, `Numpad5`.
+    ///
+    /// Inverse of the vocabulary [`HotkeyBinding::parse`] accepts; every token
+    /// produced here parses back to the same key.
+    pub fn to_token(&self) -> String {
+        match self {
+            Key::Char(c) => c.to_ascii_uppercase().to_string(),
+            Key::Fn(n) => format!("F{n}"),
+            Key::Numpad(n) => format!("Numpad{n}"),
+            other => named_key_token(*other).to_string(),
+        }
     }
 }
 
@@ -234,36 +261,34 @@ fn parse_key(lower: &str) -> Result<Key, HotkeyParseError> {
     Ok(key)
 }
 
-/// Lowercase canonical name of a key.
-fn key_to_str(key: Key) -> &'static str {
+/// Canonical token of a key that has a fixed name (character and numbered
+/// keys are handled by [`Key::to_token`]).
+fn named_key_token(key: Key) -> &'static str {
     match key {
-        Key::CapsLock => "capslock",
-        Key::Space => "space",
-        Key::Tab => "tab",
-        Key::Enter => "enter",
-        Key::Escape => "escape",
-        Key::Backspace => "backspace",
-        Key::Delete => "delete",
-        Key::Insert => "insert",
-        Key::Home => "home",
-        Key::End => "end",
-        Key::PageUp => "pageup",
-        Key::PageDown => "pagedown",
-        Key::Left => "left",
-        Key::Right => "right",
-        Key::Up => "up",
-        Key::Down => "down",
-        Key::ScrollLock => "scrolllock",
-        Key::NumLock => "numlock",
-        Key::PrintScreen => "printscreen",
-        Key::Pause => "pause",
-        Key::LeftMouse => "mouse1",
-        Key::RightMouse => "mouse2",
-        // Character and numbered keys have no static name; the canonical
-        // string for them is built by the caller if ever needed.
-        Key::Char(_) => "?",
-        Key::Fn(_) => "f?",
-        Key::Numpad(_) => "numpad?",
+        Key::CapsLock => "CapsLock",
+        Key::Space => "Space",
+        Key::Tab => "Tab",
+        Key::Enter => "Enter",
+        Key::Escape => "Escape",
+        Key::Backspace => "Backspace",
+        Key::Delete => "Delete",
+        Key::Insert => "Insert",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::Left => "Left",
+        Key::Right => "Right",
+        Key::Up => "Up",
+        Key::Down => "Down",
+        Key::ScrollLock => "ScrollLock",
+        Key::NumLock => "NumLock",
+        Key::PrintScreen => "PrintScreen",
+        Key::Pause => "Pause",
+        Key::LeftMouse => "Mouse1",
+        Key::RightMouse => "Mouse2",
+        // Unreachable through `Key::to_token`, which formats these itself.
+        Key::Char(_) | Key::Fn(_) | Key::Numpad(_) => "?",
     }
 }
 
@@ -407,6 +432,58 @@ pub fn key_to_vk(_key: Key) -> Option<VkCode> {
     None
 }
 
+/// Converts a Win32 virtual-key code back into a logical key.
+///
+/// Inverse of [`key_to_vk`]; used by the key-capture path to name the key the
+/// user actually pressed. Returns `None` for keys a binding cannot express
+/// (OEM punctuation, browser/media keys, unused VK slots).
+#[cfg(windows)]
+pub fn vk_to_key(vk: u16) -> Option<Key> {
+    // Plain numbers with the VK each arm stands for: the mapping is stable
+    // Win32 ABI, and spelling it out keeps the inverse of `key_to_vk`
+    // auditable at a glance.
+    match vk {
+        0x01 => Some(Key::LeftMouse),   // VK_LBUTTON
+        0x02 => Some(Key::RightMouse),  // VK_RBUTTON
+        0x08 => Some(Key::Backspace),   // VK_BACK
+        0x09 => Some(Key::Tab),         // VK_TAB
+        0x0D => Some(Key::Enter),       // VK_RETURN
+        0x13 => Some(Key::Pause),       // VK_PAUSE
+        0x14 => Some(Key::CapsLock),    // VK_CAPITAL
+        0x1B => Some(Key::Escape),      // VK_ESCAPE
+        0x20 => Some(Key::Space),       // VK_SPACE
+        0x21 => Some(Key::PageUp),      // VK_PRIOR
+        0x22 => Some(Key::PageDown),    // VK_NEXT
+        0x23 => Some(Key::End),         // VK_END
+        0x24 => Some(Key::Home),        // VK_HOME
+        0x25 => Some(Key::Left),        // VK_LEFT
+        0x26 => Some(Key::Up),          // VK_UP
+        0x27 => Some(Key::Right),       // VK_RIGHT
+        0x28 => Some(Key::Down),        // VK_DOWN
+        0x2C => Some(Key::PrintScreen), // VK_SNAPSHOT
+        0x2D => Some(Key::Insert),      // VK_INSERT
+        0x2E => Some(Key::Delete),      // VK_DELETE
+        0x90 => Some(Key::NumLock),     // VK_NUMLOCK
+        0x91 => Some(Key::ScrollLock),  // VK_SCROLL
+        // VK_0..VK_9
+        0x30..=0x39 => Some(Key::Char((b'0' + (vk as u8 - 0x30)) as char)),
+        // VK_A..VK_Z — lowercase, matching what `HotkeyBinding::parse` stores
+        // for a bare letter token.
+        0x41..=0x5A => Some(Key::Char((b'a' + (vk as u8 - 0x41)) as char)),
+        // VK_NUMPAD0..VK_NUMPAD9
+        0x60..=0x69 => Some(Key::Numpad((vk - 0x60) as u8)),
+        // VK_F1..VK_F24
+        0x70..=0x87 => Some(Key::Fn((vk - 0x6F) as u8)),
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub fn vk_to_key(_vk: u16) -> Option<Key> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +570,80 @@ mod tests {
         assert_eq!(key_to_vk(Key::Char('s')), Some(VK_S));
         assert_eq!(key_to_vk(Key::Fn(5)), Some(VK_F5));
         assert_eq!(key_to_vk(Key::Space), Some(VK_SPACE));
+    }
+
+    /// Everything the capture path can produce must survive a trip through
+    /// `config.toml` (token → parse → equal binding).
+    #[test]
+    fn tokens_round_trip_through_parse() {
+        for token in [
+            "CapsLock", "Space", "Tab", "Enter", "Escape", "Backspace", "Delete", "Insert",
+            "Home", "End", "PageUp", "PageDown", "Left", "Right", "Up", "Down", "ScrollLock",
+            "NumLock", "PrintScreen", "Pause", "Mouse1", "Mouse2", "F1", "F24", "Numpad0",
+            "Numpad9", "A", "Z", "0", "9",
+        ] {
+            let parsed = HotkeyBinding::parse(token).unwrap_or_else(|e| panic!("{token}: {e}"));
+            let again = HotkeyBinding::parse(&parsed.to_token_string())
+                .unwrap_or_else(|e| panic!("{} re-parse: {e}", parsed.to_token_string()));
+            assert_eq!(again, parsed, "token {token} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn token_string_orders_modifiers_and_keeps_the_key() {
+        assert_eq!(
+            HotkeyBinding::parse("shift+control+f5")
+                .unwrap()
+                .to_token_string(),
+            "Ctrl+Shift+F5"
+        );
+        assert_eq!(
+            HotkeyBinding::parse("CapsLock").unwrap().to_token_string(),
+            "CapsLock"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vk_to_key_inverts_key_to_vk() {
+        let keys = [
+            Key::CapsLock,
+            Key::Space,
+            Key::Tab,
+            Key::Enter,
+            Key::Escape,
+            Key::Backspace,
+            Key::Delete,
+            Key::Insert,
+            Key::Home,
+            Key::End,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Left,
+            Key::Right,
+            Key::Up,
+            Key::Down,
+            Key::ScrollLock,
+            Key::NumLock,
+            Key::PrintScreen,
+            Key::Pause,
+            Key::LeftMouse,
+            Key::RightMouse,
+            Key::Char('a'),
+            Key::Char('z'),
+            Key::Char('0'),
+            Key::Char('9'),
+            Key::Fn(1),
+            Key::Fn(24),
+            Key::Numpad(0),
+            Key::Numpad(9),
+        ];
+        for key in keys {
+            let vk = key_to_vk(key).unwrap_or_else(|| panic!("no VK for {key:?}"));
+            assert_eq!(vk_to_key(vk.0), Some(key), "round-trip failed for {key:?}");
+        }
+        // Keys a binding cannot express must stay rejected.
+        assert_eq!(vk_to_key(0x00), None);
+        assert_eq!(vk_to_key(0xFE), None);
     }
 }

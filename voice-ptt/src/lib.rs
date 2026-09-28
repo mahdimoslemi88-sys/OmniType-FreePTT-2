@@ -169,6 +169,9 @@ pub fn run() -> Result<()> {
     let (hk_tx, hk_rx) = std::sync::mpsc::channel::<HotkeyEvent>();
     let hotkey_config = HotkeyListener::config_from_settings(&settings.hotkey);
     let listener = HotkeyListener::spawn_with_config(hk_tx, hotkey_config)?;
+    // Handle the dashboard keeps: live re-bind of shortcuts and the
+    // system-wide key capture used by the settings UI.
+    let hotkey_control = listener.control();
 
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<HotkeyEvent>();
     let overlay_flag = Arc::new(AtomicBool::new(false));
@@ -318,6 +321,32 @@ pub fn run() -> Result<()> {
         )));
     }
 
+    // Antigravity live dictation: borrow the cloud speech-to-text of a locally
+    // running Antigravity over loopback (gRPC-Web + the CSRF token from its own
+    // command line). It never outranks the engines above in auto mode — select
+    // «Antigravity Live» explicitly, or let auto fall through to it.
+    if settings.antigravity.enabled {
+        let antigravity = Arc::new(asr::AntigravityEngine::new(settings.antigravity.clone()));
+        tracing::info!(
+            ready_timeout_secs = settings.antigravity.ready_timeout_secs,
+            "Antigravity live dictation engine enabled (requires a running Antigravity); \
+             note: a session takes ~13 s to open on this machine"
+        );
+        // Discovery spawns PowerShell + netstat, so it must stay off the UI
+        // thread; re-probe while unavailable because the app may start later.
+        let probe = antigravity.clone();
+        std::thread::spawn(move || loop {
+            probe.maintain();
+            let pause = if asr::AsrEngine::health(probe.as_ref()).is_available() {
+                60
+            } else {
+                30
+            };
+            std::thread::sleep(std::time::Duration::from_secs(pause));
+        });
+        engines.push(antigravity);
+    }
+
     engines.push(whisper.clone());
     let router = AsrRouter::new_with_active(engines, settings.active_engine.clone());
 
@@ -346,6 +375,13 @@ pub fn run() -> Result<()> {
         dictionary: dictionary.clone(),
         settings: settings.clone(),
     }));
+
+    // Streaming engines (Antigravity) publish partial transcripts while they
+    // work; route them to the capsule through the state machine.
+    {
+        let machine = machine.clone();
+        asr::progress::set_sink(Arc::new(move |text: &str| machine.publish_partial(text)));
+    }
 
     // ---- hotkeys were registered above (tray-first startup) -------------------
 
@@ -434,6 +470,7 @@ pub fn run() -> Result<()> {
     let gui_config_path = config_path.clone();
     let gui_events_tx = events_tx.clone();
     let gui_update_state = update_state.clone();
+    let gui_hotkey_control = hotkey_control.clone();
     eframe::run_native(
         "voice-ptt",
         native_options,
@@ -494,6 +531,7 @@ pub fn run() -> Result<()> {
                 gui_settings,
                 gui_config_path,
                 gui_update_state,
+                Some(gui_hotkey_control),
             )) as Box<dyn eframe::App>)
         }),
     )
