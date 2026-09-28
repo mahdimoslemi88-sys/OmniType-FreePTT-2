@@ -78,6 +78,10 @@ pub enum CaptureOutcome {
     Binding(String),
     /// Escape was pressed, the wait timed out, or the capture was cancelled.
     Cancelled,
+    /// The chord was refused with a reason (e.g. it uses the Windows key, or
+    /// the main key has no bindable equivalent). The UI surfaces the reason
+    /// instead of leaving the user with a silently dead button.
+    Rejected(String),
 }
 
 /// State shared between the polling thread and the UI's [`HotkeyControl`].
@@ -452,7 +456,9 @@ fn capture_tick(
     // storing a shortcut that would then fire on the bare key.
     if pressed.iter().any(|vk| is_unsupported_modifier(*vk)) {
         tracing::warn!("hotkey capture rejected: Windows-key chords are not supported");
-        return Some(CaptureOutcome::Cancelled);
+        return Some(CaptureOutcome::Rejected(
+            "Windows-key chords are not supported".into(),
+        ));
     }
 
     let Some(key) = *capture_key else {
@@ -483,7 +489,7 @@ fn capture_tick(
     }
     Some(match chord_token(key, capture_mods) {
         Some(token) => CaptureOutcome::Binding(token),
-        None => CaptureOutcome::Cancelled,
+        None => CaptureOutcome::Rejected("key has no bindable equivalent".into()),
     })
 }
 

@@ -1211,6 +1211,8 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     new_engine_model: String,
     new_engine_lang: String,
     engine_msg: Option<(String, Instant)>,
+    /// Transient capture feedback (saved / rejected reason), auto-expires.
+    hotkey_msg: Option<(String, Instant)>,
     pub update_state: crate::updates::SharedUpdateState,
     update_toast_notified: Option<String>,
     /// Runtime handle to the global hotkey listener: live re-bind plus the
@@ -1301,6 +1303,7 @@ impl OverlayApp {
             new_engine_model: "whisper-large-v3-turbo".to_string(),
             new_engine_lang: "fa".to_string(),
             engine_msg: None,
+            hotkey_msg: None,
             update_state,
             update_toast_notified: None,
             hotkey,
@@ -2453,7 +2456,19 @@ impl OverlayApp {
                             _ => self.draft_settings.hotkey.quit = token,
                         }
                         self.apply_hotkeys_live();
+                        self.hotkey_msg = Some(("کلید جدید ذخیره شد".to_string(), Instant::now()));
                     }
+                    ctx.request_repaint();
+                }
+                Some(CaptureOutcome::Rejected(reason)) => {
+                    self.capturing_hotkey = [false; 3];
+                    // A refused chord must never be silent: tell the user why.
+                    let msg = if reason.contains("Windows-key") {
+                        "ترکیب با کلید ویندوز پشتیبانی نمی‌شود — کلید دیگری انتخاب کنید"
+                    } else {
+                        "این کلید قابل انتساب نیست — کلید دیگری انتخاب کنید"
+                    };
+                    self.hotkey_msg = Some((msg.to_string(), Instant::now()));
                     ctx.request_repaint();
                 }
                 Some(CaptureOutcome::Cancelled) => {
@@ -2708,6 +2723,23 @@ impl OverlayApp {
                                 if let Some(hotkey) = self.hotkey.clone() {
                                     hotkey.begin_capture();
                                 }
+                            }
+
+                            // Transient feedback for capture results so a
+                            // rejected chord is never silently swallowed.
+                            let expired = self
+                                .hotkey_msg
+                                .as_ref()
+                                .is_some_and(|(_, at)| at.elapsed() > std::time::Duration::from_secs(4));
+                            if expired {
+                                self.hotkey_msg = None;
+                            }
+                            if let Some((msg, _)) = &self.hotkey_msg {
+                                ui.label(
+                                    egui::RichText::new(format_persian_display(msg))
+                                        .size(10.5)
+                                        .color(palette::WARNING),
+                                );
                             }
 
                             ui.add_space(6.0);
@@ -3297,10 +3329,16 @@ impl OverlayApp {
                             let status = self.status.get();
                             let busy =
                                 matches!(status.state, AppState::Processing | AppState::Typing);
+                            // Snapshot the error before the state is moved below.
+                            let error_text = match &status.state {
+                                AppState::Error(err) => Some(err.clone()),
+                                _ => None,
+                            };
                             let (dot, label) = match status.state {
                                 AppState::Recording => (palette::DANGER, "در حال ضبط"),
                                 AppState::Processing => (palette::WARNING, "در حال پردازش"),
                                 AppState::Typing => (palette::ACCENT_SOFT, "در حال تایپ"),
+                                AppState::Error(_) => (palette::DANGER, "خطا — دوباره تلاش کنید"),
                                 _ => (palette::SUCCESS_DOT, "آماده"),
                             };
 
@@ -3331,6 +3369,21 @@ impl OverlayApp {
                                         .size(10.5)
                                         .color(color),
                                 );
+                            } else if let Some(err) = error_text {
+                                // A failed utterance must be visible, not a
+                                // green "ready" dot pretending nothing happened.
+                                let mut shown: String = err.chars().take(90).collect();
+                                if err.chars().count() > 90 {
+                                    shown.push('…');
+                                }
+                                ui.label(
+                                    egui::RichText::new(format_persian_display(&format!(
+                                        "خطا: {shown}"
+                                    )))
+                                    .size(10.5)
+                                    .color(palette::DANGER),
+                                )
+                                .on_hover_text(format_persian_display(&err));
                             } else {
                                 let (resp, painter) =
                                     ui.allocate_painter(egui::vec2(10.0, 10.0), egui::Sense::hover());

@@ -174,7 +174,11 @@ impl StateMachine {
                             break;
                         }
                         Some(HotkeyEvent::RecordDown) => {
-                            if self.status_rx.borrow().state == AppState::Idle {
+                            // `Error` is a resting state, not a dead end: one
+                            // failed utterance (offline engine, provider 403)
+                            // must never freeze push-to-talk until restart.
+                            let state = self.status_rx.borrow().state.clone();
+                            if matches!(state, AppState::Idle | AppState::Error(_)) {
                                 self.begin_recording(&mut buffer, &mut vad_cursor);
                             }
                         }
@@ -382,6 +386,14 @@ impl StateMachine {
             Err(e) => {
                 self.set_state(AppState::Error(format!("injection failed: {e:#}")));
             }
+        }
+
+        // `Error` is transient: keep it visible just long enough to read, then
+        // return to Idle so the next push-to-talk press starts a fresh
+        // recording instead of being swallowed by a stale failure.
+        if matches!(self.status_rx.borrow().state, AppState::Error(_)) {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            self.set_state(AppState::Idle);
         }
     }
 }
