@@ -219,6 +219,7 @@
 - interface مشترک engineها و error taxonomy مشخص شود.
 - local engine و cloud engine با mock قابل تست باشند.
 - timeout، retry محدود و backoff برای cloud تعریف شود.
+- انتظار برای آماده‌شدن سشن (ready) همراه با نگه‌داشتن بافر محلی، و گزارش صریح شکست به کاربر؛ هیچ‌گاه روی رها کردن کلید درخواست را kill نکنیم — درسِ اندازه‌گیری‌شدهٔ Antigravity در `docs/reaserch/bridge/Antigravity-Log-Analysis-02.md`.
 - retry روی خطاهای غیرقابل تکرار مثل 401 انجام نشود.
 - quota بعد از پاسخ واقعی و طبق قرارداد provider محاسبه شود.
 - ذخیرهٔ quota با atomic replace سازگار با Windows انجام شود.

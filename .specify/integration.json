@@ -2,14 +2,14 @@
   "version": "1.0.11.dev0",
   "integration_state_schema": 1,
   "installed_integrations": [
-    "agy"
+    "hermes"
   ],
   "integration_settings": {
-    "agy": {
+    "hermes": {
       "script": "ps",
       "invoke_separator": "-"
     }
   },
-  "integration": "agy",
-  "default_integration": "agy"
+  "integration": "hermes",
+  "default_integration": "hermes"
 }

@@ -248,6 +248,11 @@ pub struct HotkeySettings {
 pub struct GuiSettings {
     pub show_overlay: bool,
     pub theme: String,
+    /// Orb center, physical screen pixels. None = first run (center of primary screen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orb_position_x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orb_position_y: Option<i32>,
 }
 
 impl Default for AudioSettings {
@@ -302,6 +307,8 @@ impl Default for GuiSettings {
         Self {
             show_overlay: true,
             theme: "dark".into(),
+            orb_position_x: None,
+            orb_position_y: None,
         }
     }
 }

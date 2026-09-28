@@ -16,10 +16,23 @@ use unicode_bidi::BidiInfo;
 use crate::asr::engine::AsrHealth;
 use crate::asr::router::AsrRouter;
 use crate::config::settings::{CustomProvider, Settings};
+use crate::gui::orb::{Orb, OrbMode};
 use crate::hotkey::binding::HotkeyBinding;
 use crate::hotkey::{CaptureOutcome, HotkeyConfig, HotkeyControl, HotkeyEvent};
 use crate::processing::Dictionary;
 use crate::state::{AppState, AppStatus};
+
+impl From<&AppState> for OrbMode {
+    fn from(state: &AppState) -> Self {
+        match state {
+            AppState::Idle => OrbMode::Idle,
+            AppState::Recording => OrbMode::Recording,
+            AppState::Processing => OrbMode::Processing,
+            AppState::Typing => OrbMode::Complete,
+            AppState::Error(_) => OrbMode::Error,
+        }
+    }
+}
 
 /// Sync-readable wrapper around the Tokio watch channel for the GUI thread.
 pub struct StatusClient {
@@ -340,6 +353,7 @@ mod palette {
         /// Recording capsule & visual-mode states (idle pill, recording,
         /// processing). Fill roles; text/icon colors are separate roles so
         /// the light theme can re-tune them independently.
+        #[allow(dead_code)]
         pub mod pill {
             use super::Color32;
 
@@ -825,6 +839,7 @@ fn header_badge(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Colo
 /// Frame of the floating recording capsule for one visual mode. Single
 /// source for the capsule's fill/stroke/rounding per state — restyling a
 /// capsule state is a one-line change.
+#[allow(dead_code)]
 fn capsule_frame(
     fill: egui::Color32,
     stroke: egui::Stroke,
@@ -1056,6 +1071,7 @@ fn apply_window_shapes_all() {
 }
 
 /// Paints a Phosphor microphone icon inside `rect` (replaces the hand-drawn vector mic).
+#[allow(dead_code)]
 fn paint_vector_mic(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     painter.text(
         rect.center(),
@@ -1067,6 +1083,7 @@ fn paint_vector_mic(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
 }
 
 /// Paints a Phosphor cross (✕) icon inside `rect`.
+#[allow(dead_code)]
 fn paint_vector_cross(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
     painter.text(
         rect.center(),
@@ -1078,6 +1095,7 @@ fn paint_vector_cross(painter: &egui::Painter, rect: egui::Rect, stroke: egui::S
 }
 
 /// Paints a Phosphor checkmark (✓) icon inside `rect`.
+#[allow(dead_code)]
 fn paint_vector_check(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
     painter.text(
         rect.center(),
@@ -1171,8 +1189,11 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     pub visual_mode: VisualMode,
     pub is_hovered: bool,
     pub last_hover_time: Option<Instant>,
+    #[allow(dead_code)]
     has_initial_positioned: bool,
+    #[allow(dead_code)]
     current_width: f32,
+    #[allow(dead_code)]
     current_height: f32,
     new_from: String,
     new_to: String,
@@ -1218,6 +1239,7 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     /// Runtime handle to the global hotkey listener: live re-bind plus the
     /// system-wide "press a key to bind it" capture.
     hotkey: Option<HotkeyControl>,
+    pub orb: Orb,
 }
 
 impl OverlayApp {
@@ -1242,6 +1264,12 @@ impl OverlayApp {
             .read()
             .map(|s| s.gui.show_overlay)
             .unwrap_or(true);
+
+        let saved_orb_center = settings
+            .read()
+            .ok()
+            .and_then(|s| s.gui.orb_position_x.zip(s.gui.orb_position_y));
+        let orb = Orb::new("OmniType", saved_orb_center);
 
         Self {
             status,
@@ -1307,7 +1335,26 @@ impl OverlayApp {
             update_state,
             update_toast_notified: None,
             hotkey,
+            orb,
         }
+    }
+
+    /// Persists the new orb center coordinates to Settings and writes to disk.
+    fn persist_orb_position(&self, x: i32, y: i32) {
+        let snapshot = match self.settings.write() {
+            Ok(mut s) => {
+                s.gui.orb_position_x = Some(x);
+                s.gui.orb_position_y = Some(y);
+                s.clone()
+            }
+            Err(_) => return,
+        };
+        let config_path = self.config_path.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = snapshot.save(&config_path) {
+                tracing::error!("[orb] failed to save position: {e:?}");
+            }
+        });
     }
 
     /// Toggles overlay visibility and persists the preference.
@@ -3859,374 +3906,24 @@ impl eframe::App for OverlayApp {
             }
         }
 
-        let time = ctx.input(|i| i.time);
-
-        // Determine target VisualMode based on state and hover
-        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-        let pointer_in_window = pointer_pos.is_some();
-        if pointer_in_window {
-            self.is_hovered = true;
-            self.last_hover_time = Some(now);
-        } else if let Some(last) = self.last_hover_time {
-            if now.duration_since(last) > Duration::from_millis(400) {
-                self.is_hovered = false;
+        // Render Floating AI Orb Assistant
+        #[cfg(windows)]
+        {
+            let hwnd = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+            if hwnd != 0 {
+                self.orb.set_hwnd(hwnd);
             }
         }
 
-        let target_mode = match status.state {
-            AppState::Recording => VisualMode::RecordingActive,
-            AppState::Processing | AppState::Typing => VisualMode::Processing,
-            _ => {
-                if self.is_hovered {
-                    VisualMode::HoveredAwake
-                } else {
-                    VisualMode::IdleDormant
-                }
-            }
-        };
-
-        // Determine target dimensions and corner radius for Variant 5
-        let (target_w, target_h, target_corner) = match target_mode {
-            VisualMode::IdleDormant => (38.0_f32, 6.0_f32, 3.0_f32),
-            VisualMode::HoveredAwake => (144.0_f32, 32.0_f32, 16.0_f32),
-            VisualMode::RecordingActive => (176.0_f32, 34.0_f32, 17.0_f32),
-            VisualMode::Processing => (126.0_f32, 32.0_f32, 16.0_f32),
-        };
-
-        let mode_changed = self.visual_mode != target_mode
-            || (self.current_width - target_w).abs() > 0.5
-            || (self.current_height - target_h).abs() > 0.5;
-
-        if mode_changed {
-            self.visual_mode = target_mode;
-            self.current_width = target_w;
-            self.current_height = target_h;
-
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(target_w, target_h)));
-
-            #[cfg(windows)]
-            {
-                let hwnd = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-                if hwnd != 0 {
-                    let ppp = ctx.pixels_per_point();
-                    let w_px = (target_w * ppp).round() as i32;
-                    let h_px = (target_h * ppp).round() as i32;
-                    let corner_px = (target_corner * ppp).round() as i32;
-                    position_above_taskbar(hwnd, w_px, h_px, corner_px);
-                    self.has_initial_positioned = true;
-                }
-            }
-        } else if !self.has_initial_positioned {
-            #[cfg(windows)]
-            {
-                let hwnd = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-                if hwnd != 0 {
-                    let ppp = ctx.pixels_per_point();
-                    let w_px = (target_w * ppp).round() as i32;
-                    let h_px = (target_h * ppp).round() as i32;
-                    let corner_px = (target_corner * ppp).round() as i32;
-                    position_above_taskbar(hwnd, w_px, h_px, corner_px);
-                    self.has_initial_positioned = true;
-                }
-            }
+        let orb_out = self.orb.show(ctx, OrbMode::from(&status.state));
+        if let Some((x, y)) = orb_out.moved_to {
+            self.persist_orb_position(x, y);
         }
-
-        // Render Variant 5 (Executive Pill) according to current visual mode
-        match self.visual_mode {
-            VisualMode::IdleDormant => {
-                egui::CentralPanel::default()
-                    .frame(capsule_frame(
-                        palette::pill::DORMANT_BAR,
-                        egui::Stroke::NONE,
-                        3.0,
-                        egui::Margin::same(0.0),
-                    ))
-                    .show(ctx, |ui| {
-                        let rect = ui.max_rect();
-                        let sense = ui.interact(rect, ui.id().with("dormant_bar"), egui::Sense::click());
-                        if sense.clicked() {
-                            let _ = self.events_tx.send(HotkeyEvent::RecordDown);
-                        }
-                        if sense.hovered() {
-                            self.is_hovered = true;
-                            self.last_hover_time = Some(now);
-                        }
-                    });
-            }
-            VisualMode::HoveredAwake => {
-                egui::CentralPanel::default()
-                    .frame(capsule_frame(
-                        palette::pill::SURFACE,
-                        egui::Stroke::new(1.0_f32, palette::pill::IDLE_GLOW),
-                        16.0,
-                        egui::Margin::symmetric(7.0, 4.0),
-                    ))
-                    .show(ctx, |ui| {
-                        let mut action_btn_clicked = false;
-
-                        // First-run cue (skill state 1): no model loaded yet.
-                        if self.first_run_pending {
-                            ui.label(
-                                egui::RichText::new(format_persian_display("مدلی بارگذاری نشده"))
-                                    .size(9.0)
-                                    .color(palette::WARNING),
-                            );
-                        }
-
-                        ui.horizontal(|ui| {
-                            // Vector Mic button (Click to start recording)
-                            let (mic_rect, mic_resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                            let mic_hover = mic_resp.hovered();
-                            let mic_bg = if mic_hover {
-                                palette::pill::MIC_IDLE_HOVER
-                            } else {
-                                palette::pill::MIC_IDLE
-                            };
-                            ui.painter().circle_filled(mic_rect.center(), 10.5, mic_bg);
-                            paint_vector_mic(ui.painter(), mic_rect, palette::WHITE);
-                            if mic_resp.clicked() {
-                                let _ = self.events_tx.send(HotkeyEvent::RecordDown);
-                                action_btn_clicked = true;
-                            }
-                            let _ = mic_resp
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text(format_persian_display("شروع ضبط گفتار"));
-
-                            ui.add_space(2.0);
-
-                            // Shortcut badge
-                            ui.label(
-                                egui::RichText::new(format_persian_display("CapsLock"))
-                                    .size(10.5)
-                                    .strong()
-                                    .color(palette::TEXT_STRONG_SOFT),
-                            );
-
-                            // Right-aligned buttons: Engine badge & History
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    // Engine Badge
-                                    let active_engine = self.router.active_engine();
-                                    let engine_short = match active_engine.as_str() {
-                                        "auto" => "AUTO",
-                                        "google" => "GGL",
-                                        "local_whisper" | "whisper.cpp" => "LOC",
-                                        "groq" | "cloud" => "GROQ",
-                                        _ => "API",
-                                    };
-
-                                    let badge_btn = ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new(engine_short)
-                                                    .size(8.5)
-                                                    .strong()
-                                                    .color(palette::pill::BADGE_TEXT),
-                                            )
-                                            .fill(palette::pill::BADGE_BG)
-                                            .rounding(egui::Rounding::same(5.0)),
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text(format!(
-                                            "موتور فعال: {active_engine} (کلیک برای مدیریت)"
-                                        ));
-                                    if badge_btn.clicked() {
-                                        self.show_dashboard = true;
-                                        self.dashboard_tab = DashboardTab::Engines;
-                                        action_btn_clicked = true;
-                                    }
-
-                                    ui.add_space(1.0);
-
-                                    // History icon (Clean vector badge)
-                                    let (hist_rect, hist_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                                    let hist_hover = hist_resp.hovered();
-                                    let hist_bg = if hist_hover {
-                                        palette::pill::HIST_HOVER
-                                    } else {
-                                        palette::pill::HIST_IDLE
-                                    };
-                                    ui.painter().rect_filled(hist_rect, egui::Rounding::same(4.0), hist_bg);
-                                    ui.painter().text(
-                                        hist_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        ic::CLOCK_COUNTER_CLOCKWISE,
-                                        egui::FontId::proportional(10.0),
-                                        palette::pill::HIST_ICON,
-                                    );
-                                    if hist_resp.clicked() {
-                                        self.show_dashboard = true;
-                                        self.dashboard_tab = DashboardTab::History;
-                                        action_btn_clicked = true;
-                                    }
-                                    let _ = hist_resp
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text(format_persian_display("تاریخچه گفتار (History)"));
-                                },
-                            );
-                        });
-
-                        // Click anywhere else on the pill to start recording
-                        let pill_sense = ui.interact(
-                            ui.max_rect(),
-                            ui.id().with("pill_awake_body"),
-                            egui::Sense::click(),
-                        );
-                        if pill_sense.clicked() && !action_btn_clicked {
-                            let _ = self.events_tx.send(HotkeyEvent::RecordDown);
-                        }
-                    });
-            }
-            VisualMode::RecordingActive => {
-                egui::CentralPanel::default()
-                    .frame(capsule_frame(
-                        palette::WINDOW_BG,
-                        egui::Stroke::new(1.2_f32, palette::pill::REC_GLOW),
-                        17.0,
-                        egui::Margin::symmetric(7.0, 4.0),
-                    ))
-                    .show(ctx, |ui| {
-                        let mut action_btn_clicked = false;
-
-                        ui.horizontal(|ui| {
-                            // 1. Vector Cancel button (✕) on the left
-                            let (cancel_rect, cancel_resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                            let cancel_hover = cancel_resp.hovered();
-                            let cancel_bg = if cancel_hover {
-                                palette::pill::CANCEL_HOVER
-                            } else {
-                                palette::pill::CANCEL_IDLE
-                            };
-                            ui.painter().circle_filled(cancel_rect.center(), 10.0, cancel_bg);
-                            let cross_stroke = egui::Stroke::new(1.5_f32, palette::pill::CANCEL_ICON);
-                            paint_vector_cross(ui.painter(), cancel_rect, cross_stroke);
-                            if cancel_resp.clicked() {
-                                let _ = self.events_tx.send(HotkeyEvent::Cancel);
-                                action_btn_clicked = true;
-                            }
-                            let _ = cancel_resp
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text(format_persian_display("لغو ضبط (بدون ارسال متن)"));
-
-                            ui.add_space(2.0);
-
-                            // 2. Digital recording timer (00:04)
-                            let elapsed = self
-                                .recording_start
-                                .map(|s| now.duration_since(s).as_secs())
-                                .unwrap_or(0);
-                            let timer_str = format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
-                            ui.label(
-                                egui::RichText::new(timer_str)
-                                    .size(10.0)
-                                    .strong()
-                                    .color(palette::pill::REC_TEXT),
-                            );
-
-                            ui.add_space(2.0);
-
-                            // 3. Dynamic Equalizer Waveform Bars (8 animated bars)
-                            let wave_w = 46.0_f32;
-                            let (wave_resp, wave_painter) = ui.allocate_painter(
-                                egui::vec2(wave_w, 16.0),
-                                egui::Sense::hover(),
-                            );
-                            let num_bars = 8;
-                            let bar_w = 2.4_f32;
-                            let bar_spacing = (wave_w - (num_bars as f32 * bar_w)) / ((num_bars - 1) as f32);
-                            let center_y = wave_resp.rect.center().y;
-
-                            for i in 0..num_bars {
-                                let phase = time * 10.0 + (i as f64) * 0.95;
-                                let wave_val = (phase.sin().abs() * 0.7 + (phase * 1.6).cos().abs() * 0.3) as f32;
-                                let h = (3.5 + 11.5 * wave_val).clamp(3.0, 15.0);
-
-                                let bx = wave_resp.rect.min.x + (i as f32) * (bar_w + bar_spacing);
-                                let by = center_y - h / 2.0;
-
-                                let bar_color = if i % 2 == 0 {
-                                    palette::pill::WAVE_STRONG
-                                } else {
-                                    palette::pill::WAVE_FAINT
-                                };
-
-                                wave_painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(bx, by),
-                                        egui::vec2(bar_w, h),
-                                    ),
-                                    egui::Rounding::same(1.2),
-                                    bar_color,
-                                );
-                            }
-
-                            // 4. Vector Submit / Finish button (✓) on the right
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let (submit_rect, submit_resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                                    let submit_hover = submit_resp.hovered();
-                                    let submit_bg = if submit_hover {
-                                        palette::pill::SUBMIT_HOVER
-                                    } else {
-                                        palette::pill::SUBMIT_IDLE
-                                    };
-                                    ui.painter().circle_filled(submit_rect.center(), 10.0, submit_bg);
-                                    let check_stroke = egui::Stroke::new(1.8_f32, palette::pill::SUBMIT_ICON);
-                                    paint_vector_check(ui.painter(), submit_rect, check_stroke);
-                                    if submit_resp.clicked() {
-                                        let _ = self.events_tx.send(HotkeyEvent::RecordUp);
-                                        action_btn_clicked = true;
-                                    }
-                                    let _ = submit_resp
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text(format_persian_display("پایان ضبط و تایپ متن"));
-                                },
-                            );
-                        });
-
-                        // Clicking elsewhere on recording capsule also submits
-                        let rec_sense = ui.interact(
-                            ui.max_rect(),
-                            ui.id().with("pill_rec_body"),
-                            egui::Sense::click(),
-                        );
-                        if rec_sense.clicked() && !action_btn_clicked {
-                            let _ = self.events_tx.send(HotkeyEvent::RecordUp);
-                        }
-                    });
-            }
-            VisualMode::Processing => {
-                egui::CentralPanel::default()
-                    .frame(capsule_frame(
-                        palette::pill::SURFACE,
-                        egui::Stroke::new(1.0_f32, palette::pill::PROC_GLOW),
-                        16.0,
-                        egui::Margin::symmetric(8.0, 4.0),
-                    ))
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            let pulse = 3.0 + 1.5 * (time * 6.0).sin().abs() as f32;
-                            let (response, painter) = ui.allocate_painter(
-                                egui::vec2(12.0, 12.0),
-                                egui::Sense::hover(),
-                            );
-                            let center = response.rect.center();
-                            let amber = palette::pill::PROC_AMBER;
-                            painter.circle_filled(center, pulse + 1.5, amber.linear_multiply(0.25));
-                            painter.circle_filled(center, 3.2, amber);
-
-                            ui.add_space(2.0);
-
-                            ui.label(
-                                egui::RichText::new(format_persian_display("در حال پردازش..."))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(palette::pill::PROC_TEXT),
-                            );
-                        });
-                    });
+        if orb_out.clicked {
+            if matches!(status.state, AppState::Recording) {
+                let _ = self.events_tx.send(HotkeyEvent::RecordUp);
+            } else {
+                let _ = self.events_tx.send(HotkeyEvent::RecordDown);
             }
         }
     }

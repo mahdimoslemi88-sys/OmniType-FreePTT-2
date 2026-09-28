@@ -1,7 +1,7 @@
 # OmniType FreePTT v2 — سند تحویل پروژه (Handoff)
 
 > **هدف این سند**: هر مدل/توسعه‌دهنده‌ای بتواند بدون بافت قبلی، کار روی این پروژه را ادامه دهد.
-> آخرین به‌روزرسانی: ۲۰۲۶-۰۹-۲۱ · شاخه: `main` · وضعیت: کارکرد کامل + تغییرات کامیت‌نشده (بخش ۹)
+> آخرین به‌روزرسانی: ۲۰۲۶-۰۹-۲۷ · شاخه: `main` · وضعیت: کارکرد کامل + موتور جدید Antigravity (بخش ۱۳) + تغییرات کامیت‌نشده (بخش ۹)
 
 ---
 
@@ -169,6 +169,7 @@ MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
 4. **تیون چشمی تم روشن** — `docs/light-theme-tuning.md` چک‌لیست کامل دارد؛ ۴ جفت زیر آستانهٔ WCAG ۳× شناسایی شده (`WARNING`، `SUCCESS` روی بنر، `TEXT_FAINT`، `ACCENT_SOFT`).
 5. کامیت + push؛ سپس PR بالادستی (بخش ۸).
 6. autostart نصب‌کننده از `{userstartup}` (_startup folder_) می‌سازد — اگر خواستی رفتار «اجرای خودکار» اپ با تنظیم داخلی‌اش هم‌گام شود، هم‌راستا کن.
+7. **تأخیر ۱۳ ثانیه‌ای موتور Antigravity** — سرور محلی هر سشن را ~۱۳s باز می‌کند (بخش ۱۳)؛ راه‌حل بعدی: باز کردن سشن در لحظهٔ فشردن کلید یا نگه‌داشتن یک سشن گرم.
 
 ## ۱۱. عجایب محیط این دستگاه (زمان‌سوز نباش)
 
@@ -190,3 +191,30 @@ MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
 | مسیر داده جدید | `paths.rs` (exe-first را رعایت کن) |
 | رفتار نصب/آپگرید | `installer/installer.iss` → بخش‌های `[Files]`, `[Code]` |
 | متن‌های ویزارد | `[Messages]` + `InitializeWizard` در همان فایل |
+| موتور دیکتهٔ زنده (Antigravity) | `src/asr/antigravity.rs` + `docs/reaserch/bridge/Antigravity-Live-Dictation-Engine.md` |
+| نمایش متن زندهٔ در حال شکل‌گیری | `src/asr/progress.rs` → `AppStatus.partial` → نوار وضعیت داشبورد |
+
+---
+
+## ۱۳. موتور دیکتهٔ زندهٔ Antigravity (۲۷ سپتامبر ۲۰۲۶) — تازه
+
+یک موتور ASR جدید که صدا را به **زبان‌سرور محلی خودِ Antigravity** می‌دهد
+(gRPC-Web + JSON روی loopback، توکن CSRF از خط فرمان همان پروسه) — بدون کلید
+API و بدون مدل محلی. مستند کامل: `docs/reaserch/bridge/Antigravity-Live-Dictation-Engine.md`.
+
+نکاتی که باید بدانی:
+
+- موتور فقط وقتی Ready است که Antigravity **در حال اجرا** باشد؛ در غیر این صورت
+  `Failed` می‌شود و در حالت `auto` نوبت به موتور بعدی می‌رسد (ترتیب auto عوض
+  نشده: cloud → google → custom → **antigravity** → whisper).
+- سرور محلی دو پورت می‌دهد: یکی HTTPS و یکی **HTTP ساده**؛ موتور اول HTTP را
+  پروب می‌کند (`200`) و HTTPS را فقط به‌عنوان fallback نگه می‌دارد.
+- **هر سشن ~۱۳ ثانیه** طول می‌کشد تا باز شود (`ready`) و این تأخیر سمت سرور است
+  (با `curl`: `time_starttransfer≈13.3s` با توکن معتبر، `0.011s` با توکن نامعتبر)؛
+  خود اپ هم همین را دارد (`ready_timeout_secs` پیش‌فرض ۳۰ است).
+- `cascadeId` از پنجرهٔ باز Antigravity (CDP `/json/list`) خوانده می‌شود؛ مقدار
+  خالی/ساختگی قابل اتکا نیست.
+- تست زندهٔ بدون میکروفون: `cargo test --test antigravity_live -- --ignored --nocapture`
+  (صدای سینتزشدهٔ ویندوز → متن نهایی).
+- بیلد ریلیز ۲۷ سپتامبر در `voice-ptt-dist/voice-ptt.exe` کپی شده
+  (`README-ANTIGRAVITY-ENGINE.md` هم کنارش هست)؛ پکیج نصب Inno بازسازی نشده است.
