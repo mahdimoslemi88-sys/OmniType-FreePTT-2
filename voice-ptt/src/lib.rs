@@ -465,6 +465,7 @@ pub fn run() -> Result<()> {
     };
 
     let native_options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_decorations(false)
             .with_transparent(true)
@@ -541,6 +542,13 @@ pub fn run() -> Result<()> {
             // Persian coverage from Segoe UI stays intact.
             egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
             cc.egui_ctx.set_fonts(fonts);
+
+            // Ensure the main overlay context has fully transparent panel and window fills
+            let mut transparent_visuals = eframe::egui::Visuals::dark();
+            transparent_visuals.panel_fill = eframe::egui::Color32::TRANSPARENT;
+            transparent_visuals.window_fill = eframe::egui::Color32::TRANSPARENT;
+            transparent_visuals.extreme_bg_color = eframe::egui::Color32::TRANSPARENT;
+            cc.egui_ctx.set_visuals(transparent_visuals);
 
             Ok(Box::new(OverlayApp::new(
                 gui_status.clone(),

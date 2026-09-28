@@ -69,7 +69,7 @@ windows = { version = "0.58", features = [
 
 # System tray + floating overlay GUI
 tray-icon = "0.14"
-eframe = "0.28"
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "wgpu"] }
 
 # Ready-made egui components (pinned to the egui 0.28-compatible releases):
 # - phosphor icons replace the hand-drawn vector glyphs and emoji buttons

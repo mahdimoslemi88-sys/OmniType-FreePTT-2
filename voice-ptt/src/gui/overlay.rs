@@ -3724,6 +3724,12 @@ impl OverlayApp {
                 #[cfg(windows)]
                 apply_window_shapes_all();
 
+                let mut transparent_visuals = egui::Visuals::dark();
+                transparent_visuals.panel_fill = egui::Color32::TRANSPARENT;
+                transparent_visuals.window_fill = egui::Color32::TRANSPARENT;
+                transparent_visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
+                toast_ctx.set_visuals(transparent_visuals);
+
                 toast_ctx.request_repaint_after(Duration::from_millis(16));
 
                 egui::CentralPanel::default()
