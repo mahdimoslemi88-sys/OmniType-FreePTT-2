@@ -11,8 +11,9 @@ pub use super::orb_animation::OrbMode;
 use super::orb_animation::{ease_out_cubic, lerp_color, smoothstep, OrbAnimation, BASE_DIAMETER};
 use super::orb_palette::OrbPalette;
 
-/// Tight window side factor: ~84x84 idle, ~140x140 recording.
-const CANVAS_TIGHT_FACTOR: f32 = 1.40;
+/// Window side = orb diameter * factor + 2 * padding (generous room for glow/rings/overshoot).
+const CANVAS_FACTOR: f32 = 1.90;
+const CANVAS_PADDING: f32 = 24.0;
 const GLOW_EXTENT: f32 = 0.55;
 const GLOW_LAYERS: usize = 12;
 const MIN_HIT_RADIUS: f32 = 24.0;
@@ -145,8 +146,10 @@ impl Orb {
             });
 
         let canvas_scale = self.update_canvas_scale();
-        let side_px = (Self::canvas_side_points(canvas_scale) * ppp).ceil() as i32;
+        let side_pt = Self::canvas_side_points(canvas_scale);
+        let side_px = (side_pt * ppp).ceil() as i32;
         self.window.place(self.anim.current_position, side_px);
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::InnerSize(eframe::egui::vec2(side_pt, side_pt)));
 
         ctx.request_repaint_after(self.repaint_interval(mode));
         out
@@ -241,7 +244,7 @@ impl Orb {
     }
 
     fn canvas_side_points(scale: f32) -> f32 {
-        BASE_DIAMETER * scale * CANVAS_TIGHT_FACTOR
+        BASE_DIAMETER * scale * CANVAS_FACTOR + CANVAS_PADDING * 2.0
     }
 
     fn repaint_interval(&self, mode: OrbMode) -> Duration {
@@ -608,12 +611,19 @@ mod win {
 
         fn hwnd(&mut self) -> Option<HWND> {
             if self.raw == 0 {
-                let found = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(self.title.as_ptr())) };
-                if let Ok(h) = found {
-                    if !h.0.is_null() {
-                        self.raw = h.0 as isize;
-                        #[cfg(windows)]
-                        crate::gui::overlay::enable_true_transparency(self.raw);
+                let main = crate::gui::overlay::MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+                if main != 0 {
+                    self.raw = main;
+                    #[cfg(windows)]
+                    crate::gui::overlay::enable_true_transparency(self.raw);
+                } else {
+                    let found = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(self.title.as_ptr())) };
+                    if let Ok(h) = found {
+                        if !h.0.is_null() {
+                            self.raw = h.0 as isize;
+                            #[cfg(windows)]
+                            crate::gui::overlay::enable_true_transparency(self.raw);
+                        }
                     }
                 }
             }

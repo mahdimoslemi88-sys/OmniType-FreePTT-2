@@ -440,8 +440,8 @@ pub fn run() -> Result<()> {
     // ---- GUI (main thread) ------------------------------------------------------
     let status_client = Arc::new(StatusClient::new(machine.subscribe()));
     let (icon_rgba, icon_w, icon_h) = gui::tray::app_icon_rgba();
-    // Zero-flash launch: tightly sized native window (~84x84 idle, expands to 140x140 recording)
-    let initial_side = 84.0_f32;
+    // Zero-flash launch: generously sized native window with full padding for glow/ripples
+    let initial_side = 162.0_f32;
     let (init_x, init_y) = match (settings.gui.orb_position_x, settings.gui.orb_position_y) {
         (Some(x), Some(y)) => (
             x as f32 - initial_side * 0.5,
@@ -474,7 +474,7 @@ pub fn run() -> Result<()> {
             .with_visible(settings.gui.show_overlay)
             .with_position([init_x, init_y])
             .with_inner_size([initial_side, initial_side])
-            .with_title("OmniType")
+            .with_title("")
             .with_icon(std::sync::Arc::new(eframe::egui::IconData {
                 rgba: icon_rgba,
                 width: icon_w,

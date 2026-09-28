@@ -952,23 +952,40 @@ extern "system" {
 pub fn enable_true_transparency(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE,
+        GetWindowLongW, SetWindowLongW, SetWindowPos, SetWindowTextW, GWL_EXSTYLE, GWL_STYLE,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
         WS_BORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
         WS_THICKFRAME,
     };
 
-    let margins = WinMargins {
-        cx_left: -1,
-        cx_right: -1,
-        cy_top: -1,
-        cy_bottom: -1,
-    };
+    let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
     unsafe {
-        // 1. Extend DWM frame completely into client area for per-pixel hardware alpha
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        // 1. Strip non-client styles (caption, thickframe, min/max buttons, sysmenu, borders) FIRST
+        let cur_style = GetWindowLongW(win_hwnd, GWL_STYLE);
+        let stripped = (cur_style as u32
+            & !(WS_CAPTION.0
+                | WS_THICKFRAME.0
+                | WS_MINIMIZEBOX.0
+                | WS_MAXIMIZEBOX.0
+                | WS_SYSMENU.0
+                | WS_BORDER.0
+                | 0x0080_0000 /* WS_DLGFRAME */))
+            | WS_POPUP.0;
+        let _ = SetWindowLongW(win_hwnd, GWL_STYLE, stripped as i32);
 
-        // 2. DWMWA_NCRENDERING_POLICY = 2, DWMNCRP_DISABLED = 1
+        // 2. Strip extended styles (sunken/raised edges, static edges, dialog frame)
+        let cur_ex = GetWindowLongW(win_hwnd, GWL_EXSTYLE);
+        let stripped_ex = cur_ex as u32
+            & !(0x0000_0100 /* WS_EX_WINDOWEDGE */
+                | 0x0000_0200 /* WS_EX_CLIENTEDGE */
+                | 0x0002_0000 /* WS_EX_STATICEDGE */
+                | 0x0000_0001 /* WS_EX_DLGMODALFRAME */);
+        let _ = SetWindowLongW(win_hwnd, GWL_EXSTYLE, stripped_ex as i32);
+
+        // 3. Clear window title string from OS window so Windows never renders "OmniType"
+        let _ = SetWindowTextW(win_hwnd, windows::core::w!(""));
+
+        // 4. DWMWA_NCRENDERING_POLICY = 2, DWMNCRP_DISABLED = 1
         // Disables non-client area rendering and window drop shadow
         let ncrp_disabled: u32 = 1;
         let _ = DwmSetWindowAttribute(
@@ -978,7 +995,7 @@ pub fn enable_true_transparency(hwnd: isize) {
             4,
         );
 
-        // 3. DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_DONOTROUND = 1
+        // 5. DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_DONOTROUND = 1
         // Prevents Windows 11 from rounding window corners
         let corner_donotround: u32 = 1;
         let _ = DwmSetWindowAttribute(
@@ -988,7 +1005,7 @@ pub fn enable_true_transparency(hwnd: isize) {
             4,
         );
 
-        // 4. DWMWA_BORDER_COLOR = 34, DWMWA_COLOR_NONE = 0xFFFFFFFE
+        // 6. DWMWA_BORDER_COLOR = 34, DWMWA_COLOR_NONE = 0xFFFFFFFE
         // Removes any default window border color
         let border_none: u32 = 0xFFFF_FFFE;
         let _ = DwmSetWindowAttribute(
@@ -998,7 +1015,7 @@ pub fn enable_true_transparency(hwnd: isize) {
             4,
         );
 
-        // 5. DWMWA_SYSTEMBACKDROP_TYPE = 38, DWMSBT_NONE = 1
+        // 7. DWMWA_SYSTEMBACKDROP_TYPE = 38, DWMSBT_NONE = 1
         // Disables acrylic and mica frosted glass so the background is 100% transparent
         let backdrop_none: u32 = 1;
         let _ = DwmSetWindowAttribute(
@@ -1008,15 +1025,16 @@ pub fn enable_true_transparency(hwnd: isize) {
             4,
         );
 
-        // 6. Strip non-client styles (caption, thickframe, min/max buttons, sysmenu, borders)
-        let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
-        let cur_style = GetWindowLongW(win_hwnd, GWL_STYLE);
-        let stripped = (cur_style as u32
-            & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_SYSMENU.0 | WS_BORDER.0))
-            | WS_POPUP.0;
-        let _ = SetWindowLongW(win_hwnd, GWL_STYLE, stripped as i32);
+        // 8. Extend DWM frame completely into client area for per-pixel hardware alpha
+        let margins = WinMargins {
+            cx_left: -1,
+            cx_right: -1,
+            cy_top: -1,
+            cy_bottom: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
-        // 7. Force window manager to discard cached frame decorations
+        // 9. Force window manager to discard cached frame decorations
         let _ = SetWindowPos(
             win_hwnd,
             HWND(std::ptr::null_mut()),
@@ -1045,7 +1063,7 @@ fn true_screen_size_px() -> Option<(i32, i32)> {
 }
 
 #[cfg(windows)]
-static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+pub(crate) static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 #[cfg(windows)]
 pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, _corner_px: i32) {
@@ -1089,17 +1107,15 @@ fn apply_window_shapes_all() {
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
         let len = GetWindowTextLengthW(hwnd);
-        if len > 0 {
-            let mut buf = vec![0u16; (len + 1) as usize];
-            let actual = GetWindowTextW(hwnd, &mut buf);
-            let title = String::from_utf16_lossy(&buf[..actual as usize]);
+        let mut buf = vec![0u16; (len + 1) as usize];
+        let actual = GetWindowTextW(hwnd, &mut buf);
+        let title = String::from_utf16_lossy(&buf[..actual as usize]);
 
-            if title == "OmniType" {
-                MAIN_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
-                enable_true_transparency(hwnd.0 as isize);
-            } else if title.contains("OmniType_Preview") {
-                enable_true_transparency(hwnd.0 as isize);
-            }
+        if title.is_empty() || title == "OmniType" {
+            MAIN_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
+            enable_true_transparency(hwnd.0 as isize);
+        } else if title.contains("OmniType_Preview") {
+            enable_true_transparency(hwnd.0 as isize);
         }
         BOOL(1)
     }
@@ -3671,17 +3687,33 @@ impl OverlayApp {
         let orb_pt_x = home_px_x as f32 / ppp;
         let orb_pt_y = home_px_y as f32 / ppp;
 
-        // Size the card based on text content
+        // Persian shaped typography with graceful dynamic wrapping and sizing
+        let formatted = format_persian_display(text);
+        let font_id = egui::FontId::proportional(13.5);
+        let max_text_w = 340.0_f32;
+
+        let mut layout_job = egui::text::LayoutJob::single_section(
+            formatted.clone(),
+            egui::text::TextFormat {
+                font_id: font_id.clone(),
+                color: egui::Color32::from_rgba_premultiplied(
+                    245, 248, 255, (235.0 * fade_alpha) as u8,
+                ),
+                ..Default::default()
+            },
+        );
+        layout_job.wrap = egui::text::TextWrapping::wrap_at_width(max_text_w);
+        layout_job.halign = egui::Align::RIGHT;
+        let galley = ctx.fonts(|f| f.layout_job(layout_job));
+        let text_size = galley.size();
+
         let shadow_pad = 16.0_f32;
-        let bubble_w = 380.0_f32;
-        let char_count = text.chars().count();
-        let bubble_h = if char_count > 120 {
-            88.0_f32
-        } else if char_count > 60 {
-            68.0_f32
-        } else {
-            54.0_f32
-        };
+        let pad_x = 20.0_f32;
+        let pad_y = 12.0_f32;
+        let dot_margin = 28.0_f32;
+
+        let bubble_w = (text_size.x + pad_x + dot_margin).clamp(240.0, 420.0);
+        let bubble_h = (text_size.y + pad_y * 2.0 + 6.0).max(48.0);
 
         let win_w = bubble_w + shadow_pad * 2.0;
         let win_h = bubble_h + shadow_pad * 2.0;
@@ -3706,9 +3738,9 @@ impl OverlayApp {
         pos_y = pos_y.clamp(16.0, (sh_pt - win_h - 16.0).max(16.0));
 
         let mut dismiss = false;
-        let bubble_text = text.clone();
         let current_elapsed = elapsed;
         let current_total = total;
+        let bubble_galley = galley.clone();
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("preview_toast_viewport"),
@@ -3796,21 +3828,15 @@ impl OverlayApp {
                             egui::Color32::from_rgba_premultiplied(52, 211, 153, (230.0 * fade_alpha) as u8),
                         );
 
-                        // 6. Persian shaped typography with graceful layout
-                        let formatted = format_persian_display(&bubble_text);
-                        let text_rect = egui::Rect::from_min_max(
-                            egui::pos2(card_rect.min.x + 16.0, card_rect.min.y + 8.0),
-                            egui::pos2(card_rect.max.x - 30.0, card_rect.max.y - 8.0),
+                        // 6. Persian shaped typography with graceful dynamic layout
+                        let text_pos = egui::pos2(
+                            card_rect.max.x - dot_margin - text_size.x,
+                            card_rect.min.y + pad_y,
                         );
-                        painter.text(
-                            egui::pos2(text_rect.max.x, text_rect.min.y + 2.0),
-                            egui::Align2::RIGHT_TOP,
-                            formatted,
-                            egui::FontId::proportional(13.5),
-                            egui::Color32::from_rgba_premultiplied(
-                                245, 248, 255, (235.0 * fade_alpha) as u8,
-                            ),
+                        let text_color = egui::Color32::from_rgba_premultiplied(
+                            245, 248, 255, (235.0 * fade_alpha) as u8,
                         );
+                        painter.galley(text_pos, bubble_galley, text_color);
 
                         // 7. Subtle bottom progress indicator
                         let remaining_ratio = ((current_total - current_elapsed) / current_total).clamp(0.0, 1.0);
