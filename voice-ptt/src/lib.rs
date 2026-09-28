@@ -440,8 +440,8 @@ pub fn run() -> Result<()> {
     // ---- GUI (main thread) ------------------------------------------------------
     let status_client = Arc::new(StatusClient::new(machine.subscribe()));
     let (icon_rgba, icon_w, icon_h) = gui::tray::app_icon_rgba();
-    // Zero-flash launch: compute initial window position from saved settings or screen center
-    let initial_side = 220.0_f32;
+    // Zero-flash launch: tightly sized native window (~84x84 idle, expands to 140x140 recording)
+    let initial_side = 84.0_f32;
     let (init_x, init_y) = match (settings.gui.orb_position_x, settings.gui.orb_position_y) {
         (Some(x), Some(y)) => (
             x as f32 - initial_side * 0.5,

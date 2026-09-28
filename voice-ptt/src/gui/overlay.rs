@@ -950,6 +950,14 @@ extern "system" {
 
 #[cfg(windows)]
 pub fn enable_true_transparency(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        WS_BORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+        WS_THICKFRAME,
+    };
+
     let margins = WinMargins {
         cx_left: -1,
         cx_right: -1,
@@ -957,15 +965,66 @@ pub fn enable_true_transparency(hwnd: isize) {
         cy_bottom: -1,
     };
     unsafe {
+        // 1. Extend DWM frame completely into client area for per-pixel hardware alpha
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-        // DWMWA_SYSTEMBACKDROP_TYPE = 38, DWMSBT_NONE = 1
-        // Disables acrylic and mica frosted glass so the background is 100% transparent!
+
+        // 2. DWMWA_NCRENDERING_POLICY = 2, DWMNCRP_DISABLED = 1
+        // Disables non-client area rendering and window drop shadow
+        let ncrp_disabled: u32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            2,
+            &ncrp_disabled as *const _ as *const std::ffi::c_void,
+            4,
+        );
+
+        // 3. DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_DONOTROUND = 1
+        // Prevents Windows 11 from rounding window corners
+        let corner_donotround: u32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            33,
+            &corner_donotround as *const _ as *const std::ffi::c_void,
+            4,
+        );
+
+        // 4. DWMWA_BORDER_COLOR = 34, DWMWA_COLOR_NONE = 0xFFFFFFFE
+        // Removes any default window border color
+        let border_none: u32 = 0xFFFF_FFFE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            34,
+            &border_none as *const _ as *const std::ffi::c_void,
+            4,
+        );
+
+        // 5. DWMWA_SYSTEMBACKDROP_TYPE = 38, DWMSBT_NONE = 1
+        // Disables acrylic and mica frosted glass so the background is 100% transparent
         let backdrop_none: u32 = 1;
         let _ = DwmSetWindowAttribute(
             hwnd,
             38,
             &backdrop_none as *const _ as *const std::ffi::c_void,
             4,
+        );
+
+        // 6. Strip non-client styles (caption, thickframe, min/max buttons, sysmenu, borders)
+        let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
+        let cur_style = GetWindowLongW(win_hwnd, GWL_STYLE);
+        let stripped = (cur_style as u32
+            & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_SYSMENU.0 | WS_BORDER.0))
+            | WS_POPUP.0;
+        let _ = SetWindowLongW(win_hwnd, GWL_STYLE, stripped as i32);
+
+        // 7. Force window manager to discard cached frame decorations
+        let _ = SetWindowPos(
+            win_hwnd,
+            HWND(std::ptr::null_mut()),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
 }

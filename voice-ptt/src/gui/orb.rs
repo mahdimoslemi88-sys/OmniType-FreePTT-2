@@ -4,17 +4,15 @@ use std::f32::consts::{PI, TAU};
 use std::time::Duration;
 
 use eframe::egui::{
-    epaint::PathShape, Color32, CursorIcon, Frame, Id, Painter, Pos2, Rect, Sense, Shape, Stroke,
-    Vec2,
+    epaint::PathShape, Color32, CursorIcon, Id, Painter, Pos2, Rect, Sense, Shape, Stroke, Vec2,
 };
 
 pub use super::orb_animation::OrbMode;
 use super::orb_animation::{ease_out_cubic, lerp_color, smoothstep, OrbAnimation, BASE_DIAMETER};
 use super::orb_palette::OrbPalette;
 
-/// Window side = orb diameter * factor + 2 * padding (room for glow/rings/overshoot).
-const CANVAS_FACTOR: f32 = 1.85;
-const CANVAS_PADDING: f32 = 16.0;
+/// Tight window side factor: ~84x84 idle, ~140x140 recording.
+const CANVAS_TIGHT_FACTOR: f32 = 1.40;
 const GLOW_EXTENT: f32 = 0.55;
 const GLOW_LAYERS: usize = 12;
 const MIN_HIT_RADIUS: f32 = 24.0;
@@ -114,8 +112,9 @@ impl Orb {
         let ppp = ctx.pixels_per_point();
         let mut out = OrbOutput::default();
 
-        eframe::egui::CentralPanel::default()
-            .frame(Frame::none().fill(Color32::TRANSPARENT))
+        eframe::egui::Area::new(Id::new("omnitype_orb_floating_area"))
+            .fixed_pos(Pos2::ZERO)
+            .interactable(true)
             .show(ctx, |ui| {
                 let screen = ui.ctx().screen_rect();
                 let radius = BASE_DIAMETER * 0.5 * self.anim.current_scale;
@@ -242,7 +241,7 @@ impl Orb {
     }
 
     fn canvas_side_points(scale: f32) -> f32 {
-        BASE_DIAMETER * scale * CANVAS_FACTOR + CANVAS_PADDING * 2.0
+        BASE_DIAMETER * scale * CANVAS_TIGHT_FACTOR
     }
 
     fn repaint_interval(&self, mode: OrbMode) -> Duration {
@@ -599,6 +598,10 @@ mod win {
         }
 
         pub fn set_raw(&mut self, raw: isize) {
+            if self.raw != raw && raw != 0 {
+                #[cfg(windows)]
+                crate::gui::overlay::enable_true_transparency(raw);
+            }
             self.raw = raw;
             self.last = None;
         }
@@ -609,6 +612,8 @@ mod win {
                 if let Ok(h) = found {
                     if !h.0.is_null() {
                         self.raw = h.0 as isize;
+                        #[cfg(windows)]
+                        crate::gui::overlay::enable_true_transparency(self.raw);
                     }
                 }
             }
