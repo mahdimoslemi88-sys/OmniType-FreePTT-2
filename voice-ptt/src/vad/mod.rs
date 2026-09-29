@@ -109,6 +109,14 @@ impl Endpoint {
         self.speech_samples
     }
 
+    /// Trailing silence observed since the last speech frame, in samples.
+    ///
+    /// Chunked streaming uses this to find a clean cut point: flushing right
+    /// after a pause cannot clip a word (see `StreamingSettings`).
+    pub fn trailing_silence_samples(&self) -> usize {
+        self.silence_samples
+    }
+
     /// Total samples fed since the last reset (speech + silence + leading
     /// quiet). Approximates elapsed recording time.
     pub fn total_samples(&self) -> usize {

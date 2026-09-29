@@ -325,6 +325,7 @@ pub fn run() -> Result<()> {
     // running Antigravity over loopback (gRPC-Web + the CSRF token from its own
     // command line). It never outranks the engines above in auto mode — select
     // «Antigravity Live» explicitly, or let auto fall through to it.
+    let mut antigravity_probe: Option<Arc<asr::AntigravityEngine>> = None;
     if settings.antigravity.enabled {
         let antigravity = Arc::new(asr::AntigravityEngine::new(settings.antigravity.clone()));
         tracing::info!(
@@ -332,23 +333,36 @@ pub fn run() -> Result<()> {
             "Antigravity live dictation engine enabled (requires a running Antigravity); \
              note: a session takes ~13 s to open on this machine"
         );
-        // Discovery spawns PowerShell + netstat, so it must stay off the UI
-        // thread; re-probe while unavailable because the app may start later.
-        let probe = antigravity.clone();
+        antigravity_probe = Some(antigravity.clone());
+        engines.push(antigravity);
+    }
+
+    engines.push(whisper.clone());
+    let router = AsrRouter::new_with_active(engines, settings.active_engine.clone());
+    // The local whisper model commits ~1.6 GB when it runs, so the `auto` chain
+    // only falls through to it when the user explicitly allows that.
+    router.set_allow_local_fallback(settings.asr.auto_local_fallback);
+
+    // Antigravity discovery spawns PowerShell + netstat (a real subprocess per
+    // probe), so it must stay off the UI thread — and phase 2 gates it on the
+    // engine actually being selected: probing forever for an engine the user
+    // never chose was measurable churn (handles/threads/private bytes jumping
+    // every 30–60 s). Re-probe while unavailable because the app may start later.
+    if let Some(probe) = antigravity_probe {
+        let probe_router = router.clone();
         std::thread::spawn(move || loop {
-            probe.maintain();
-            let pause = if asr::AsrEngine::health(probe.as_ref()).is_available() {
+            let selected = probe_router.active_engine() == "antigravity";
+            if selected {
+                probe.maintain();
+            }
+            let pause = if selected && asr::AsrEngine::health(probe.as_ref()).is_available() {
                 60
             } else {
                 30
             };
             std::thread::sleep(std::time::Duration::from_secs(pause));
         });
-        engines.push(antigravity);
     }
-
-    engines.push(whisper.clone());
-    let router = AsrRouter::new_with_active(engines, settings.active_engine.clone());
 
     // ---- text processing ---------------------------------------------------
     let normalizer = Arc::new(Normalizer::new());

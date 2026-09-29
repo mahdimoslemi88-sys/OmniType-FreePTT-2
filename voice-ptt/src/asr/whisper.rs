@@ -317,6 +317,12 @@ impl AsrEngine for WhisperEngine {
         "Local"
     }
 
+    /// Opt-in for the `auto` chain: loading this model commits ~1.6 GB, so it
+    /// must be the user's explicit choice, never a silent fallback.
+    fn implicit_fallback(&self) -> bool {
+        false
+    }
+
     fn health(&self) -> AsrHealth {
         let ctx = self.context.read().expect("context lock poisoned");
         match &*ctx {

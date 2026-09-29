@@ -934,7 +934,26 @@ extern "system" {
         cy: i32,
         flags: u32,
     ) -> i32;
+    fn RedrawWindow(
+        hwnd: isize,
+        lprc_update: *const std::ffi::c_void,
+        hrgn_update: isize,
+        flags: u32,
+    ) -> i32;
 }
+
+/// `RDW_*` flags for [`RedrawWindow`].
+///
+/// phase 3.3: `RDW_ERASE` and `RDW_FRAME` are deliberately **not** set. With the
+/// DWM frame extended into the whole client area (that is how this window gets
+/// per-pixel alpha), `RDW_FRAME` asks DWM to repaint that "non-client" region —
+/// which is the entire window — and it lands there as a *light* layer: the orb
+/// then had a pale-blue bar above it and the transcript card a white box around
+/// it. We only want the app itself to redraw: invalidate and update.
+#[cfg(windows)]
+const RDW_FORCE_REPAINT: u32 = 0x0001 /* INVALIDATE */
+    | 0x0020 /* ALLCHILDREN */
+    | 0x0100 /* UPDATENOW */;
 
 #[cfg(windows)]
 #[link(name = "dwmapi")]
@@ -952,7 +971,7 @@ extern "system" {
 pub fn enable_true_transparency(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongW, SetWindowLongW, SetWindowPos, SetWindowTextW, GWL_EXSTYLE, GWL_STYLE,
+        GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
         WS_BORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
         WS_THICKFRAME,
@@ -983,7 +1002,11 @@ pub fn enable_true_transparency(hwnd: isize) {
         let _ = SetWindowLongW(win_hwnd, GWL_EXSTYLE, stripped_ex as i32);
 
         // 3. Clear window title string from OS window so Windows never renders "OmniType"
-        let _ = SetWindowTextW(win_hwnd, windows::core::w!(""));
+        // phase 1: the window title is never cleared any more. Clearing it made
+        // this window indistinguishable from winit's internal event-target
+        // window and the tray-icon message window (all three ended up
+        // title-less), which is how the wrong window got captured above.
+        // let _ = SetWindowTextW(win_hwnd, windows::core::w!(""));
 
         // 4. DWMWA_NCRENDERING_POLICY = 2, DWMNCRP_DISABLED = 1
         // Disables non-client area rendering and window drop shadow
@@ -1044,7 +1067,69 @@ pub fn enable_true_transparency(hwnd: isize) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
+
+        // phase 3.3: no manual erase here. `RDW_ERASE`/`RDW_FRAME` made DWM paint
+        // the extended-frame region (i.e. the whole window) in a light colour,
+        // which showed up as pale bars/boxes over the orb and the transcript
+        // card. The `SWP_FRAMECHANGED` above already recalculates the frame, and
+        // egui repaints the window every frame anyway.
+        // (rollback: RedrawWindow(hwnd, std::ptr::null(), 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME))
     }
+}
+
+/// True when the OS window already has the shaper's target style: a frameless
+/// popup with no raised/sunken/dialog edge.
+#[cfg(windows)]
+fn window_style_is_shaped(style: i32, ex: i32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WS_BORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    };
+    const WS_DLGFRAME: u32 = 0x0080_0000;
+    const WS_EX_WINDOWEDGE: u32 = 0x0000_0100;
+    const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
+    const WS_EX_STATICEDGE: u32 = 0x0002_0000;
+    const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
+
+    let s = style as u32;
+    let e = ex as u32;
+    let framed = s
+        & (WS_CAPTION.0
+            | WS_THICKFRAME.0
+            | WS_MINIMIZEBOX.0
+            | WS_MAXIMIZEBOX.0
+            | WS_SYSMENU.0
+            | WS_BORDER.0
+            | WS_DLGFRAME)
+        != 0;
+    let not_popup = s & WS_POPUP.0 == 0;
+    let edged = e & (WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_DLGMODALFRAME) != 0;
+    !(framed || not_popup || edged)
+}
+
+/// Cheap per-frame guard: keeps a window frameless for as long as it lives.
+///
+/// Two `GetWindowLongW` reads per call, and the expensive path (styles + DWM
+/// attributes + full repaint) only runs when the OS has actually drifted. Drift
+/// is real and reproducible: winit re-applies its window attributes on a few
+/// paths — minimize/restore is the one the user hit — which puts `WS_CAPTION`
+/// and the frame right back, and the orb then shows a normal Windows title bar.
+///
+/// Returns `true` when a repair happened, so the caller can log it.
+#[cfg(windows)]
+pub fn enforce_frameless_window(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_EXSTYLE, GWL_STYLE};
+    if hwnd == 0 {
+        return false;
+    }
+    let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    let style = unsafe { GetWindowLongW(win_hwnd, GWL_STYLE) };
+    let ex = unsafe { GetWindowLongW(win_hwnd, GWL_EXSTYLE) };
+    if window_style_is_shaped(style, ex) {
+        return false;
+    }
+    enable_true_transparency(hwnd);
+    true
 }
 
 /// True screen dimensions in physical pixels. Used to center the dashboard
@@ -1064,6 +1149,27 @@ fn true_screen_size_px() -> Option<(i32, i32)> {
 
 #[cfg(windows)]
 pub(crate) static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Bumped every time a new transcript bubble appears.
+///
+/// phase 3.2: no longer read — the preview window is now drift-checked every
+/// frame (`shape_preview_window`) instead of shaped once per generation. Kept
+/// for the rollback path documented there.
+#[cfg(windows)]
+#[allow(dead_code)]
+static PREVIEW_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Erases and repaints a window right now.
+///
+/// Called after moving a transparent window: without it the pixels of the old
+/// position stay on screen and successive moves pile up as the "nested window
+/// frames" the user saw.
+#[cfg(windows)]
+pub fn force_repaint(hwnd: isize) {
+    if hwnd != 0 {
+        let _ = unsafe { RedrawWindow(hwnd, std::ptr::null(), 0, RDW_FORCE_REPAINT) };
+    }
+}
 
 #[cfg(windows)]
 pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, _corner_px: i32) {
@@ -1127,7 +1233,20 @@ fn local_time_str() -> String {
 }
 
 #[cfg(windows)]
-fn apply_window_shapes_all() {
+/// LEGACY (phase 1) — kept in the tree, uncalled, as a rollback path.
+///
+/// It resolved the app window by *title* across every window of the UI thread.
+/// winit's internal "Winit Thread Event Target" window and the tray-icon
+/// message window are *also* title-less, so they were treated as the app window:
+/// `MAIN_HWND` was overwritten with whichever window matched last (enumeration
+/// order is z-order, so "last" is effectively arbitrary) and `OrbWindow::place()`
+/// then moved/resized *that* window onto the orb on every frame, leaving the
+/// frozen "ghost" rectangles that accumulated with each dictation.
+///
+/// Evidence and the verification probe: `docs/GUI-BUGFIX-PLAN.md` §1-1 and
+/// `docs/reaserch/gui/probes/window-probe.ps1`.
+#[allow(dead_code)]
+fn apply_window_shapes_all_legacy() {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -1153,6 +1272,102 @@ fn apply_window_shapes_all() {
         let thread_id = GetCurrentThreadId();
         let _ = EnumThreadWindows(thread_id, Some(enum_proc), LPARAM(0));
     }
+}
+
+/// Resolves and registers the **real** main window handle exactly once, straight
+/// from eframe's own raw platform window handle ([`eframe::Frame`] implements
+/// `raw_window_handle::HasWindowHandle`), then applies the alpha shaping to it.
+///
+/// Returns `true` when a handle was registered on this call.
+///
+/// This replaces title-based picking entirely: no thread-wide enumeration, no
+/// window ever has its title cleared or its styles stripped unless it is the
+/// window eframe hands us for the main viewport.
+#[cfg(windows)]
+pub fn register_main_hwnd(frame: &eframe::Frame) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = frame.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return false;
+    };
+    let hwnd: isize = win32.hwnd.get();
+    if hwnd == 0 {
+        return false;
+    }
+    // phase 3.2: compare instead of "only when empty". winit can recreate the OS
+    // window (minimize/restore, DPI change); the cached handle then pointed at a
+    // dead window, the *new* one was never shaped, and it came up as a normal
+    // captioned window — one more "frame" on screen every time.
+    let previous = MAIN_HWND.swap(hwnd, std::sync::atomic::Ordering::Relaxed);
+    if previous == hwnd {
+        return false;
+    }
+    enable_true_transparency(hwnd);
+    if previous == 0 {
+        tracing::info!(hwnd, "main window handle registered from eframe's raw window handle");
+    } else {
+        tracing::warn!(
+            hwnd,
+            previous,
+            "main window handle changed; re-shaped the new OS window"
+        );
+    }
+    true
+}
+
+/// Drops the cached main-window handle so [`register_main_hwnd`] resolves it
+/// again. Called when a `SetWindowPos` on it fails, i.e. the OS window is gone
+/// (it can be recreated when the main viewport is reopened).
+#[cfg(windows)]
+pub fn invalidate_main_hwnd() {
+    MAIN_HWND.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Keeps the transcript preview host window framed correctly — matched by its
+/// **own** title (`OmniType_Preview`), never by "empty title", so no unrelated
+/// window can be captured.
+///
+/// phase 3.2: this used to run **once per bubble generation** (an optimisation
+/// against DWM churn). That was too clever: the preview window is a fresh OS
+/// window per bubble and winit applies its own attributes shortly after
+/// creation, so a one-shot shape could be overwritten and the bubble showed a
+/// caption again. `enforce_frameless_window` is a drift check (two cheap reads),
+/// so running it per frame costs nothing while the bubble is visible and the
+/// expensive path only runs when the window really drifted.
+/// (rollback: the generation guard is kept, commented, below.)
+#[cfg(windows)]
+pub fn shape_preview_window() {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GetWindowTextLengthW, GetWindowTextW,
+    };
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+        let len = GetWindowTextLengthW(hwnd);
+        let mut buf = vec![0u16; (len + 1) as usize];
+        let actual = GetWindowTextW(hwnd, &mut buf);
+        let title = String::from_utf16_lossy(&buf[..actual as usize]);
+        if title.contains("OmniType_Preview") && enforce_frameless_window(hwnd.0 as isize) {
+            tracing::debug!(hwnd = hwnd.0 as isize, "preview window re-stripped");
+        }
+        BOOL(1)
+    }
+
+    unsafe {
+        let thread_id = GetCurrentThreadId();
+        let _ = EnumThreadWindows(thread_id, Some(enum_proc), LPARAM(0));
+    }
+    // phase 3.2 (rollback): shape once per bubble generation instead of per frame.
+    // static SHAPED_GENERATION: std::sync::atomic::AtomicU64 =
+    //     std::sync::atomic::AtomicU64::new(u64::MAX);
+    // if SHAPED_GENERATION.load(std::sync::atomic::Ordering::Relaxed) == generation {
+    //     return;
+    // }
+    // SHAPED_GENERATION.store(generation, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Paints a Phosphor microphone icon inside `rect` (replaces the hand-drawn vector mic).
@@ -1259,6 +1474,10 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     history_search: String,
     history_copy_msg: Option<(String, Instant)>,
     shape_frames_checked: u8,
+    /// How many times the window style had to be re-stripped because the OS put
+    /// the caption/frame back (winit re-applies window attributes on
+    /// minimize/restore). Logged while small, then summarised.
+    style_repairs: u32,
     /// Transcribed text for the 10-second secondary preview toast window
     /// Library-managed notification channel (egui-notify). Each transcript
     /// enqueues a toast that renders inside the preview viewport and manages
@@ -1270,6 +1489,12 @@ pub struct OverlayApp {    status: Arc<StatusClient>,
     live_toasts: VecDeque<(usize, String, Instant, u64)>,
     next_toast_seq: usize,
     pub last_seen_transcript: Option<String>,
+    /// phase 3: history entry id that the current recording session keeps
+    /// appending to, so a chunked dictation stays **one** history row instead of
+    /// one row per chunk.
+    session_history_id: Option<usize>,
+    /// Text accumulated for that session (chunk texts joined in order).
+    session_text: String,
     /// Wispr Flow interaction and dock mode
     pub visual_mode: VisualMode,
     pub is_hovered: bool,
@@ -1379,10 +1604,13 @@ impl OverlayApp {
             history_search: String::new(),
             history_copy_msg: None,
             shape_frames_checked: 0,
+            style_repairs: 0,
             toasts: new_toast_channel(),
             live_toasts: VecDeque::new(),
             next_toast_seq: 0,
             last_seen_transcript: None,
+            session_history_id: None,
+            session_text: String::new(),
             visual_mode: VisualMode::IdleDormant,
             is_hovered: false,
             last_hover_time: None,
@@ -3616,6 +3844,10 @@ impl OverlayApp {
     }
 
     /// Builds a dark OmniType notification card for a transcript.
+    ///
+    /// phase 2: no longer called (the egui-notify channel is never rendered —
+    /// see the note at its former call sites). Kept for rollback.
+    #[allow(dead_code)]
     fn make_toast(raw: String, remaining_secs: u64, lifetime: Duration) -> Toast {
         let mut toast = Toast::basic(toast_caption(&raw, remaining_secs));
         toast.set_duration(Some(lifetime));
@@ -3684,6 +3916,13 @@ impl OverlayApp {
     /// notifications inside are fully managed by `egui_notify::Toasts` —
     /// slide-in animation, dark card, live countdown, progress bar and ✕.
     fn render_preview_toast_window(&mut self, ctx: &egui::Context) {
+        // phase 2: the bubble is independent of the orb and can be turned off
+        // entirely with `gui.show_transcript_bubble = false`.
+        let bubble_enabled = self
+            .settings
+            .read()
+            .map(|s| s.gui.show_transcript_bubble)
+            .unwrap_or(true);
         let now = Instant::now();
 
         // Expire finished transcripts
@@ -3693,6 +3932,11 @@ impl OverlayApp {
             } else {
                 break;
             }
+        }
+        if !bubble_enabled {
+            // Disabled: drop queued bubbles instead of leaving them pending.
+            self.live_toasts.clear();
+            return;
         }
         if self.live_toasts.is_empty() {
             return;
@@ -3763,8 +4007,10 @@ impl OverlayApp {
                 .with_always_on_top()
                 .with_resizable(false),
             move |toast_ctx, _class| {
+                // phase 1: shape *this* preview window only (matched by its own
+                // title), once per bubble — never the thread's other windows.
                 #[cfg(windows)]
-                apply_window_shapes_all();
+                shape_preview_window();
 
                 let mut transparent_visuals = egui::Visuals::dark();
                 transparent_visuals.panel_fill = egui::Color32::TRANSPARENT;
@@ -3889,13 +4135,42 @@ impl eframe::App for OverlayApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Physically clip OS windows to eliminate any black or frosted glass rectangular bounding box
-        if self.shape_frames_checked < 10 {
-            self.shape_frames_checked += 1;
-            #[cfg(windows)]
-            apply_window_shapes_all();
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // phase 1 — deterministic window ownership (see `register_main_hwnd`).
+        //
+        // The main window handle now comes straight from eframe's own raw window
+        // handle instead of being guessed by title, so winit's internal
+        // event-target window and the tray-icon message window can no longer be
+        // mistaken for the orb and dragged onto it (the accumulating ghost boxes).
+        // `shape_frames_checked` is now "frames spent waiting for the handle".
+        #[cfg(windows)]
+        {
+            // Re-resolved every frame: cheap, and it is the only way to notice
+            // that winit recreated the OS window (`register_main_hwnd` returns
+            // early when the handle is unchanged).
+            if register_main_hwnd(frame) {
+                self.shape_frames_checked = self.shape_frames_checked.wrapping_add(1);
+            }
+            let hwnd = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+            // Self-healing shape guard (see `enforce_frameless_window`): two
+            // `GetWindowLongW` reads per frame, and a repair only when the
+            // window really drifted back to a captioned frame — e.g. after
+            // minimize/restore. Without this the orb showed a Windows title bar
+            // and a frame again until the app was restarted.
+            if enforce_frameless_window(hwnd) {
+                self.style_repairs = self.style_repairs.saturating_add(1);
+                if self.style_repairs <= 10 {
+                    tracing::warn!(
+                        repairs = self.style_repairs,
+                        hwnd,
+                        "window frame drifted back; re-stripped caption/border"
+                    );
+                }
+            }
         }
+        // On non-Windows builds the frame is not needed at all.
+        #[cfg(not(windows))]
+        let _ = &frame;
 
         // Consume external control flags.
         if self
@@ -3967,8 +4242,13 @@ impl eframe::App for OverlayApp {
                 self.dashboard_needs_shape = false;
                 self.dashboard_shape_frames = 0;
             }
-            #[cfg(windows)]
-            apply_window_shapes_all();
+            // phase 1: the thread-wide shaping that used to run here is disabled —
+            // re-resolving "the app window" on every dashboard open was one of the
+            // paths that parked the wrong OS window on the orb. The dashboard is a
+            // decorated window and never needed the transparency surgery.
+            // (rollback: restore `apply_window_shapes_all();`)
+            // #[cfg(windows)]
+            // apply_window_shapes_all();
             ctx.request_repaint();
         }
         if self.quit_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3998,19 +4278,31 @@ impl eframe::App for OverlayApp {
                 "نسخه جدید {} منتشر شد\nبرای مشاهده و دریافت کلیک کنید",
                 info.latest_version
             );
-            let display = format_persian_display(&msg);
-            let mut toast = Toast::custom(
-                display,
-                ToastLevel::Custom(ic::BELL.to_string(), palette::ACCENT),
-            );
-            toast.set_duration(Some(Duration::from_secs(12)));
-            toast.set_closable(true);
-            toast.set_show_progress_bar(true);
-            toast.set_max_width(Some(TOAST_MAX_WIDTH));
-            self.toasts.add(toast);
+            // phase 2 — the egui-notify channel is never rendered anywhere (no
+            // `toasts.show()` exists in the project), so every `add` queued a
+            // Toast that could never expire. `needs_animation_frames()` sees a
+            // non-empty channel, so the 30 fps repaint loop ran forever after the
+            // first transcript (measured: ~2.5–5 % of a core while idle, plus a
+            // slowly climbing working set). The banner in the dashboard still
+            // reports new releases; this dead path is disabled.
+            // (rollback: restore the previous `Toast::custom` + `self.toasts.add`.)
+            let _ = &msg;
+            // let display = format_persian_display(&msg);
+            // let mut toast = Toast::custom(
+            //     display,
+            //     ToastLevel::Custom(ic::BELL.to_string(), palette::ACCENT),
+            // );
+            // toast.set_duration(Some(Duration::from_secs(12)));
+            // toast.set_closable(true);
+            // toast.set_show_progress_bar(true);
+            // toast.set_max_width(Some(TOAST_MAX_WIDTH));
+            // self.toasts.add(toast);
 
-            #[cfg(windows)]
-            apply_window_shapes_all();
+            // phase 1: the update banner is not a window of its own, so the
+            // thread-wide re-shaping that used to run here is disabled.
+            // (rollback: restore `apply_window_shapes_all();`)
+            // #[cfg(windows)]
+            // apply_window_shapes_all();
         }
 
         // Always render secondary viewports if open
@@ -4055,17 +4347,29 @@ impl eframe::App for OverlayApp {
             self.show_consent_window = true;
         }
 
-        // Track recording duration
-        if matches!(status.state, AppState::Recording) {
-            if self.recording_start.is_none() {
-                self.recording_start = Some(now);
-                self.last_seen_transcript = None; // Reset so next utterance can trigger toast
+        // Session bookkeeping.
+        //
+        // phase 3: with chunked streaming a *single* session alternates
+        // Recording → Processing/Typing → Recording once per chunk, so a bubble
+        // must only be dismissed when a **new** session starts (Idle/Error →
+        // Recording) — clearing it on every Recording frame would wipe each
+        // chunk's text before the user could read it.
+        match status.state {
+            AppState::Recording => {
+                if self.recording_start.is_none() {
+                    self.recording_start = Some(now);
+                    self.last_seen_transcript = None; // next utterance gets its own bubble
+                    // Dismiss the previous session's bubbles, and start a fresh
+                    // history row for this session (chunks append to it).
+                    self.live_toasts.clear();
+                    self.session_history_id = None;
+                    self.session_text.clear();
+                    self.toasts = new_toast_channel();
+                }
             }
-            // Dismiss toast previews when the user starts speaking again
-            self.live_toasts.clear();
-            self.toasts = new_toast_channel();
-        } else {
-            self.recording_start = None;
+            // Mid-session states: keep the session (and its bubbles) alive.
+            AppState::Processing | AppState::Typing => {}
+            _ => self.recording_start = None,
         }
 
         // When speech transcript arrives, pop up the 10-second toast preview and record in history (ONLY ONCE per utterance)
@@ -4078,36 +4382,68 @@ impl eframe::App for OverlayApp {
                 self.live_toasts
                     .push_back((seq, trimmed.to_string(), now, TOAST_TOTAL_SECS));
 
+                // phase 1: a new bubble means a new preview OS window, so its
+                // alpha shaping has to run once more (see `shape_preview_window`).
+                #[cfg(windows)]
+                PREVIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 // Dark OmniType card: near-white caption with a live 10 s
                 // countdown footer, accent mic glyph, progress bar, ✕.
                 // toast_caption shapes the raw text itself (per finished
                 // line, so ligatures stay intact).
-                let toast = Self::make_toast(
-                    trimmed.to_string(),
-                    TOAST_TOTAL_SECS,
-                    Duration::from_secs(TOAST_TOTAL_SECS),
-                );
-                self.toasts.add(toast);
+                // phase 2: same dead egui-notify path as above — the transcript
+                // is shown by the dedicated bubble window below, not by
+                // egui-notify. (rollback: restore `Self::make_toast` + add.)
+                // let toast = Self::make_toast(
+                //     trimmed.to_string(),
+                //     TOAST_TOTAL_SECS,
+                //     Duration::from_secs(TOAST_TOTAL_SECS),
+                // );
+                // self.toasts.add(toast);
 
                 let time_now = local_time_str();
                 let active_engine_str = self.router.active_engine();
 
-                self.history.insert(
-                    0,
-                    HistoryItem {
-                        id: self.next_history_id,
-                        text: trimmed.to_string(),
-                        timestamp: time_now,
-                        engine: active_engine_str,
-                    },
-                );
+                // phase 3: one history row per *session*. A chunked dictation
+                // delivers one text per chunk, so the row is extended in place
+                // instead of pushing a new entry every 20 s.
+                match self.session_history_id {
+                    Some(id) => {
+                        if !self.session_text.is_empty() {
+                            self.session_text.push(' ');
+                        }
+                        self.session_text.push_str(trimmed);
+                        if let Some(item) = self.history.iter_mut().find(|h| h.id == id) {
+                            item.text = self.session_text.clone();
+                            item.timestamp = time_now;
+                        }
+                    }
+                    None => {
+                        self.session_text = trimmed.to_string();
+                        let id = self.next_history_id;
+                        self.session_history_id = Some(id);
+                        self.history.insert(
+                            0,
+                            HistoryItem {
+                                id,
+                                text: self.session_text.clone(),
+                                timestamp: time_now,
+                                engine: active_engine_str,
+                            },
+                        );
+                    }
+                }
                 self.next_history_id += 1;
                 if self.history.len() > 100 {
                     self.history.truncate(100);
                 }
 
-                #[cfg(windows)]
-                apply_window_shapes_all();
+                // phase 1: the main window is shaped exactly once at startup
+                // (`register_main_hwnd`); re-shaping it after every transcript was
+                // pure DWM churn and another chance to grab the wrong window.
+                // (rollback: restore `apply_window_shapes_all();`)
+                // #[cfg(windows)]
+                // apply_window_shapes_all();
             }
         }
 
@@ -4270,6 +4606,8 @@ mod tests {
             last_text: None,
             vad_engine: "silero",
             partial: None,
+            latched: false,
+            chunk_busy: false,
         });
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         let flags = (
@@ -4315,6 +4653,8 @@ mod tests {
             last_text: None,
             vad_engine: "silero",
             partial: None,
+            latched: false,
+            chunk_busy: false,
         });
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         let flags = (
@@ -4375,6 +4715,8 @@ mod tests {
             last_text: None,
             vad_engine: "silero",
             partial: None,
+            latched: false,
+            chunk_busy: false,
         });
         let client = Arc::new(StatusClient::new(rx));
         assert_eq!(client.get().state, AppState::Idle);
@@ -4383,6 +4725,8 @@ mod tests {
             last_text: None,
             vad_engine: "silero",
             partial: None,
+            latched: false,
+            chunk_busy: false,
         })
         .unwrap();
         assert_eq!(client.get().state, AppState::Recording);

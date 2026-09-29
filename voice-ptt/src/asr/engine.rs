@@ -64,6 +64,18 @@ pub trait AsrEngine: Send + Sync {
     /// Current health/availability.
     fn health(&self) -> AsrHealth;
 
+    /// Whether the `auto` engine chain may use this engine as an *implicit*
+    /// fallback. `false` means: only run when the user selected this engine
+    /// explicitly.
+    ///
+    /// The local whisper engine opts out because running it maps a ~1.6 GB
+    /// model into the process; that must never happen just because a cloud
+    /// engine hiccuped. See `settings.asr.auto_local_fallback`, which can put it
+    /// back into the chain.
+    fn implicit_fallback(&self) -> bool {
+        true
+    }
+
     /// Transcribes an utterance. Blocking; keep it off async contexts.
     fn transcribe(&self, audio: &AudioUtterance) -> Result<String>;
 }

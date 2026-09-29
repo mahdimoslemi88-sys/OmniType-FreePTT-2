@@ -24,7 +24,8 @@ pub struct CaptureConfig {
     pub sample_rate: u32,
     pub channels: u16,
     pub buffer_frames: u32,
-    /// Ring buffer duration in seconds (spec: 30 s).
+    /// Ring buffer duration in seconds. 60 s gives a chunked/streaming session
+    /// enough headroom that a slow transcription cannot overwrite live audio.
     pub ring_seconds: u32,
     pub device_name: Option<String>,
     pub gain_db: f32,
@@ -36,7 +37,7 @@ impl Default for CaptureConfig {
             sample_rate: 16_000,
             channels: 1,
             buffer_frames: 256,
-            ring_seconds: 30,
+            ring_seconds: 60,
             device_name: None,
             gain_db: 0.0,
         }

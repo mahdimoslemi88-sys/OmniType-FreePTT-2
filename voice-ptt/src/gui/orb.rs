@@ -48,6 +48,11 @@ pub struct Orb {
     last_time: Option<f64>,
     time: f32,
     audio_level: Option<f32>,
+    /// Last `InnerSize` command sent to the viewport (physical points).
+    /// phase 1: the same size used to be re-sent every frame, which made the
+    /// wgpu surface reconfigure continuously (thousands of
+    /// `wgpu_hal::vulkan ... present mode` warnings per session).
+    sent_side_pt: Option<f32>,
 }
 
 impl Orb {
@@ -71,6 +76,7 @@ impl Orb {
             last_time: None,
             time: 0.0,
             audio_level: None,
+            sent_side_pt: None,
         }
     }
 
@@ -149,7 +155,13 @@ impl Orb {
         let side_pt = Self::canvas_side_points(canvas_scale);
         let side_px = (side_pt * ppp).ceil() as i32;
         self.window.place(self.anim.current_position, side_px);
-        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::InnerSize(eframe::egui::vec2(side_pt, side_pt)));
+        // phase 1: only resize when the canvas actually changed.
+        if self.sent_side_pt != Some(side_pt) {
+            self.sent_side_pt = Some(side_pt);
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::InnerSize(eframe::egui::vec2(
+                side_pt, side_pt,
+            )));
+        }
 
         ctx.request_repaint_after(self.repaint_interval(mode));
         out
@@ -577,15 +589,17 @@ mod win {
     use std::ffi::c_void;
 
     use eframe::egui::Pos2;
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HWND, POINT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetCursorPos, GetSystemMetrics, SetWindowPos, HWND_TOPMOST, SM_CXSCREEN,
+        GetCursorPos, GetSystemMetrics, SetWindowPos, HWND_TOPMOST, SM_CXSCREEN,
         SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
     };
 
     pub struct OrbWindow {
+        /// phase 1: kept for the commented-out title lookup below; the handle is
+        /// now resolved by the overlay from eframe's raw window handle.
+        #[allow(dead_code)]
         title: Vec<u16>,
         raw: isize,
         last: Option<(i32, i32, i32, i32)>,
@@ -617,17 +631,23 @@ mod win {
                     #[cfg(windows)]
                     crate::gui::overlay::enable_true_transparency(self.raw);
                 } else {
-                    let found = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(self.title.as_ptr())) };
-                    if let Ok(h) = found {
-                        if !h.0.is_null() {
-                            self.raw = h.0 as isize;
-                            #[cfg(windows)]
-                            crate::gui::overlay::enable_true_transparency(self.raw);
-                        }
-                    }
+                    // phase 1: the title-based fallback is disabled. The main window
+                    // is created with an empty title (`with_title("")`), so this
+                    // lookup never found it — and `FindWindowW` matches *any*
+                    // window, which is exactly how unrelated windows could get
+                    // adopted. The overlay now registers the real HWND directly.
+                    // (rollback: the original lookup follows, commented out.)
+                    // let found = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(self.title.as_ptr())) };
+                    // if let Ok(h) = found {
+                    //     if !h.0.is_null() {
+                    //         self.raw = h.0 as isize;
+                    //         #[cfg(windows)]
+                    //         crate::gui::overlay::enable_true_transparency(self.raw);
+                    //     }
+                    // }
                 }
             }
-            (self.raw != 0).then(|| HWND(self.raw as *mut c_void))
+            (self.raw != 0).then_some(HWND(self.raw as *mut c_void))
         }
 
         /// Center the (square) window on `center`, physical pixels. No-op if unchanged.
@@ -653,9 +673,18 @@ mod win {
             };
             if result.is_ok() {
                 self.last = Some(rect);
+                // phase 3.2: a moved transparent window keeps the pixels of its
+                // previous position unless it is erased — those leftovers are
+                // what looked like nested window frames piling up.
+                #[cfg(windows)]
+                crate::gui::overlay::force_repaint(self.raw);
             } else {
                 self.raw = 0; // window recreated? resolve again next frame
                 self.last = None;
+                // phase 1: let the overlay re-resolve the real handle if this one
+                // is gone (the OS window can be recreated for the main viewport).
+                #[cfg(windows)]
+                crate::gui::overlay::invalidate_main_hwnd();
             }
         }
     }

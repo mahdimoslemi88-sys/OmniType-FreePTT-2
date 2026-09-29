@@ -4577,6 +4577,7 @@ dependencies = [
  "futures-util",
  "ndarray",
  "ort",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",

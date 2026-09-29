@@ -39,6 +39,7 @@ pub struct Settings {
     pub audio: AudioSettings,
     pub asr: AsrSettings,
     pub vad: VadSettings,
+    pub streaming: StreamingSettings,
     pub hotkey: HotkeySettings,
     pub gui: GuiSettings,
     pub cloud: CloudConfig,
@@ -59,6 +60,7 @@ impl Default for Settings {
             audio: AudioSettings::default(),
             asr: AsrSettings::default(),
             vad: VadSettings::default(),
+            streaming: StreamingSettings::default(),
             hotkey: HotkeySettings::default(),
             gui: GuiSettings::default(),
             cloud: CloudConfig::default(),
@@ -107,6 +109,73 @@ impl Default for GoogleConfig {
             enabled: true,
             language: "fa-IR".into(),
             timeout_secs: 10,
+        }
+    }
+}
+
+/// Chunked ("streaming") dictation.
+///
+/// Historically the session ended at the ring-buffer safety valve (~30 s of
+/// audio) and everything before that was transcribed at once. With streaming on,
+/// the session is instead flushed as **ordered chunks while the microphone keeps
+/// running**: the audio is cut at a pause (or at `chunk_seconds`, whichever comes
+/// first), transcribed, injected, and recording continues — so a dictation can
+/// last as long as the user wants, and text appears while they are still talking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StreamingSettings {
+    pub enabled: bool,
+    /// Hard cap for one chunk, in seconds: flushed even mid-phrase at this
+    /// length. Kept well below the free Google endpoint's own limit.
+    pub chunk_seconds: u64,
+    /// Never flush a chunk shorter than this (avoids tiny fragments).
+    pub min_chunk_seconds: u64,
+    /// Audio repeated at the start of the next chunk so a seam cannot clip a word.
+    pub overlap_ms: u64,
+    /// Trailing silence that marks a clean cut point in the `silence` strategy.
+    ///
+    /// phase 3.2: 600 ms cut a chunk at every short breath, which felt like the
+    /// app stopping and restarting mid-dictation. 1200 ms is a real pause.
+    pub silence_ms: u64,
+    /// `silence` (prefer cutting at pauses) or `fixed` (pure time slicing).
+    pub strategy: String,
+    /// Absolute safety cap for one held session, in seconds.
+    pub max_utterance_seconds: u64,
+    /// Stitch chunk seams: drop head words the previous chunk already typed
+    /// (the deliberate audio overlap makes the recogniser repeat them) and, when
+    /// a cut truncated a word, delete that fragment before typing the full word.
+    pub seam_merge: bool,
+    /// Delete the truncated word fragment at the seam with backspaces. Off ⇒
+    /// only duplicated words are removed and the fragment stays in the text.
+    pub seam_backspace: bool,
+    /// How many head words may be treated as the repeated overlap (per chunk).
+    pub seam_max_words: usize,
+    /// Treat near-identical words (diacritics, ZWNJ, one recognition slip) as
+    /// the same word when matching a seam.
+    pub seam_fuzzy: bool,
+}
+
+impl Default for StreamingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // 20 s sits comfortably inside what the free Chromium speech endpoint
+            // handles reliably, and short enough that text shows up as you speak.
+            chunk_seconds: 20,
+            min_chunk_seconds: 4,
+            overlap_ms: 300,
+            silence_ms: 1200,
+            strategy: "silence".into(),
+            max_utterance_seconds: 600,
+            // Seam repair is on: it is the difference between a long dictation
+            // reading as one text and reading as a stutter of repeated words.
+            seam_merge: true,
+            // Backspacing deletes ~1 word we typed ourselves at the seam; if a
+            // fragment ever gets eaten wrongly, turn this off first.
+            seam_backspace: true,
+            // 300 ms of overlap is a handful of words at any speaking rate.
+            seam_max_words: 6,
+            seam_fuzzy: true,
         }
     }
 }
@@ -204,6 +273,9 @@ pub struct AudioSettings {
     pub sample_rate: u32,
     pub channels: u16,
     pub buffer_frames: u32,
+    /// Ring-buffer length in seconds. phase 3: raised from 30 s to 60 s so a slow
+    /// chunk transcription (the consumer is not draining meanwhile) cannot make
+    /// the buffer overwrite the oldest audio of a long session.
     pub ring_seconds: u32,
     /// "default" or a specific device name.
     pub device: String,
@@ -221,6 +293,11 @@ pub struct AsrSettings {
     pub beam_size: i32,
     pub n_threads: i32,
     pub initial_prompt: Option<String>,
+    /// Allow the `auto` engine chain to fall through to the **local** whisper
+    /// model. Off by default: loading large-v3-turbo maps ~1.6 GB into the
+    /// process, so it must be a deliberate choice (pick «Local Whisper» in the
+    /// dashboard) instead of a silent fallback when a cloud engine hiccups.
+    pub auto_local_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +318,14 @@ pub struct HotkeySettings {
     pub record: String,
     pub toggle_overlay: String,
     pub quit: String,
+    /// Hands-free "latch": two quick presses of the record key keep the
+    /// recording running after the key is released; the next press ends it.
+    /// Hold-to-talk is unchanged (a hold ≥ `tap_max_ms` finalises on release).
+    pub double_tap_latch: bool,
+    /// A press shorter than this counts as a "tap" (milliseconds).
+    pub tap_max_ms: u64,
+    /// Maximum gap allowed between the two taps of a double-tap (milliseconds).
+    pub double_tap_window_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +333,10 @@ pub struct HotkeySettings {
 pub struct GuiSettings {
     pub show_overlay: bool,
     pub theme: String,
+    /// Show the floating transcript bubble. It is anchored bottom-center above
+    /// the taskbar and is completely independent of the orb; set it to `false`
+    /// to keep the desktop clean (no transcript window at all).
+    pub show_transcript_bubble: bool,
     /// Orb center, physical screen pixels. None = first run (center of primary screen).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orb_position_x: Option<i32>,
@@ -261,7 +350,7 @@ impl Default for AudioSettings {
             sample_rate: 16_000,
             channels: 1,
             buffer_frames: 256,
-            ring_seconds: 30,
+            ring_seconds: 60,
             device: "default".into(),
             gain_db: 0.0,
         }
@@ -276,6 +365,7 @@ impl Default for AsrSettings {
             beam_size: 5,
             n_threads: 8,
             initial_prompt: None,
+            auto_local_fallback: false,
         }
     }
 }
@@ -298,6 +388,9 @@ impl Default for HotkeySettings {
             record: "CapsLock".into(),
             toggle_overlay: "Ctrl+Alt+S".into(),
             quit: "Ctrl+Alt+Q".into(),
+            double_tap_latch: true,
+            tap_max_ms: 350,
+            double_tap_window_ms: 600,
         }
     }
 }
@@ -307,6 +400,7 @@ impl Default for GuiSettings {
         Self {
             show_overlay: true,
             theme: "dark".into(),
+            show_transcript_bubble: true,
             orb_position_x: None,
             orb_position_y: None,
         }
@@ -400,7 +494,7 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.audio.sample_rate, 16_000);
         assert_eq!(s.audio.buffer_frames, 256);
-        assert_eq!(s.audio.ring_seconds, 30);
+        assert_eq!(s.audio.ring_seconds, 60);
         assert_eq!(s.asr.beam_size, 5);
         assert_eq!(s.asr.n_threads, 8);
         assert_eq!(s.vad.threshold, 0.5);
@@ -409,6 +503,17 @@ mod tests {
         assert!(!s.vad.cutoff_on_hold);
         assert_eq!(s.audio.gain_db, 0.0);
         assert_eq!(s.hotkey.record, "CapsLock");
+        assert!(s.hotkey.double_tap_latch);
+        assert_eq!(s.hotkey.tap_max_ms, 350);
+        assert_eq!(s.hotkey.double_tap_window_ms, 600);
+        assert!(s.gui.show_transcript_bubble);
+        assert!(s.streaming.enabled);
+        assert_eq!(s.streaming.chunk_seconds, 20);
+        assert_eq!(s.streaming.min_chunk_seconds, 4);
+        assert_eq!(s.streaming.overlap_ms, 300);
+        assert_eq!(s.streaming.silence_ms, 1200);
+        assert_eq!(s.streaming.strategy, "silence");
+        assert_eq!(s.streaming.max_utterance_seconds, 600);
         assert!(s.google.enabled);
         assert_eq!(s.google.language, "fa-IR");
         assert!(s.updates.check_on_startup);

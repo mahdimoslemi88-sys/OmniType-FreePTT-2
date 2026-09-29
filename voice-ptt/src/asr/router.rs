@@ -6,7 +6,7 @@
 //! transcription work runs on Tokio's blocking pool so the async state machine
 //! never stalls.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -35,6 +35,10 @@ pub struct AsrRouter {
     active_engine: Arc<RwLock<String>>,
     cooldown_ms: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
+    /// Whether `auto` may fall through to an engine that opted out of implicit
+    /// fallback (the local whisper model). Off by default — see
+    /// `AsrEngine::implicit_fallback` and `settings.asr.auto_local_fallback`.
+    allow_local_fallback: Arc<AtomicBool>,
 }
 
 impl AsrRouter {
@@ -58,6 +62,7 @@ impl AsrRouter {
             active_engine: Arc::new(RwLock::new(active)),
             cooldown_ms: Arc::new(AtomicU64::new(COOLDOWN_MS)),
             last_error: Arc::new(Mutex::new(None)),
+            allow_local_fallback: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -115,6 +120,12 @@ impl AsrRouter {
         self.cooldown_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// Allows or forbids `auto`-mode fallback into engines that opted out of
+    /// implicit fallback (the local whisper model, whose load commits ~1.6 GB).
+    pub fn set_allow_local_fallback(&self, allow: bool) {
+        self.allow_local_fallback.store(allow, Ordering::Relaxed);
+    }
+
     /// Human-readable status of each engine (for UI/logs).
     pub fn status(&self) -> Vec<(&'static str, AsrHealth)> {
         let slots = self.slots.read().unwrap();
@@ -147,10 +158,14 @@ impl AsrRouter {
         // allowed to run, and any failure must surface to the caller instead of
         // being papered over by a fallback. Failover chains belong to `auto`.
         let explicit = active != "auto";
+        let allow_local = self.allow_local_fallback.load(Ordering::Relaxed);
         let mut candidate_indices: Vec<usize> = (0..candidates.len())
             .filter(|&i| {
                 if !explicit {
-                    return true;
+                    // In `auto`, an engine that opted out of implicit fallback
+                    // (local whisper) is skipped unless the user allowed it —
+                    // its model load would commit ~1.6 GB on a cloud hiccup.
+                    return candidates[i].0.implicit_fallback() || allow_local;
                 }
                 let (engine, _) = &candidates[i];
                 engine.id() == active || engine.name() == active
@@ -341,6 +356,66 @@ mod tests {
         assert!(router.transcribe(&utterance()).await.is_err());
         assert!(router.last_error().is_some());
         assert_eq!(bad.calls.load(Ordering::Relaxed), 1, "single engine, single attempt per call");
+    }
+
+    /// Engine that opted out of implicit fallback — mirrors the local whisper
+    /// engine, whose model load commits ~1.6 GB.
+    struct OptInEngine {
+        calls: AtomicUsize,
+    }
+
+    impl AsrEngine for OptInEngine {
+        fn name(&self) -> &'static str {
+            "local_whisper"
+        }
+        fn id(&self) -> String {
+            "local_whisper".to_string()
+        }
+        fn health(&self) -> AsrHealth {
+            AsrHealth::Ready
+        }
+        fn implicit_fallback(&self) -> bool {
+            false
+        }
+        fn transcribe(&self, _audio: &AudioUtterance) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok("local ran".to_string())
+        }
+    }
+
+    /// `auto` must never load the local model just because a cloud engine
+    /// hiccuped — the ~1.6 GB commitment has to be the user's explicit choice.
+    #[tokio::test]
+    async fn auto_skips_opt_in_engines_unless_explicitly_allowed() {
+        let cloud = Arc::new(FakeEngine {
+            name: "google",
+            available: true,
+            result_text: String::new(), // simulates "request failed"
+            calls: AtomicUsize::new(0),
+        });
+        let local = Arc::new(OptInEngine {
+            calls: AtomicUsize::new(0),
+        });
+
+        // Default: an engine that opted out is not part of the `auto` chain.
+        let router = AsrRouter::new(vec![cloud.clone(), local.clone()]);
+        assert!(router.transcribe(&utterance()).await.is_err());
+        assert_eq!(
+            local.calls.load(Ordering::Relaxed),
+            0,
+            "the local model must not be loaded implicitly"
+        );
+
+        // Selecting it explicitly still runs it.
+        router.set_active_engine("local_whisper");
+        assert_eq!(router.transcribe(&utterance()).await.unwrap(), "local ran");
+        assert_eq!(local.calls.load(Ordering::Relaxed), 1);
+
+        // Opting in through settings puts it back into the `auto` chain.
+        let router = AsrRouter::new(vec![cloud, local.clone()]);
+        router.set_allow_local_fallback(true);
+        assert_eq!(router.transcribe(&utterance()).await.unwrap(), "local ran");
+        assert_eq!(local.calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -2,4 +2,4 @@
 
 pub mod injector;
 
-pub use injector::{inject_text, press_enter};
+pub use injector::{inject_backspaces, inject_text, press_enter};

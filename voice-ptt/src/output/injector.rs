@@ -43,6 +43,44 @@ pub fn inject_text(text: &str) -> Result<usize> {
     Ok(text.chars().count())
 }
 
+/// Deletes `count` characters before the caret by pressing Backspace `count`
+/// times. Used by the chunk-seam stitcher to remove the fragment of a word that
+/// a chunk cut in half (the full word arrives in the next chunk).
+///
+/// `count` is always the length of a word *we typed ourselves* a moment ago, and
+/// it is capped by the caller, so this can never chew far into the user's text.
+pub fn inject_backspaces(count: usize) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYBD_EVENT_FLAGS, VK_BACK};
+    let down = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_BACK,
+                dwFlags: KEYBD_EVENT_FLAGS(0),
+                ..Default::default()
+            },
+        },
+    };
+    let mut up = down;
+    up.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(count * 2);
+    for _ in 0..count {
+        inputs.push(down);
+        inputs.push(up);
+        if inputs.len() >= BATCH {
+            flush(&mut inputs)?;
+        }
+    }
+    if !inputs.is_empty() {
+        flush(&mut inputs)?;
+    }
+    Ok(())
+}
+
 /// Injects a plain `\n` as the Enter key (keystroke, not a Unicode char).
 pub fn press_enter() -> Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN};

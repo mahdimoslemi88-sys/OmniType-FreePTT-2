@@ -1,10 +1,14 @@
-//! Post-processing pipeline: normalization → dictionary correction.
+//! Post-processing pipeline: normalization → dictionary correction, plus the
+//! chunk-seam stitcher (`seam`) that keeps a long, chunked dictation reading as
+//! one continuous piece of text.
 
 pub mod dictionary;
 pub mod normalizer;
+pub mod seam;
 
 pub use dictionary::Dictionary;
 pub use normalizer::Normalizer;
+pub use seam::{SeamMerge, SeamOptions, SeamStitcher};
 
 /// Runs the full text post-processing pipeline in order.
 pub fn process_text(text: &str, normalizer: &Normalizer, dictionary: &Dictionary) -> String {

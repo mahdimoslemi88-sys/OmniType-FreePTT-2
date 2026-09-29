@@ -565,6 +565,7 @@ mod tests {
             record: "Shift+F5".into(),
             toggle_overlay: "Ctrl+Alt+P".into(),
             quit: "Ctrl+Shift+Q".into(),
+            ..HotkeySettings::default()
         };
         let cfg = HotkeyConfig::from_settings(&s);
         assert_eq!(
@@ -580,6 +581,7 @@ mod tests {
             record: "not a key".into(),
             toggle_overlay: "".into(),
             quit: "Ctrl+Ctrl+Ctrl+Q".into(),
+            ..HotkeySettings::default()
         };
         let cfg = HotkeyConfig::from_settings(&s);
         // Defaults: CapsLock / Ctrl+Alt+S / Ctrl+Alt+Q
@@ -617,6 +619,7 @@ mod tests {
             record: "Shift+F5".into(),
             toggle_overlay: "Ctrl+Alt+P".into(),
             quit: "Ctrl+Shift+Q".into(),
+            ..HotkeySettings::default()
         };
         control.set_config(HotkeyConfig::from_settings(&settings));
 
