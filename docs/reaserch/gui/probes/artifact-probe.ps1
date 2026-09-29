@@ -56,14 +56,34 @@ public static class OmniArtifactProbe
     [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr hWnd, int index);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
+
+    /// PowerShell hosts are not per-monitor DPI aware, so every GetWindowRect
+    /// they call is virtualised: at 125% scaling a 203x203 physical window comes
+    /// back as 162x162, and the screen as 1536x864 instead of 1920x1080. The
+    /// numbers in docs/GUI-WINDOW-ARTIFACT-REPORT.md were read exactly that way.
+    /// Call this before any other API here.
+    public static string MakeDpiAware()
+    {
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if (SetProcessDpiAwarenessContext(new IntPtr(-4)))
+            return "per-monitor-v2 (GetWindowRect now returns physical pixels)";
+        if (SetProcessDPIAware())
+            return "system (GetWindowRect now returns physical pixels)";
+        return "FAILED - all rects below are virtualised (divide by the 125% scale)";
+    }
 
     public static string FindWindow(uint pid, string clsOrTitle, bool visibleOnly, bool biggest)
     {
         string res = "";
         int bestArea = 0;
+        LastFoundHwnd = IntPtr.Zero;
         EnumWindows(delegate(IntPtr h, IntPtr l)
         {
             uint p;
@@ -82,12 +102,20 @@ public static class OmniArtifactProbe
             if (!biggest || area > bestArea)
             {
                 bestArea = area;
+                LastFoundHwnd = h;
                 res = string.Format("{0},{1},{2},{3}", r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
                 if (!biggest) return false;
             }
             return true;
         }, IntPtr.Zero);
         return res;
+    }
+
+    public static IntPtr LastFoundHwnd = IntPtr.Zero;
+
+    public static uint FoundDpi()
+    {
+        return LastFoundHwnd == IntPtr.Zero ? 0 : GetDpiForWindow(LastFoundHwnd);
     }
 
     public static List<string> WindowsAtPoint(int px, int py)
@@ -216,6 +244,7 @@ if (-not $proc) {
     exit 1
 }
 
+Write-Output ("-- dpi: {0}" -f [OmniArtifactProbe]::MakeDpiAware())
 Write-Output ("-- pid={0} private={1} MB   {2}" -f $proc.Id, [math]::Round($proc.PrivateMemorySize64 / 1MB, 1), (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 Write-Output "-- run this WHILE the light bar/box is visible; the z-order list names the owner"
 Write-Output ""
@@ -224,7 +253,7 @@ $orb = [OmniArtifactProbe]::FindWindow([uint32]$proc.Id, "Window Class", $true, 
 if ($orb) {
     $q = $orb -split ','
     $x = [int]$q[0]; $y = [int]$q[1]; $w = [int]$q[2]; $h = [int]$q[3]
-    Write-Output ("-- orb window (class 'Window Class') = ({0},{1} {2}x{3})" -f $x, $y, $w, $h)
+    Write-Output ("-- orb window (class 'Window Class') = ({0},{1} {2}x{3})  [physical px, dpi={4}]" -f $x, $y, $w, $h, [OmniArtifactProbe]::FoundDpi())
     Scan-Region ($x - $Pad) ($y - $Pad) ($w + 2 * $Pad) ($h + 2 * $Pad) "around orb window"
 } else {
     Write-Output "-- no visible 'Window Class' window found"
@@ -235,7 +264,7 @@ if ($prev) {
     $q = $prev -split ','
     $x = [int]$q[0]; $y = [int]$q[1]; $w = [int]$q[2]; $h = [int]$q[3]
     Write-Output ""
-    Write-Output ("-- transcript window (title 'OmniType_Preview') = ({0},{1} {2}x{3})" -f $x, $y, $w, $h)
+    Write-Output ("-- transcript window (title 'OmniType_Preview') = ({0},{1} {2}x{3})  [physical px, dpi={4}]" -f $x, $y, $w, $h, [OmniArtifactProbe]::FoundDpi())
     Scan-Region ($x - 48) ($y - 48) ($w + 96) ($h + 96) "around transcript window"
 } else {
     Write-Output ""

@@ -46,9 +46,24 @@ public static class OmniStyleProbe
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
+
+    /// PowerShell is not per-monitor DPI aware, so GetWindowRect is virtualised
+    /// (203x203 physical px reads as 162x162 at 125% scaling). Call before Dump().
+    public static string MakeDpiAware()
+    {
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if (SetProcessDpiAwarenessContext(new IntPtr(-4)))
+            return "per-monitor-v2 (rects below are physical pixels)";
+        if (SetProcessDPIAware())
+            return "system (rects below are physical pixels)";
+        return "FAILED - rects below are virtualised (multiply by the scale factor)";
+    }
 
     public static System.Collections.Generic.List<string> Dump(uint target)
     {
@@ -74,8 +89,9 @@ public static class OmniStyleProbe
             bool layered = (ex & 0x00080000) != 0;
 
             lines.Add(string.Format(
-                "class={0,-26} vis={1,-5} min={2,-5} rect=({3},{4} {5}x{6}) style=0x{7:X8} ex=0x{8:X8} caption={9,-5} thickframe={10,-5} popup={11,-5} edged={12,-5} layered={13,-5} title=\"{14}\"",
-                cls.ToString(), IsWindowVisible(h), IsIconic(h), r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top,
+                "class={0,-26} vis={1,-5} min={2,-5} dpi={3,-4} rect=({4},{5} {6}x{7}) style=0x{8:X8} ex=0x{9:X8} caption={10,-5} thickframe={11,-5} popup={12,-5} edged={13,-5} layered={14,-5} title=\"{15}\"",
+                cls.ToString(), IsWindowVisible(h), IsIconic(h), GetDpiForWindow(h),
+                r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top,
                 style, ex, caption, thickframe, popup, edged, layered, title.ToString()));
             return true;
         }, IntPtr.Zero);
@@ -93,6 +109,7 @@ if (-not $proc) {
     exit 1
 }
 
+Write-Output ("-- dpi: {0}" -f [OmniStyleProbe]::MakeDpiAware())
 Write-Output ("-- pid={0}  private={1} MB  working_set={2} MB  {3}" -f `
     $proc.Id, `
     [math]::Round($proc.PrivateMemorySize64 / 1MB, 1), `

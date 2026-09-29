@@ -311,3 +311,118 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass \
 ```
 
 وضعیت راستیآزمایی در آخرین بیلد: `cargo clippy --all-targets` بدون هشدار · `cargo test` = ۱۸۳ lib + ۵ + ۳ + ۴ + ۴ سبز.
+---
+
+## ۱۲٫۸ تغییرات این بخش
+
+- `voice-ptt/src/gui/overlay.rs`: `TransparencyMode` + `transparency_mode_from`/`transparency_mode` (متغیر محیطی،
+  **پیش‌فرض = `swapchain`**)، شاخهٔ `swapchain` در `enable_true_transparency`، شرطی‌شدن `SWP_FRAMECHANGED`،
+  `log_window_geometry` (یک‌بار هنگام ثبت HWND: `dpi`، `window_w/h`، `client_w/h`، `mode`) و دو تست برای قفل
+  نگه‌داشتن نگاشت. پیش‌بینی لاگ: `dpi=120 client_w=203 client_h=203 ppp=1.25`.
+- `docs/reaserch/gui/probes/artifact-probe.ps1` و `window-style-probe.ps1`: `SetProcessDpiAwarenessContext(-4)`
+  قبل از هر فراخوانی، به‌علاوهٔ چاپ `dpi` هر پنجره. (این همان باگی است که اعداد §۳ و §۴ را خراب کرده بود.)
+- **ریفکتور:** کل منطق Win32/DWM از `overlay.rs` به ماژول مستقل `gui/window_shape.rs` منتقل شد
+  (`overlay.rs` از ۵۰۰۶ به ۴۳۵۳ خط، `window_shape.rs` = ۷۱۰ خط). دلیل: این کد باید در برابر کامپوزیتور ویندوز
+  استدلال شود نه در برابر چیدمان UI، و دیگر وسط یک فایل ۵۰۰۰ خطی پنهان نیست. تست‌های شفافیت هم همراهش رفتند.
+- **پنجرهٔ اورب دیگر resize نمی‌شود**: یک‌بار در بزرگ‌ترین اندازه (`Orb::max_canvas_points`) ساخته می‌شود و
+  انیمیشن فقط داخل آن اتفاق می‌افتد ⇒ نوار یخ‌زدهٔ ۲۹۸×۲۸ دیگر ساخته نمی‌شود.
+- **پنجرهٔ کارت متن حالا موقع ساخت شکل می‌گیرد**: `shape_preview_window` فقط گاردِ drift بود و چون بیت‌های
+  استایل پنجرهٔ تازه سالم‌اند، `enable_true_transparency` **هرگز** رویش اجرا نمی‌شد.
+- ابزارهای جدید: `screenshot-measure.ps1` و `artifact-repro.ps1`.
+
+---
+
+## ۱۳. تشخیص نهایی: `with_transparent(true)` در ویندوز ۱۱
+
+> **وضعیت سند:** بخش‌های ۱ تا ۱۲٫۷ آخرین بار همراه با پروبه‌ها commit نشده بود و بازنویسی این فایل آن‌ها را
+> پاک کرد؛ متن بالا آخرین نسخهٔ commit‌شده به‌علاوهٔ ۱۲٫۸ است. اندازه‌گیری‌های میانی §۱۲ با اجرای دوبارهٔ
+> پروب‌ها از `docs/reaserch/gui/probes/` قابل بازتولیدند.
+
+### ۱۳٫۱ چه چیزی ثابت شد
+
+سه مشاهدهٔ کاربر که تشخیص‌های قبلی را کنار گذاشت:
+
+1. کادر روشن **کلیک را می‌بلعد** ⇒ رندر نمی‌تواند کلیک بدزدد، پس یک `HWND` زنده است.
+2. با بزرگ شدن متن به **سمت چپ** می‌پرد ⇒ پنجره‌ای با اندازهٔ قدیمی زیر پنجرهٔ فعلی مانده.
+3. **هم برای اورب هست هم برای کارت متن** ⇒ یک علت مشترک، نه دو مسیر متفاوت.
+
+نکتهٔ ۳ کلیدی بود: هر دو پنجره از یک مسیر ساخته می‌شوند.
+
+### ۱۳٫۲ زنجیرهٔ علت (از روی سورس، نه حدس)
+
+```
+preview_window.rs:  ViewportBuilder::with_transparent(true)
+   └─ egui-winit-0.28.1/src/lib.rs:1595      .with_transparent(transparent.unwrap_or(false))
+        └─ winit-0.30.13/.../windows/window.rs:1231-1246   (fn on_create)
+             if attributes.transparent {
+                 let region = CreateRectRgn(0, 0, -1, -1);          // ناحیهٔ خالی
+                 DwmEnableBlurBehindWindow(hwnd, {
+                     dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,      // ← قاتل
+                     hRgnBlur: region, .. });
+             }
+```
+
+از build **۲۲۶۲۱** به بعد (این دستگاه: **۲۶۲۰۰**)، `DWM_BB_ENABLE` دیگر یعنی «blur این ناحیه»
+نیست؛ یعنی **system backdrop پنجره را روشن کن**. ناحیهٔ خالی ⇒ «backdrop روی تمام پنجره».
+
+نتیجه: پنجرهٔ کارت (always-on-top، و آن ناحیه هیچ‌وقت رندر نمی‌شود) یک پنل روشن به اندازهٔ کل
+client area است. چون یک **پنجره** است، کلیک هم می‌بلعد. گوشه‌های گرد/تیز هم از
+`DWMWA_WINDOW_CORNER_PREFERENCE` است که هرگز روی این پنجره اعمال نشده بود.
+
+رنگ `rgb(248,248,248)` هم تصادفی نبود: رنگ سیستمی ویندوز نیست (آن ۲۴۰ است) — این دقیقاً
+`egui::Visuals::light().panel_fill` است، یعنی رنگی که کانتکست فرزند پیش‌فرض با آن شروع می‌شود.
+الزامِ `set_visuals` قبل از هر رسمی، و frame شفاف، هر دو در `report_window` صریح شدند.
+
+### ۱۳٫۳ چرا «فقط اصلاحش کن» کافی نبود
+
+چون اصلاح = مسابقه با `on_create` در هر بار ساخت پنجره، برای همیشه. و دقیقاً همین اتفاق افتاده بود:
+HWND پنجرهٔ کارت **هرگز** به هیچ‌کدام از کدهای Win32 نمی‌رسید (فقط پنجرهٔ ریشه از
+`register_main_hwnd` می‌رفت)، پس هیچ‌چیز آن را اصلاح نمی‌کرد.
+
+### ۱۳٫۴ چرا حذفش چیزی را خراب نمی‌کند
+
+آلفای swapchain از `ViewportBuilder` کارت **نمی‌آید**:
+
+```
+eframe-0.28.1/src/native/wgpu_integration.rs:196
+    egui_wgpu::winit::Painter::new(.., native_options.viewport.transparent)
+```
+
+این Painter **یک‌بار** در استارتاپ و از روی تنظیم **پنجرهٔ ریشه** ساخته می‌شود و
+`Painter::add_surface` (egui-wgpu-0.28.1/src/winit.rs:274-276) همان یک فیلد را برای **همهٔ**
+viewportها — از جمله فرزند — به کار می‌برد. ریشه در `lib.rs` `with_transparent(true)` دارد، پس سطح
+کارت از قبل `CompositeAlphaMode::PreMultiplied` بود. فلگ روی فرزند فقط **اثر جانبی** بود، بدون فایده.
+
+### ۱۳٫۵ تغییرات
+
+- `gui/preview_window.rs` — بازنویسی کامل:
+  - `with_transparent(true)` **حذف شد** (تست `card_window_does_not_ask_winit_for_transparency` آن را قفل می‌کند).
+  - `with_mouse_passthrough(true)` اضافه شد: پنجرهٔ ثابت ۴۵۲×۲۶۰ نقطه‌ای است و حتی اگر کاملاً شفاف باشد،
+    تا وقتی always-on-top است همان مستطیل را از دسکتاپ می‌گیرد — همان چیزی که به‌صورت «دکمهٔ کنارش کلیک
+    نمی‌شود» گزارش شده بود. هزینه‌اش از دست رفتن click-to-dismiss است؛ با ثابت
+    `CARD_CLICKS_PASS_THROUGH` یک‌خطی برمی‌گردد.
+  - یک پنجره برای کل عمر پروسه؛ `with_visible` تنها چیزی است که بین بابل‌ها فرق می‌کند (تست
+    `show_and_hide_differ_only_in_visibility`).
+  - `window_position` به `window_shape::taskbar_bottom_center_pt` سپرده شد (کار درست، به‌جای ریاضیِ
+    `screen_h - taskbar` که پنجره را زیر نوار وظیفه می‌برد).
+  - بلوک مردهٔ `LayoutJob` در `paint_card` که ساخته و دور ریخته می‌شد حذف شد.
+- `gui/window_shape.rs`:
+  - `apply_viewport_transparency(hwnd)`: **تنها** اصلاح Win32 برای هر پنجرهٔ viewport — چهار فراخوانی
+    idempotent، بدون نوشتن style و بدون `SWP_FRAMECHANGED` (برخلاف گارد قبلی که ۲۲۶۷ بار در ۱۶ ثانیه
+    style می‌نوشت و همان چیزی بود که caption را برمی‌گرداند).
+  - `shape_preview_window` → `ensure_preview_window_shaped`: پنجرهٔ کارت با **عنوان خودش** پیدا و تا
+    عمرش اصلاح می‌شود (هر ۱۵ فریم یک‌بار + بلافاصله بعد از ساخته‌شدن).
+- تست‌ها: ۸ تست `preview_window` (شامل قفل‌های regression روی `transparent` و `mouse_passthrough`)،
+  ۱۹۴ تست کتابخانه سبز، `cargo clippy --all-targets` بدون هشدار.
+
+### ۱۳٫۶ مسیرهای مرده (ثبت می‌شوند تا دوباره امتحان نشوند)
+
+`DwmExtendFrameIntoClientArea` · همهٔ attributeهای DWM به‌جز backdrop/corner/border · subclass
+`WM_NCCALCSIZE` · `SWP_FRAMECHANGED` · `DWMNCRP_DISABLED` · blur-behind (تنها به‌عنوان **پاک‌سازی** لازم
+است، نه فعال‌سازی) · گارد per-frame روی `SetWindowLongW`.
+
+### ۱۳٫۷ نکتهٔ عملی برای تست
+
+`voice-ptt-dist/voice-ptt.exe` قبلاً ساعت ۰۸:۵۰ بود در حالی که سورس ۰۹:۱۰ — یعنی چند دور تست روی
+بیلدی انجام شده که اصلاحات قبلی را نداشت. قبل از قضاوت دربارهٔ نتیجه، مطمئن شو که exe را از
+`voice-ptt-dist/` اجرا می‌کنی. md5 بیلد فعلی در پیام تحویل آمده است.
