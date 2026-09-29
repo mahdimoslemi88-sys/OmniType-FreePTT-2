@@ -514,6 +514,27 @@ const TOAST_ACCENT: egui::Color32 = palette::ACCENT;
 /// so even the tallest preview never clips.
 const TOAST_TOTAL_SECS: u64 = 10;
 
+/// Whether the transcript card window is ever created.
+///
+/// # Off, and the whole card path is unreachable
+///
+/// The card is an `egui` child viewport, and an `egui` child viewport is a real
+/// top-level `HWND`. Making it correct is not a matter of drawing it correctly:
+/// on Windows 11 build 22621+ winit's `on_create` turns on a *system backdrop*
+/// for any `with_transparent` window, that window swallows mouse input over its
+/// whole rect, and it survives a few frames after egui stops reporting it —
+/// which is the pale box that used to sit over the desktop and block clicks.
+///
+/// The transcript is still fully available: it is typed into the focused
+/// field, and the dashboard history keeps the session text. Only the floating
+/// duplicate is gone.
+///
+/// Set to `true` to bring the card back. Nothing else has to change —
+/// [`OverlayApp::render_preview_toast_window`], [`crate::gui::preview_window`]
+/// and [`crate::gui::window_shape::ensure_preview_window_shaped`] are all
+/// still there and still wired up.
+const SHOW_TRANSCRIPT_CARD: bool = false;
+
 /// Width cap for a toast card (vendored egui-notify width-cap port of
 /// ItsEthra/egui-notify#54). Capped captions hard-wrap (even unbreakable
 /// tokens) and grow the card vertically instead of stretching; uncapped
@@ -3459,7 +3480,17 @@ impl OverlayApp {
     /// once and then only ever shows/hides it. This function decides *what* to
     /// show; the module decides *how* the window is kept alive. See that
     /// module's docs for why a per-bubble window was the bug.
+    ///
+    /// Currently a no-op: [`SHOW_TRANSCRIPT_CARD`] is `false`, so no viewport
+    /// is ever reported and no `HWND` is ever created. The queue is drained
+    /// rather than left to grow, so turning the card back on cannot resurrect a
+    /// backlog of stale bubbles.
     fn render_preview_toast_window(&mut self, ctx: &egui::Context) {
+        if !SHOW_TRANSCRIPT_CARD {
+            self.live_toasts.clear();
+            return;
+        }
+
         let bubble_enabled = self
             .settings
             .read()
@@ -3526,9 +3557,8 @@ fn build_card_content(
     );
     // Wrap at the card's inner width so a long transcript breaks into lines
     // instead of being clipped at the window edge.
-    layout_job.wrap = egui::text::TextWrapping::wrap_at_width(
-        preview_window::CARD_MAX_W - preview_window::SHADOW_PAD * 2.0 - 56.0,
-    );
+    layout_job.wrap =
+        egui::text::TextWrapping::wrap_at_width(preview_window::card_text_wrap_width());
     layout_job.halign = egui::Align::RIGHT;
 
     let galley = ctx.fonts(|f| f.layout_job(layout_job));

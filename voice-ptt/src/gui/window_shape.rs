@@ -23,6 +23,9 @@ struct WinMargins {
 #[cfg(windows)]
 #[link(name = "user32")]
 extern "system" {
+    /// Makes the window manager hit-test only inside `h_rgn`. Passing 0 clears
+    /// the region and restores "the whole rect".
+    fn SetWindowRgn(hwnd: isize, h_rgn: isize, b_redraw: i32) -> i32;
     fn SystemParametersInfoW(
         ui_action: u32,
         ui_param: u32,
@@ -59,6 +62,14 @@ extern "system" {
 const RDW_FORCE_REPAINT: u32 = 0x0001 /* INVALIDATE */
     | 0x0020 /* ALLCHILDREN */
     | 0x0100 /* UPDATENOW */;
+
+#[cfg(windows)]
+#[link(name = "gdi32")]
+extern "system" {
+    fn CreateEllipticRgn(l: i32, t: i32, r: i32, b: i32, f: i32) -> isize;
+    fn CreateRoundRectRgn(l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> isize;
+    fn DeleteObject(ho: *mut std::ffi::c_void) -> i32;
+}
 
 #[cfg(windows)]
 #[link(name = "dwmapi")]
@@ -244,6 +255,217 @@ pub fn apply_viewport_transparency(hwnd: isize) {
     dwm_set_u32(hwnd, dwm_attr::WINDOW_CORNER_PREFERENCE, 1); // DWMWCP_DONOTROUND
     dwm_set_u32(hwnd, dwm_attr::BORDER_COLOR, 0xFFFF_FFFE); // DWMWA_COLOR_NONE
     dwm_set_u32(hwnd, dwm_attr::SYSTEMBACKDROP_TYPE, 1); // DWMSBT_NONE
+}
+
+/// The last `(hwnd, region)` handed to the window manager, so an unchanged
+/// shape costs nothing.
+#[cfg(windows)]
+static CLICK_REGION_CACHE: std::sync::Mutex<Option<(isize, ClickRegion)>> =
+    std::sync::Mutex::new(None);
+
+/// The `HWND` of the transcript card window, or 0 when it has not been created
+/// yet. Read by [`crate::gui::preview_window`] to attach a click region to the
+/// card without a second window walk.
+#[cfg(windows)]
+pub fn preview_hwnd() -> isize {
+    PREVIEW_HWND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where a viewport window accepts clicks, in **points** relative to its own
+/// top-left corner.
+///
+/// # Why this and not `WS_EX_TRANSPARENT`
+///
+/// `WS_EX_TRANSPARENT` is all-or-nothing: with it the window cannot be clicked
+/// at all, without it the window swallows every click over its whole rect. For
+/// the orb that is unusable — it has to stay draggable — and for the card it
+/// costs click-to-dismiss and, because winit pairs the bit with
+/// `WS_EX_LAYERED` ([winit window_state.rs:300-301][1]), it puts a layered
+/// style on a window whose pixels come from a `wgpu` swapchain.
+///
+/// A **window region** is the other half of Win32 hit-testing: `WindowFromPoint`
+/// only ever offers a point to a window whose region contains it, so a region
+/// smaller than the window lets the desktop through everywhere else while the
+/// window itself stays fully interactive.
+///
+/// `WM_NCHITTEST` returning `HTTRANSPARENT` looks like a third option and is
+/// not: it only skips windows **in the same thread**, and the windows being
+/// protected are other processes'.
+///
+/// [1]: https://docs.rs/winit/0.30/winit/0.30.13/src/winit/platform_impl/windows/window_state.rs.html#300-301
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ClickRegion {
+    /// No region: the window takes the hit over its whole rect.
+    Full,
+    /// A circle centred on the window.
+    Circle {
+        radius_pt: f32,
+    },
+    /// A rounded rectangle. `rect_pt` is `[left, top, right, bottom]`.
+    RoundedRect {
+        rect_pt: [f32; 4],
+        radius_pt: f32,
+    },
+}
+
+/// Converts a region to physical pixels against a window of `window_pt`.
+///
+/// Returns `None` for any shape that would describe an empty or out-of-window
+/// region, which is the caller's signal to fall back to [`ClickRegion::Full`].
+/// `SetWindowRgn` fails on an empty region and, when it is handed a shape that
+/// degenerates at runtime (the orb scaled to nothing, the card not laid out
+/// yet), silently leaves a window nobody can see and everybody can click.
+#[cfg(windows)]
+pub fn click_region_px(region: ClickRegion, window_pt: [f32; 2], ppp: f32) -> Option<ClickRegion> {
+    /// `NaN` and non-positive both have to be rejected: `NaN` would otherwise
+    /// sail through every comparison and reach `SetWindowRgn` as a zero-size
+    /// region.
+    fn usable(v: f32) -> bool {
+        v.is_finite() && v > 0.0
+    }
+
+    let (window_w, window_h) = (window_pt[0], window_pt[1]);
+    if !usable(window_w) || !usable(window_h) || !usable(ppp) {
+        return Some(ClickRegion::Full);
+    }
+    match region {
+        ClickRegion::Full => Some(ClickRegion::Full),
+        ClickRegion::Circle { radius_pt } => {
+            let radius_px = (radius_pt * ppp).round() as i32;
+            // The region has to fit inside the window, or it is clipped to the
+            // window anyway and the shape bought nothing.
+            let max_px = ((window_w.min(window_h) * ppp) * 0.5).round() as i32;
+            let radius_px = radius_px.clamp(1, max_px.max(1));
+            Some(ClickRegion::Circle { radius_pt: radius_px as f32 / ppp })
+        }
+        ClickRegion::RoundedRect {
+            rect_pt,
+            radius_pt,
+        } => {
+            let mut left = (rect_pt[0] * ppp).round() as i32;
+            let mut top = (rect_pt[1] * ppp).round() as i32;
+            let mut right = (rect_pt[2] * ppp).round() as i32;
+            let mut bottom = (rect_pt[3] * ppp).round() as i32;
+            left = left.clamp(0, (window_w * ppp).round() as i32);
+            top = top.clamp(0, (window_h * ppp).round() as i32);
+            right = right.clamp(0, (window_w * ppp).round() as i32);
+            bottom = bottom.clamp(0, (window_h * ppp).round() as i32);
+            if right - left < 2 || bottom - top < 2 {
+                return None;
+            }
+            let corner = (radius_pt * ppp).round().max(0.0) as i32;
+            let max_corner = ((right - left) / 2).min((bottom - top) / 2);
+            let corner = corner.min(max_corner.max(0));
+            Some(ClickRegion::RoundedRect {
+                rect_pt: [
+                    left as f32 / ppp,
+                    top as f32 / ppp,
+                    right as f32 / ppp,
+                    bottom as f32 / ppp,
+                ],
+                radius_pt: corner as f32 / ppp,
+            })
+        }
+    }
+}
+
+/// Applies a click region, skipping the call when it has not changed.
+///
+/// `SetWindowRgn` makes the window manager send `WM_WINDOWPOSCHANGING` and
+/// `WM_WINDOWPOSCHANGED`, so calling it every frame would put the window
+/// through a spurious move/activate cycle 60 times a second for a shape that
+/// only changes when the orb animates.
+#[cfg(windows)]
+pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2], ppp: f32) {
+    if hwnd == 0 {
+        return;
+    }
+    let Some(px) = click_region_px(region, window_pt, ppp) else {
+        return;
+    };
+    {
+        let Ok(mut last) = CLICK_REGION_CACHE.lock() else { return };
+        if *last == Some((hwnd, px)) {
+            return;
+        }
+        *last = Some((hwnd, px));
+    }
+
+    // Half-pixel inset: a region that exactly touches the window edge can leave
+    // a hairline of unowned pixels along the far sides.
+    let side_w = (window_pt[0] * ppp).round() as i32;
+    let side_h = (window_pt[1] * ppp).round() as i32;
+    let rgn: isize = match px {
+        ClickRegion::Full => {
+            let ok = unsafe { SetWindowRgn(hwnd, 0, 1) };
+            if ok == 0 {
+                tracing::debug!(hwnd, "clearing the window region failed");
+            } else {
+                force_repaint(hwnd);
+            }
+            return;
+        }
+        ClickRegion::Circle { radius_pt } => {
+            let r = (radius_pt * ppp).round() as i32;
+            let cx = side_w / 2;
+            let cy = side_h / 2;
+            unsafe { CreateEllipticRgn(cx - r, cy - r, cx + r + 1, cy + r + 1, 1) }
+        }
+        ClickRegion::RoundedRect {
+            rect_pt,
+            radius_pt,
+        } => {
+            let l = (rect_pt[0] * ppp).round() as i32;
+            let t = (rect_pt[1] * ppp).round() as i32;
+            let r = (rect_pt[2] * ppp).round() as i32;
+            let b = (rect_pt[3] * ppp).round() as i32;
+            let c = (radius_pt * ppp).round() as i32;
+            unsafe { CreateRoundRectRgn(l, t, r, b, c * 2, c * 2) }
+        }
+    };
+
+    if rgn == 0 {
+        tracing::debug!(hwnd, ?px, "could not build the window region");
+        return;
+    }
+    let ok = unsafe { SetWindowRgn(hwnd, rgn, 1) };
+    if ok == 0 {
+        // The call failed, so ownership never transferred and the region is
+        // still ours to free.
+        unsafe { DeleteObject(rgn as *mut std::ffi::c_void) };
+        tracing::debug!(hwnd, ?px, "SetWindowRgn failed");
+        return;
+    }
+    // On success the system owns the region and must not be told to delete it.
+
+    // Repaint, or the old boundary stays on screen.
+    //
+    // `SetWindowRgn(..., TRUE)` asks for a redraw, but all it delivers is
+    // `WM_WINDOWPOSCHANGED` — and DWM composes a per-pixel-alpha window from
+    // its *cached* redirection surface, which that message does not invalidate.
+    // So when the region shrinks (the orb returning to idle drops it from the
+    // `Recording` radius of 96 pt to 58 pt), DWM keeps showing the last frame
+    // that was composed with the larger region. The symptom is a hard-edged
+    // arc of the old circle, left floating above the orb where nothing is
+    // painted.
+    //
+    // `RDW_ERASE`/`RDW_FRAME` are deliberately not set — asking DWM to repaint
+    // the frame region of a transparent window lands as a light layer over the
+    // parts egui never paints, which is the pale box this module exists to
+    // prevent. INVALIDATE + UPDATENOW only forces the next presented frame to
+    // be composited, which is what actually needs to happen.
+    force_repaint(hwnd);
+}
+
+/// Drops the cached region so the next [`apply_click_region`] call always
+/// reaches the window manager. Needed when a window is recreated behind the
+/// same handle, and by tests.
+#[cfg(windows)]
+pub fn invalidate_click_region() {
+    if let Ok(mut last) = CLICK_REGION_CACHE.lock() {
+        *last = None;
+    }
 }
 
 /// Cancels the blur-behind layer that winit puts on every window created with

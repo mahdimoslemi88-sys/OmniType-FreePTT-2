@@ -14,7 +14,11 @@ pub const BASE_DIAMETER: f32 = 60.0;
 
 const HOVER_SCALE_BOOST: f32 = 0.08; // 60pt -> ~65pt on hover
 const SPRING_STIFFNESS: f32 = 170.0;
-const SPRING_DAMPING_RATIO: f32 = 0.62; // slight, soft overshoot
+/// Damping ratio of the scale spring. Read by `gui::orb`'s tests, which derive
+/// the scale overshoot from it rather than assuming the orb never exceeds its
+/// target — a spring always overshoots, and an overshoot past the canvas would
+/// crop the glow.
+pub(crate) const SPRING_DAMPING_RATIO: f32 = 0.62; // slight, soft overshoot
 const POSITION_SMOOTHING: f32 = 5.5; // 1/s, exponential approach
 const HOVER_SMOOTHING: f32 = 12.0;
 const PALETTE_FADE_SECS: f32 = 0.35;

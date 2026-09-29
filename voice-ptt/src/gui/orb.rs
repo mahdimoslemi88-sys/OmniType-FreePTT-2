@@ -15,6 +15,8 @@ use super::orb_palette::OrbPalette;
 const CANVAS_FACTOR: f32 = 1.90;
 const CANVAS_PADDING: f32 = 24.0;
 const GLOW_EXTENT: f32 = 0.55;
+/// Upper bound on `shake_offset`, as a fraction of the orb radius.
+const SHAKE_EXTENT: f32 = 0.22;
 const GLOW_LAYERS: usize = 12;
 const MIN_HIT_RADIUS: f32 = 24.0;
 const COMPLETE_HOLD_SECS: f32 = 0.9;
@@ -169,7 +171,13 @@ impl Orb {
         // a drag moves the window.
         let side_pt = Self::max_canvas_points();
         let side_px = (side_pt * ppp).ceil() as i32;
-        self.window.place(self.anim.current_position, side_px);
+        // The window is a square and the orb is a circle in the middle of it,
+        // so every click outside the orb's painted reach is a click this window
+        // takes from whatever is underneath. `painted_radius` is that reach; the
+        // window region is clipped to it. See `ClickRegion`.
+        let region_radius_px = (self.painted_radius_pt() * ppp).ceil() as i32;
+        self.window
+            .place(self.anim.current_position, side_px, region_radius_px, ppp);
         debug_assert!(side_pt >= Self::canvas_side_points(canvas_scale));
         // phase 1: only resize when the canvas actually changed.
         if self.sent_side_pt != Some(side_pt) {
@@ -273,6 +281,29 @@ impl Orb {
 
     fn canvas_side_points(scale: f32) -> f32 {
         BASE_DIAMETER * scale * CANVAS_FACTOR + CANVAS_PADDING * 2.0
+    }
+
+    /// How far out from its centre the orb can ever paint, in points.
+    ///
+    /// This is the radius the window's click region may be clipped to without
+    /// ever clipping the orb itself, so it has to be the **worst** case, not the
+    /// typical one. Each term is the ceiling of one thing [`Self::paint`] draws
+    ///:
+    ///
+    /// * `radius * 1.10` — `paint` multiplies by `1 + breath * breath_amp`,
+    ///   and `breath_amp` peaks at `0.04 + 0.06 * level` when Recording;
+    /// * `* (1 + GLOW_EXTENT)` — `paint_glow` layers reach
+    ///   `r * (1 + GLOW_EXTENT * t)` with `t` up to 1;
+    /// * `radius * 1.18` — the rings sit at `r * 1.18`, which is inside the
+    ///   glow term but is kept as an explicit floor so changing `GLOW_EXTENT`
+    ///   cannot silently shrink the clickable area;
+    /// * `+ radius * SHAKE_EXTENT` — `shake_offset` slides the whole orb
+    ///   sideways, so the circle has to travel with it.
+    ///
+    /// Clamped to the canvas so the region never asks for more than the window
+    /// has.
+    fn painted_radius_pt(&self) -> f32 {
+        region_radius_pt(self.anim.current_scale, Self::max_canvas_points() * 0.5)
     }
 
     /// Fixed window side in points: the canvas at the biggest scale the orb ever
@@ -673,42 +704,63 @@ mod win {
             (self.raw != 0).then_some(HWND(self.raw as *mut c_void))
         }
 
-        /// Center the (square) window on `center`, physical pixels. No-op if unchanged.
-        pub fn place(&mut self, center: Pos2, side_px: i32) {
+        /// Center the (square) window on `center`, physical pixels, and clip
+        /// its click region to a circle of `region_radius_px`. No-op if neither
+        /// changed.
+        pub fn place(&mut self, center: Pos2, side_px: i32, region_radius_px: i32, ppp: f32) {
+            let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
             let side = side_px.max(1);
             let x = (center.x - side as f32 * 0.5).round() as i32;
             let y = (center.y - side as f32 * 0.5).round() as i32;
             let rect = (x, y, side, side);
-            if self.last == Some(rect) {
-                return;
-            }
+            let moved = self.last != Some(rect);
             let Some(hwnd) = self.hwnd() else { return };
-            let result = unsafe {
-                SetWindowPos(
-                    hwnd,
-                    HWND_TOPMOST,
-                    x,
-                    y,
-                    side,
-                    side,
-                    SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                )
-            };
-            if result.is_ok() {
-                self.last = Some(rect);
-                // phase 3.2: a moved transparent window keeps the pixels of its
-                // previous position unless it is erased — those leftovers are
-                // what looked like nested window frames piling up.
-                #[cfg(windows)]
-                crate::gui::window_shape::force_repaint(self.raw);
-            } else {
-                self.raw = 0; // window recreated? resolve again next frame
-                self.last = None;
-                // phase 1: let the overlay re-resolve the real handle if this one
-                // is gone (the OS window can be recreated for the main viewport).
-                #[cfg(windows)]
-                crate::gui::window_shape::invalidate_main_hwnd();
+            if moved {
+                let result = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        x,
+                        y,
+                        side,
+                        side,
+                        SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                    )
+                };
+                if result.is_ok() {
+                    self.last = Some(rect);
+                    // phase 3.2: a moved transparent window keeps the pixels of
+                    // its previous position unless it is erased — those
+                    // leftovers are what looked like nested window frames
+                    // piling up.
+                    #[cfg(windows)]
+                    crate::gui::window_shape::force_repaint(self.raw);
+                } else {
+                    self.raw = 0; // window recreated? resolve again next frame
+                    self.last = None;
+                    // phase 1: let the overlay re-resolve the real handle if
+                    // this one is gone (the OS window can be recreated for the
+                    // main viewport).
+                    #[cfg(windows)]
+                    crate::gui::window_shape::invalidate_main_hwnd();
+                }
             }
+            // Runs whether or not the window moved: the orb animates, so the
+            // region grows and shrinks under a window that never does.
+            //
+            // `ClickRegion` is denominated in points, so the pixel radius is
+            // divided back out here rather than smuggled in as a `ppp` of 1.0 —
+            // that "harmless" shortcut is how a radius ends up 1.25x too small
+            // on a scaled display and quietly crops the glow.
+            #[cfg(windows)]
+            crate::gui::window_shape::apply_click_region(
+                hwnd.0 as isize,
+                crate::gui::window_shape::ClickRegion::Circle {
+                    radius_pt: region_radius_px as f32 / ppp,
+                },
+                [side as f32 / ppp, side as f32 / ppp],
+                ppp,
+            );
         }
     }
 
@@ -740,5 +792,92 @@ mod win {
             clamp(p.x, vx as f32 + half, (vx + vw) as f32 - half),
             clamp(p.y, vy as f32 + half, (vy + vh) as f32 - half),
         )
+    }
+}
+
+/// How far out from the orb's centre the click region may be clipped, in points,
+/// for an orb currently at `scale` and a canvas half-width of `canvas_half`.
+///
+/// Free-standing so the ceiling it encodes can be tested without building an
+/// [`Orb`]: see `tests::region_never_crops_the_glow`. Every term is a ceiling of
+/// something [`paint`] and [`paint_glow`] actually draw, and the sum is what the
+/// region has to contain.
+fn region_radius_pt(scale: f32, canvas_half: f32) -> f32 {
+    let radius = BASE_DIAMETER * 0.5 * scale;
+    let breathed = radius * 1.10; // `paint`: 1 + breath * breath_amp, amp <= 0.10
+    let glowed = breathed * (1.0 + GLOW_EXTENT); // `paint_glow`: r * (1 + GLOW_EXTENT * t), t <= 1
+    let rings = breathed * 1.18;
+    let shaken = radius * SHAKE_EXTENT;
+    let reach = glowed.max(rings) + shaken;
+    reach.clamp(MIN_HIT_RADIUS, canvas_half)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::orb_animation::SPRING_DAMPING_RATIO;
+    use super::*;
+
+    /// The largest scale the animation can actually reach.
+    ///
+    /// Not simply `Recording.target_scale()`: `OrbAnimation` integrates a
+    /// spring, and a spring overshoots. The step response of a second-order
+    /// system peaks at `exp(-pi*zeta / sqrt(1 - zeta^2))` above its target, so
+    /// that is the number to sweep to — doubled, because repeated hotkey taps
+    /// can stack on velocity that has not yet damped out.
+    fn max_reachable_scale() -> f32 {
+        let zeta = SPRING_DAMPING_RATIO;
+        let overshoot = (-PI * zeta / (1.0f32 - zeta * zeta).sqrt()).exp();
+        let biggest = OrbMode::Recording.target_scale();
+        biggest * (1.0 + overshoot * 2.0)
+    }
+
+    /// `SetWindowRgn` clips *rendering* as well as hit-testing, so a region
+    /// smaller than the painted orb would not merely shrink its click target —
+    /// it would shear the glow off with a hard circular edge. This is the one
+    /// failure mode of the region approach that is silent on screen, so the
+    /// ceiling is pinned here instead of being re-derived by eye.
+    #[test]
+    fn region_never_crops_the_glow() {
+        let canvas_half = Orb::max_canvas_points() * 0.5;
+        let top = max_reachable_scale();
+        let mut scale = 0.2;
+        while scale <= top {
+            let region = region_radius_pt(scale, canvas_half);
+
+            // What `paint` + `paint_glow` + the shake can actually reach.
+            let radius = BASE_DIAMETER * 0.5 * scale;
+            let painted = radius * 1.10 * (1.0 + GLOW_EXTENT) + radius * SHAKE_EXTENT;
+
+            assert!(
+                region + 0.001 >= painted,
+                "scale {scale}: region {region} < painted reach {painted}"
+            );
+            assert!(
+                region <= canvas_half + 0.001,
+                "scale {scale}: region {region} does not fit a canvas half of {canvas_half}"
+            );
+            scale += 0.01;
+        }
+    }
+
+    /// `min(MAX_REACHABLE, canvas half)` is what the region actually becomes, so
+    /// the window only has to be big enough for the *reachable* orb — a bigger
+    /// window would just be more desktop to protect.
+    #[test]
+    fn the_window_is_big_enough_for_the_biggest_orb() {
+        let top = max_reachable_scale();
+        let canvas_half = Orb::max_canvas_points() * 0.5;
+        let reach = region_radius_pt(top, canvas_half);
+        assert!(
+            reach <= canvas_half + 0.001,
+            "the largest reachable orb ({top} scale) paints to {reach} pt but the window half is {canvas_half} pt"
+        );
+        // And the clamp is not what saved it: without the canvas the orb would
+        // have needed more room than the window has.
+        let unclamped = region_radius_pt(top, f32::INFINITY);
+        assert!(
+            unclamped <= canvas_half + 0.001,
+            "the canvas is too small: {unclamped} pt of orb in a {canvas_half} pt window"
+        );
     }
 }

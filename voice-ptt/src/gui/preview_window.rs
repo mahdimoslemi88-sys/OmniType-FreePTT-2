@@ -1,5 +1,14 @@
 //! Lifecycle owner for the transcript card's OS window.
 //!
+//! # Status: dormant
+//!
+//! [`report_window`] is not currently called. [`crate::gui::overlay`]'s
+//! `SHOW_TRANSCRIPT_CARD` is `false`, so no viewport is ever reported and this
+//! module creates no `HWND` at all — which is the only way to be certain the
+//! box cannot come back, on a hotkey, mid-dictation, or after a resume. The
+//! code below is kept intact and tested; flipping that one constant restores
+//! the card.
+//!
 //! # What the pale box actually was
 //!
 //! A light, opaque, always-on-top rectangle that appeared around the card,
@@ -109,11 +118,9 @@ pub const CARD_MAX_W: f32 = 420.0;
 const WINDOW_W: f32 = CARD_MAX_W + SHADOW_PAD * 2.0;
 const WINDOW_MAX_H: f32 = 260.0;
 
-/// Let mouse input reach the desktop instead of stopping at this window.
-///
-/// `false` restores click-to-dismiss and gives the card its rect back as a
-/// click-swallowing region.
-const CARD_CLICKS_PASS_THROUGH: bool = true;
+/// Corner radius of the card, used both for painting and for the click region,
+/// so the area that swallows clicks is exactly the area that is drawn.
+pub const CARD_RADIUS: f32 = 16.0;
 
 /// Geometry of the card inside the fixed-size window.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -150,6 +157,27 @@ impl CardLayout {
             ],
         }
     }
+
+    /// The card's rectangle in viewport-local points.
+    pub fn card_rect(self) -> egui::Rect {
+        egui::Rect::from_min_size(
+            egui::pos2(self.card_origin[0], self.card_origin[1]),
+            egui::vec2(self.card_w, self.card_h),
+        )
+    }
+}
+
+/// Where a galley will actually land on screen when it is painted at `anchor`.
+///
+/// `epaint` anchors a `RIGHT`-aligned galley at its right edge, so the drawn
+/// rectangle runs leftwards from `anchor.x` rather than rightwards. Getting this
+/// wrong is invisible in code review and obvious on screen.
+pub fn text_rect(anchor: egui::Pos2, galley: &egui::text::Galley) -> egui::Rect {
+    let size = galley.size();
+    egui::Rect::from_min_max(
+        egui::pos2(anchor.x - size.x, anchor.y),
+        egui::pos2(anchor.x, anchor.y + size.y),
+    )
 }
 
 /// The bubble the card should currently show, or `None` to hide the window.
@@ -181,9 +209,16 @@ fn card_window_builder(pos: [f32; 2], visible: bool) -> ViewportBuilder {
         // Visibility, not existence, is what changes between bubbles.
         .with_visible(visible)
         .with_active(false)
-        // See the module docs: this window is larger than the card and sits on
-        // top of the desktop, so it must not keep hit-testing.
-        .with_mouse_passthrough(CARD_CLICKS_PASS_THROUGH)
+        // The window is larger than the card and sits on top of the desktop,
+        // so it must not take clicks over its whole rect. A window **region**
+        // sized to the card does that and leaves the card itself interactive;
+        // `with_mouse_passthrough` would do it at the cost of the whole window
+        // (no click-to-dismiss) plus `WS_EX_LAYERED`, which winit sets
+        // alongside `WS_EX_TRANSPARENT` and which does not belong on a window
+        // whose pixels come from a `wgpu` swapchain.
+        // (rollback: `.with_mouse_passthrough(true)` and delete the
+        // `apply_click_region` call in `report_window`.)
+        .with_mouse_passthrough(false)
         // NOTE: deliberately **not** `with_transparent(true)`.
         // It cannot give this window alpha — `egui_wgpu`'s `Painter` is built
         // once from the *root* viewport's setting and applies that one
@@ -210,16 +245,23 @@ pub fn report_window(ctx: &Context, content: Option<&mut CardContent>, ppp: f32)
     window_shape::ensure_preview_window_shaped();
 
     let pos = window_position(ppp);
-    let builder = card_window_builder(pos, content.is_some());
+    // The layout is computed here rather than inside the paint closure because
+    // the OS window's click region has to be the card, and that needs the same
+    // rectangle the painter will use.
+    let layout = content.as_ref().map(|c| {
+        CardLayout::new(
+            c.text_size[0] + TEXT_PAD_X + DOT_MARGIN,
+            c.text_size[1] + TEXT_PAD_Y * 2.0 + 6.0,
+        )
+    });
+    apply_card_click_region(layout, ppp);
+
+    let builder = card_window_builder(pos, layout.is_some());
 
     ctx.show_viewport_immediate(preview_viewport_id(), builder, |toast_ctx, _class| {
-        let Some(content) = content else {
+        let (Some(content), Some(layout)) = (content, layout) else {
             return;
         };
-        let layout = CardLayout::new(
-            content.text_size[0] + TEXT_PAD_X + DOT_MARGIN,
-            content.text_size[1] + TEXT_PAD_Y * 2.0 + 6.0,
-        );
 
         // The child viewport's `egui::Context` starts on the *default* (light)
         // theme, whose `panel_fill` is `rgb(248,248,248)` — the exact colour
@@ -241,9 +283,52 @@ pub fn report_window(ctx: &Context, content: Option<&mut CardContent>, ppp: f32)
     });
 }
 
+/// Clips the card window's click region to the card.
+///
+/// The window is [`WINDOW_W`] × [`WINDOW_MAX_H`] — fixed, so a growing
+/// transcript never resizes it — which means it always covers far more desktop
+/// than the card does. Before this, `WS_EX_TRANSPARENT` made the *whole* window
+/// click-through, which fixed the desktop but also killed click-to-dismiss and
+/// put `WS_EX_LAYERED` on a swapchain window.
+fn apply_card_click_region(layout: Option<CardLayout>, ppp: f32) {
+    let hwnd = window_shape::preview_hwnd();
+    if hwnd == 0 {
+        return;
+    }
+    let region = match layout {
+        Some(layout) => {
+            let card = layout.card_rect();
+            window_shape::ClickRegion::RoundedRect {
+                rect_pt: [card.min.x, card.min.y, card.max.x, card.max.y],
+                radius_pt: CARD_RADIUS,
+            }
+        }
+        // Nothing drawn: the window is hidden, and a full rect would leave an
+        // invisible click blocker behind if it were ever shown again without a
+        // fresh layout.
+        None => window_shape::ClickRegion::Full,
+    };
+    window_shape::apply_click_region(
+        hwnd,
+        region,
+        [WINDOW_W, WINDOW_MAX_H],
+        ppp,
+    );
+}
+
 const TEXT_PAD_X: f32 = 20.0;
 const TEXT_PAD_Y: f32 = 12.0;
 const DOT_MARGIN: f32 = 28.0;
+
+/// How wide the transcript may be before it wraps, in points.
+///
+/// Deliberately narrower than the card's own inner width: the card is sized
+/// from the galley's actual width, so this is what keeps a long transcript
+/// from ever growing the card past [`CARD_MAX_W`] and being clipped by the
+/// window. `tests::transcript_is_drawn_inside_the_card` relies on it.
+pub fn card_text_wrap_width() -> f32 {
+    CARD_MAX_W - SHADOW_PAD * 2.0 - TEXT_PAD_X - DOT_MARGIN - 8.0
+}
 
 /// Anchors the window to the bottom centre of the screen, just above the
 /// Windows taskbar.
@@ -261,10 +346,7 @@ fn window_position(ppp: f32) -> [f32; 2] {
 fn paint_card(ui: &mut Ui, layout: &CardLayout, content: &mut CardContent) {
     let painter = ui.painter();
     let fade = content.fade_alpha;
-    let card = egui::Rect::from_min_size(
-        egui::pos2(layout.card_origin[0], layout.card_origin[1]),
-        egui::vec2(layout.card_w, layout.card_h),
-    );
+    let card = layout.card_rect();
 
     // 1. Soft ambient shadow, four layers of decreasing alpha.
     for i in 1..=4 {
@@ -272,7 +354,7 @@ fn paint_card(ui: &mut Ui, layout: &CardLayout, content: &mut CardContent) {
         let alpha = ((20.0 / (i as f32 * 1.5)) * fade) as u8;
         painter.rect_filled(
             card.expand(spread),
-            16.0 + spread * 0.4,
+            CARD_RADIUS + spread * 0.4,
             egui::Color32::from_black_alpha(alpha),
         );
     }
@@ -280,14 +362,14 @@ fn paint_card(ui: &mut Ui, layout: &CardLayout, content: &mut CardContent) {
     // 2. Glass body.
     painter.rect_filled(
         card,
-        16.0,
+        CARD_RADIUS,
         egui::Color32::from_rgba_premultiplied(18, 22, 34, (215.0 * fade) as u8),
     );
 
     // 3. Hairline border.
     painter.rect_stroke(
         card,
-        16.0,
+        CARD_RADIUS,
         egui::Stroke::new(
             1.0_f32,
             egui::Color32::from_rgba_premultiplied(255, 255, 255, (38.0 * fade) as u8),
@@ -322,21 +404,33 @@ fn paint_card(ui: &mut Ui, layout: &CardLayout, content: &mut CardContent) {
 
     // 6. Text, right-aligned for Persian, kept inside the card.
     //
-    // The galley was laid out at the card's *maximum* inner width, so it can
-    // only be wider than this card's inner width if the transcript grew after
-    // the card was sized. egui 0.28's `Galley` has no `truncate`, so instead of
-    // slicing it, the draw position is clamped to keep the aligned edge inside
-    // the card; `CentralPanel` clips the rest.
+    // `pos.x` is the galley's **anchor**, not its left edge. epaint anchors a
+    // `RIGHT`-aligned galley at its right edge, so `galley.rect.right() == 0.0`
+    // and every glyph position is negative
+    // (`epaint-0.28.1/src/text/text_layout_types.rs`, "Bounding rect"), which
+    // `Shape::galley` then translates by `pos` verbatim. Passing a left edge
+    // here therefore draws the whole transcript one galley-width to the left of
+    // the card, which is what "text outside the box" was.
+    //
+    // The width is safe by construction: the card is sized as the galley's own
+    // width plus `TEXT_PAD_X + DOT_MARGIN`, so the text starts exactly
+    // `TEXT_PAD_X` inside it. `card_text_rect` is what makes that an assertion
+    // rather than a hope.
     let text = content.text.clone();
-    let max_text_w = (card.width() - DOT_MARGIN - TEXT_PAD_X).max(1.0_f32);
     let text_pos = egui::pos2(
-        card.max.x - DOT_MARGIN - text.size().x.min(max_text_w),
+        card.max.x - DOT_MARGIN,
         card.min.y + TEXT_PAD_Y,
     );
     painter.galley(
         text_pos,
-        text,
+        text.clone(),
         egui::Color32::from_rgba_premultiplied(245, 248, 255, (235.0 * fade) as u8),
+    );
+    debug_assert!(
+        card.contains_rect(text_rect(text_pos, &text)),
+        "transcript drawn outside the card: {:?} not inside {:?}",
+        text_rect(text_pos, &text),
+        card
     );
 
     // 7. Countdown bar along the bottom edge.
@@ -377,6 +471,18 @@ fn paint_card(ui: &mut Ui, layout: &CardLayout, content: &mut CardContent) {
 mod tests {
     use super::*;
 
+    /// A context with fonts installed.
+    ///
+    /// `Context::fonts` panics with "No fonts available until first call to
+    /// `Context::run`" — the font set is built on the first frame, not on
+    /// construction — so any test that lays out a galley has to burn one empty
+    /// frame first.
+    fn test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        ctx
+    }
+
     #[test]
     fn card_window_does_not_ask_winit_for_transparency() {
         // This is the single line that produced the pale always-on-top box:
@@ -398,12 +504,125 @@ mod tests {
     #[test]
     fn card_window_does_not_block_the_desktop() {
         let builder = card_window_builder([0.0, 0.0], true);
-        assert_eq!(builder.mouse_passthrough, Some(true));
+        // `false`, not `true`: click-through is handled by a window **region**
+        // sized to the card, which leaves the card itself interactive. See
+        // `apply_card_click_region`.
+        assert_eq!(builder.mouse_passthrough, Some(false));
         assert!(
             !builder.decorations.unwrap_or(true),
             "a caption is a light band above the card"
         );
         assert_eq!(builder.resizable, Some(false));
+    }
+
+    /// The contract the whole text placement rests on: epaint anchors a
+    /// `RIGHT`-aligned galley at its **right** edge.
+    ///
+    /// If this ever stops holding, `paint_card` must start passing a left edge
+    /// — and until someone notices, the transcript renders outside the card
+    /// again. It is the single cheapest thing in the file to check and the
+    /// single easiest to get wrong.
+    #[test]
+    fn right_aligned_galley_is_anchored_at_its_right_edge() {
+        let ctx = test_ctx();
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "گزینه کارت آزمایشی",
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(13.5),
+                ..Default::default()
+            },
+        );
+        job.halign = egui::Align::RIGHT;
+        job.wrap = egui::text::TextWrapping::wrap_at_width(CARD_MAX_W);
+        let galley = ctx.fonts(|f| f.layout_job(job));
+
+        assert!(
+            galley.rect.right().abs() < 0.01,
+            "expected a right-anchored galley (rect.right() == 0), got {:?}",
+            galley.rect
+        );
+        assert!(galley.rect.min.x < -1.0, "a right-anchored galley extends leftwards");
+
+        // Which means painting at `anchor` draws it leftwards from there.
+        let anchor = egui::pos2(400.0, 10.0);
+        let drawn = text_rect(anchor, &galley);
+        assert!((drawn.max.x - 400.0).abs() < 0.01);
+        assert!(drawn.min.x < 400.0 - 1.0);
+    }
+
+    #[test]
+    fn transcript_is_drawn_inside_the_card() {
+        let ctx = test_ctx();
+        for body in [
+            "کارت",
+            "گزینه کارت آزمایشی را باز کن",
+            "یک متن بلند فارسی که حتما از حداکثر عرض کارت بیشتر می شود و باید بشکند و به چند خط تقسیم شود تا داخل کارت جا شود",
+        ] {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                body,
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(13.5),
+                    ..Default::default()
+                },
+            );
+            job.halign = egui::Align::RIGHT;
+            job.wrap = egui::text::TextWrapping::wrap_at_width(card_text_wrap_width());
+            let galley = ctx.fonts(|f| f.layout_job(job));
+            let size = galley.size();
+
+            let layout = CardLayout::new(size.x + TEXT_PAD_X + DOT_MARGIN, size.y + 30.0);
+            let card = layout.card_rect();
+            let anchor = egui::pos2(card.max.x - DOT_MARGIN, card.min.y + TEXT_PAD_Y);
+
+            let drawn = text_rect(anchor, &galley);
+            assert!(
+                card.contains_rect(drawn),
+                "{body:?}: text {:?} escaped the card {:?}",
+                drawn,
+                card
+            );
+            // The right edge is the edge that matters: the galley is
+            // `Align::RIGHT`, so it is anchored at `anchor` and grows leftwards.
+            // Asserting a constant left inset instead would only hold for text
+            // that happens to fill the card exactly — which is the bug, not the
+            // contract.
+            assert!(
+                (drawn.max.x - anchor.x).abs() < 0.01,
+                "{body:?}: text ends at {:?} but the anchor is {anchor:?}",
+                drawn.max.x
+            );
+            assert!(
+                card.max.x - drawn.max.x - DOT_MARGIN < 0.51,
+                "{body:?}: text does not end DOT_MARGIN inside the card"
+            );
+        }
+    }
+
+    #[test]
+    fn card_click_region_is_the_card_not_the_window() {
+        let layout = CardLayout::new(300.0, 60.0);
+        let card = layout.card_rect();
+        let region = window_shape::click_region_px(
+            window_shape::ClickRegion::RoundedRect {
+                rect_pt: [card.min.x, card.min.y, card.max.x, card.max.y],
+                radius_pt: CARD_RADIUS,
+            },
+            [WINDOW_W, WINDOW_MAX_H],
+            1.25,
+        )
+        .expect("a laid-out card always describes a real region");
+
+        let window_shape::ClickRegion::RoundedRect { rect_pt, .. } = region else {
+            panic!("expected a rounded rect, got {region:?}");
+        };
+        assert!(rect_pt[0] >= card.min.x - 0.51);
+        assert!(rect_pt[2] <= card.max.x + 0.51);
+        assert!(rect_pt[2] < WINDOW_W, "region must not cover the window");
+        assert!(rect_pt[3] < WINDOW_MAX_H, "region must not cover the window");
     }
 
     #[test]
