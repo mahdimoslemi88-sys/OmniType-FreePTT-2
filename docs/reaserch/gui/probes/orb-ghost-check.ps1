@@ -185,12 +185,33 @@ try {
         $hard = if ($s -gt 0) { ($lum[$s - 1] - $bg) -lt 30 } else { $false }
         $isOrb = $dist -lt 90               # the orb and its glow
 
-        if ($height -le 24 -and $hard -and -not $isOrb) {
+        # The artifact is an *arc of a circle* concentric with the orb, so the
+        # radius implied by its top edge and the radius implied by its bottom
+        # edge have to agree. A line of text, a toolbar or a scrollbar in the
+        # window behind does not, which is what keeps the probe honest when the
+        # orb happens to sit over a bright one.
+        $rTop = 0.0; $rBot = 0.0
+        foreach ($edge in @(@($s, 'top'), @($e, 'bot'))) {
+            $idx = $edge[0]; $y = $top + $idx
+            $d = $cy - $y
+            $half = 0
+            while (($cx - $half - 1) -ge 0) {
+                $c = $bmp.GetPixel($cx - $half - 1, $y)
+                if (($c.R + $c.G + $c.B) / 3.0 -le $cut) { break }
+                $half++
+            }
+            $rr = [Math]::Sqrt($d * $d + $half * $half)
+            if ($edge[1] -eq 'top') { $rTop = $rr } else { $rBot = $rr }
+        }
+        $isArc = [Math]::Abs($rTop - $rBot) -le 4.0
+
+        if ($height -ge 4 -and $height -le 24 -and $hard -and -not $isOrb -and $isArc) {
             $found += [pscustomobject]@{
-                Rows = "{0}..{1}" -f ($top + $s), ($top + $e)
-                Px   = $height
-                Dist = $dist
-                Rise = [int]($peak - $bg)
+                Rows   = "{0}..{1}" -f ($top + $s), ($top + $e)
+                Px     = $height
+                Dist   = $dist
+                Rise   = [int]($peak - $bg)
+                Radius = "{0:N1}/{1:N1}" -f $rTop, $rBot
             }
         }
     }
