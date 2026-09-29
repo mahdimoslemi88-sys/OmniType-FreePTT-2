@@ -454,8 +454,12 @@ pub fn run() -> Result<()> {
     // ---- GUI (main thread) ------------------------------------------------------
     let status_client = Arc::new(StatusClient::new(machine.subscribe()));
     let (icon_rgba, icon_w, icon_h) = gui::tray::app_icon_rgba();
-    // Zero-flash launch: generously sized native window with full padding for glow/ripples
-    let initial_side = 162.0_f32;
+    // Zero-flash launch: generously sized native window with full padding for glow/ripples.
+    // The side is the orb's *fixed* canvas (the largest it ever draws at), not
+    // the idle one: the window is created once at this size and never resized,
+    // because resizing a transparent always-on-top window strands the pixels the
+    // old rect covered (see `Orb::max_canvas_points`).
+    let initial_side = gui::orb::Orb::initial_side_points();
     let (init_x, init_y) = match (settings.gui.orb_position_x, settings.gui.orb_position_y) {
         (Some(x), Some(y)) => (
             x as f32 - initial_side * 0.5,

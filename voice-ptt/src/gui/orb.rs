@@ -59,7 +59,7 @@ impl Orb {
     /// `window_title` must match the overlay viewport title (used to find the HWND).
     /// `saved_center` = `(orb_position_x, orb_position_y)` from settings, if present.
     pub fn new(window_title: &str, saved_center: Option<(i32, i32)>) -> Self {
-        let idle_half = Self::canvas_side_points(1.0) * 0.5;
+        let idle_half = Self::max_canvas_points() * 0.5;
         let home = match saved_center {
             Some((x, y)) => win::clamp_center(Pos2::new(x as f32, y as f32), idle_half),
             None => win::primary_screen_center(),
@@ -78,6 +78,13 @@ impl Orb {
             audio_level: None,
             sent_side_pt: None,
         }
+    }
+
+    /// Initial window side: the fixed canvas from [`Orb::max_canvas_points`],
+    /// so the very first frame already has the final size and the window is
+    /// never resized afterwards.
+    pub fn initial_side_points() -> f32 {
+        Self::max_canvas_points()
     }
 
     /// Optional: hand over an HWND you already own instead of title lookup.
@@ -152,9 +159,18 @@ impl Orb {
             });
 
         let canvas_scale = self.update_canvas_scale();
-        let side_pt = Self::canvas_side_points(canvas_scale);
+        // The OS window is created ONCE, at the largest canvas the orb can ever
+        // reach, and never resized. Resizing a transparent always-on-top window
+        // leaves the pixels the old rect had covered on screen: dictation grows
+        // the window 203 -> 298 px and going idle shrinks it back, and every
+        // cycle stranded a full-width band above the orb (measured: 298x28 px,
+        // centred on the orb, in the exact rows the larger window used to own).
+        // The orb keeps animating inside a fixed, fully transparent canvas; only
+        // a drag moves the window.
+        let side_pt = Self::max_canvas_points();
         let side_px = (side_pt * ppp).ceil() as i32;
         self.window.place(self.anim.current_position, side_px);
+        debug_assert!(side_pt >= Self::canvas_side_points(canvas_scale));
         // phase 1: only resize when the canvas actually changed.
         if self.sent_side_pt != Some(side_pt) {
             self.sent_side_pt = Some(side_pt);
@@ -257,6 +273,13 @@ impl Orb {
 
     fn canvas_side_points(scale: f32) -> f32 {
         BASE_DIAMETER * scale * CANVAS_FACTOR + CANVAS_PADDING * 2.0
+    }
+
+    /// Fixed window side in points: the canvas at the biggest scale the orb ever
+    /// reaches (`Recording`). Sizing the window to this once, instead of tracking
+    /// the animated scale, is what keeps the window from ever being resized.
+    fn max_canvas_points() -> f32 {
+        Self::canvas_side_points(OrbMode::Recording.target_scale())
     }
 
     fn repaint_interval(&self, mode: OrbMode) -> Duration {
@@ -617,7 +640,7 @@ mod win {
         pub fn set_raw(&mut self, raw: isize) {
             if self.raw != raw && raw != 0 {
                 #[cfg(windows)]
-                crate::gui::overlay::enable_true_transparency(raw);
+                crate::gui::window_shape::enable_true_transparency(raw);
             }
             self.raw = raw;
             self.last = None;
@@ -625,11 +648,11 @@ mod win {
 
         fn hwnd(&mut self) -> Option<HWND> {
             if self.raw == 0 {
-                let main = crate::gui::overlay::MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+                let main = crate::gui::window_shape::MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
                 if main != 0 {
                     self.raw = main;
                     #[cfg(windows)]
-                    crate::gui::overlay::enable_true_transparency(self.raw);
+                    crate::gui::window_shape::enable_true_transparency(self.raw);
                 } else {
                     // phase 1: the title-based fallback is disabled. The main window
                     // is created with an empty title (`with_title("")`), so this
@@ -642,7 +665,7 @@ mod win {
                     //     if !h.0.is_null() {
                     //         self.raw = h.0 as isize;
                     //         #[cfg(windows)]
-                    //         crate::gui::overlay::enable_true_transparency(self.raw);
+                    //         crate::gui::window_shape::enable_true_transparency(self.raw);
                     //     }
                     // }
                 }
@@ -677,14 +700,14 @@ mod win {
                 // previous position unless it is erased — those leftovers are
                 // what looked like nested window frames piling up.
                 #[cfg(windows)]
-                crate::gui::overlay::force_repaint(self.raw);
+                crate::gui::window_shape::force_repaint(self.raw);
             } else {
                 self.raw = 0; // window recreated? resolve again next frame
                 self.last = None;
                 // phase 1: let the overlay re-resolve the real handle if this one
                 // is gone (the OS window can be recreated for the main viewport).
                 #[cfg(windows)]
-                crate::gui::overlay::invalidate_main_hwnd();
+                crate::gui::window_shape::invalidate_main_hwnd();
             }
         }
     }

@@ -17,6 +17,10 @@ use crate::asr::engine::AsrHealth;
 use crate::asr::router::AsrRouter;
 use crate::config::settings::{CustomProvider, Settings};
 use crate::gui::orb::{Orb, OrbMode};
+use crate::gui::preview_window;
+use crate::gui::window_shape::{
+    enforce_frameless_window, local_time_str, register_main_hwnd, true_screen_size_px, MAIN_HWND,
+};
 use crate::hotkey::binding::HotkeyBinding;
 use crate::hotkey::{CaptureOutcome, HotkeyConfig, HotkeyControl, HotkeyEvent};
 use crate::processing::Dictionary;
@@ -907,468 +911,6 @@ pub enum VisualMode {
     Processing,
 }
 
-#[cfg(windows)]
-#[repr(C)]
-struct WinMargins {
-    cx_left: i32,
-    cx_right: i32,
-    cy_top: i32,
-    cy_bottom: i32,
-}
-
-#[cfg(windows)]
-#[link(name = "user32")]
-extern "system" {
-    fn SystemParametersInfoW(
-        ui_action: u32,
-        ui_param: u32,
-        pv_param: *mut windows::Win32::Foundation::RECT,
-        f_win_ini: u32,
-    ) -> i32;
-    fn SetWindowPos(
-        hwnd: isize,
-        hwnd_insert_after: isize,
-        x: i32,
-        y: i32,
-        cx: i32,
-        cy: i32,
-        flags: u32,
-    ) -> i32;
-    fn RedrawWindow(
-        hwnd: isize,
-        lprc_update: *const std::ffi::c_void,
-        hrgn_update: isize,
-        flags: u32,
-    ) -> i32;
-}
-
-/// `RDW_*` flags for [`RedrawWindow`].
-///
-/// phase 3.3: `RDW_ERASE` and `RDW_FRAME` are deliberately **not** set. With the
-/// DWM frame extended into the whole client area (that is how this window gets
-/// per-pixel alpha), `RDW_FRAME` asks DWM to repaint that "non-client" region —
-/// which is the entire window — and it lands there as a *light* layer: the orb
-/// then had a pale-blue bar above it and the transcript card a white box around
-/// it. We only want the app itself to redraw: invalidate and update.
-#[cfg(windows)]
-const RDW_FORCE_REPAINT: u32 = 0x0001 /* INVALIDATE */
-    | 0x0020 /* ALLCHILDREN */
-    | 0x0100 /* UPDATENOW */;
-
-#[cfg(windows)]
-#[link(name = "dwmapi")]
-extern "system" {
-    fn DwmExtendFrameIntoClientArea(hwnd: isize, p_mar_inset: *const WinMargins) -> i32;
-    fn DwmSetWindowAttribute(
-        hwnd: isize,
-        dw_attribute: u32,
-        pv_attribute: *const std::ffi::c_void,
-        cb_attribute: u32,
-    ) -> i32;
-}
-
-#[cfg(windows)]
-pub fn enable_true_transparency(hwnd: isize) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        WS_BORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-        WS_THICKFRAME,
-    };
-
-    let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
-    unsafe {
-        // 1. Strip non-client styles (caption, thickframe, min/max buttons, sysmenu, borders) FIRST
-        let cur_style = GetWindowLongW(win_hwnd, GWL_STYLE);
-        let stripped = (cur_style as u32
-            & !(WS_CAPTION.0
-                | WS_THICKFRAME.0
-                | WS_MINIMIZEBOX.0
-                | WS_MAXIMIZEBOX.0
-                | WS_SYSMENU.0
-                | WS_BORDER.0
-                | 0x0080_0000 /* WS_DLGFRAME */))
-            | WS_POPUP.0;
-        let _ = SetWindowLongW(win_hwnd, GWL_STYLE, stripped as i32);
-
-        // 2. Strip extended styles (sunken/raised edges, static edges, dialog frame)
-        let cur_ex = GetWindowLongW(win_hwnd, GWL_EXSTYLE);
-        let stripped_ex = cur_ex as u32
-            & !(0x0000_0100 /* WS_EX_WINDOWEDGE */
-                | 0x0000_0200 /* WS_EX_CLIENTEDGE */
-                | 0x0002_0000 /* WS_EX_STATICEDGE */
-                | 0x0000_0001 /* WS_EX_DLGMODALFRAME */);
-        let _ = SetWindowLongW(win_hwnd, GWL_EXSTYLE, stripped_ex as i32);
-
-        // 3. Clear window title string from OS window so Windows never renders "OmniType"
-        // phase 1: the window title is never cleared any more. Clearing it made
-        // this window indistinguishable from winit's internal event-target
-        // window and the tray-icon message window (all three ended up
-        // title-less), which is how the wrong window got captured above.
-        // let _ = SetWindowTextW(win_hwnd, windows::core::w!(""));
-
-        // 4. DWMWA_NCRENDERING_POLICY = 2, DWMNCRP_DISABLED = 1
-        // Disables non-client area rendering and window drop shadow
-        let ncrp_disabled: u32 = 1;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            2,
-            &ncrp_disabled as *const _ as *const std::ffi::c_void,
-            4,
-        );
-
-        // 5. DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_DONOTROUND = 1
-        // Prevents Windows 11 from rounding window corners
-        let corner_donotround: u32 = 1;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            33,
-            &corner_donotround as *const _ as *const std::ffi::c_void,
-            4,
-        );
-
-        // 6. DWMWA_BORDER_COLOR = 34, DWMWA_COLOR_NONE = 0xFFFFFFFE
-        // Removes any default window border color
-        let border_none: u32 = 0xFFFF_FFFE;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            34,
-            &border_none as *const _ as *const std::ffi::c_void,
-            4,
-        );
-
-        // 7. DWMWA_SYSTEMBACKDROP_TYPE = 38, DWMSBT_NONE = 1
-        // Disables acrylic and mica frosted glass so the background is 100% transparent
-        let backdrop_none: u32 = 1;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            38,
-            &backdrop_none as *const _ as *const std::ffi::c_void,
-            4,
-        );
-
-        // 8. Extend DWM frame completely into client area for per-pixel hardware alpha
-        let margins = WinMargins {
-            cx_left: -1,
-            cx_right: -1,
-            cy_top: -1,
-            cy_bottom: -1,
-        };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-
-        // 9. Force window manager to discard cached frame decorations
-        let _ = SetWindowPos(
-            win_hwnd,
-            HWND(std::ptr::null_mut()),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-
-        // phase 3.3: no manual erase here. `RDW_ERASE`/`RDW_FRAME` made DWM paint
-        // the extended-frame region (i.e. the whole window) in a light colour,
-        // which showed up as pale bars/boxes over the orb and the transcript
-        // card. The `SWP_FRAMECHANGED` above already recalculates the frame, and
-        // egui repaints the window every frame anyway.
-        // (rollback: RedrawWindow(hwnd, std::ptr::null(), 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME))
-    }
-}
-
-/// True when the OS window already has the shaper's target style: a frameless
-/// popup with no raised/sunken/dialog edge.
-#[cfg(windows)]
-fn window_style_is_shaped(style: i32, ex: i32) -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        WS_BORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
-    };
-    const WS_DLGFRAME: u32 = 0x0080_0000;
-    const WS_EX_WINDOWEDGE: u32 = 0x0000_0100;
-    const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
-    const WS_EX_STATICEDGE: u32 = 0x0002_0000;
-    const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
-
-    let s = style as u32;
-    let e = ex as u32;
-    let framed = s
-        & (WS_CAPTION.0
-            | WS_THICKFRAME.0
-            | WS_MINIMIZEBOX.0
-            | WS_MAXIMIZEBOX.0
-            | WS_SYSMENU.0
-            | WS_BORDER.0
-            | WS_DLGFRAME)
-        != 0;
-    let not_popup = s & WS_POPUP.0 == 0;
-    let edged = e & (WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_DLGMODALFRAME) != 0;
-    !(framed || not_popup || edged)
-}
-
-/// Cheap per-frame guard: keeps a window frameless for as long as it lives.
-///
-/// Two `GetWindowLongW` reads per call, and the expensive path (styles + DWM
-/// attributes + full repaint) only runs when the OS has actually drifted. Drift
-/// is real and reproducible: winit re-applies its window attributes on a few
-/// paths — minimize/restore is the one the user hit — which puts `WS_CAPTION`
-/// and the frame right back, and the orb then shows a normal Windows title bar.
-///
-/// Returns `true` when a repair happened, so the caller can log it.
-#[cfg(windows)]
-pub fn enforce_frameless_window(hwnd: isize) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GWL_EXSTYLE, GWL_STYLE};
-    if hwnd == 0 {
-        return false;
-    }
-    let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
-    let style = unsafe { GetWindowLongW(win_hwnd, GWL_STYLE) };
-    let ex = unsafe { GetWindowLongW(win_hwnd, GWL_EXSTYLE) };
-    if window_style_is_shaped(style, ex) {
-        return false;
-    }
-    enable_true_transparency(hwnd);
-    true
-}
-
-/// True screen dimensions in physical pixels. Used to center the dashboard
-/// viewport: inside a child viewport, `ctx.screen_rect()` returns the *parent*
-/// viewport's rect (the tiny capsule), not the monitor, so positioning from it
-/// pins the dashboard to the capsule's corner.
-#[cfg(windows)]
-fn true_screen_size_px() -> Option<(i32, i32)> {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-    unsafe { Some((GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))) }
-}
-
-#[cfg(not(windows))]
-fn true_screen_size_px() -> Option<(i32, i32)> {
-    None
-}
-
-#[cfg(windows)]
-pub(crate) static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-
-/// Bumped every time a new transcript bubble appears.
-///
-/// phase 3.2: no longer read — the preview window is now drift-checked every
-/// frame (`shape_preview_window`) instead of shaped once per generation. Kept
-/// for the rollback path documented there.
-#[cfg(windows)]
-#[allow(dead_code)]
-static PREVIEW_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Erases and repaints a window right now.
-///
-/// Called after moving a transparent window: without it the pixels of the old
-/// position stay on screen and successive moves pile up as the "nested window
-/// frames" the user saw.
-#[cfg(windows)]
-pub fn force_repaint(hwnd: isize) {
-    if hwnd != 0 {
-        let _ = unsafe { RedrawWindow(hwnd, std::ptr::null(), 0, RDW_FORCE_REPAINT) };
-    }
-}
-
-#[cfg(windows)]
-pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, _corner_px: i32) {
-    use windows::Win32::Foundation::RECT;
-
-    let mut work_area = RECT::default();
-    let ok = unsafe { SystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, &mut work_area, 0) };
-    if ok != 0 {
-        let center_x = (work_area.left + work_area.right) / 2;
-        let taskbar_top = work_area.bottom;
-
-        let left = center_x - width_px / 2;
-        let top = taskbar_top - height_px - 8; // 8 physical pixels above the taskbar
-
-        unsafe {
-            // SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040
-            SetWindowPos(hwnd, -1 /* HWND_TOPMOST */, left, top, width_px, height_px, 0x0010 | 0x0040);
-        }
-        enable_true_transparency(hwnd);
-    }
-}
-
-#[cfg(windows)]
-fn taskbar_bottom_center_pt(win_w_pt: f32, win_h_pt: f32, ppp: f32) -> (f32, f32) {
-    use windows::Win32::Foundation::RECT;
-
-    let mut work_area = RECT::default();
-    let ok = unsafe { SystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, &mut work_area, 0) };
-    if ok != 0 {
-        let center_x = (work_area.left + work_area.right) / 2;
-        let taskbar_top = work_area.bottom;
-
-        let px_w = (win_w_pt * ppp).round() as i32;
-        let px_h = (win_h_pt * ppp).round() as i32;
-
-        let left = center_x - px_w / 2;
-        let top = taskbar_top - px_h - 16; // 16 physical pixels above taskbar
-        (left as f32 / ppp, top as f32 / ppp)
-    } else {
-        let (sw, sh) = true_screen_size_px().unwrap_or((1920, 1080));
-        let sw_pt = sw as f32 / ppp;
-        let sh_pt = sh as f32 / ppp;
-        ((sw_pt - win_w_pt) * 0.5, sh_pt - win_h_pt - 48.0)
-    }
-}
-
-#[cfg(not(windows))]
-fn taskbar_bottom_center_pt(win_w_pt: f32, win_h_pt: f32, _ppp: f32) -> (f32, f32) {
-    (500.0, 800.0)
-}
-
-#[cfg(windows)]
-fn local_time_str() -> String {
-    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
-}
-
-#[cfg(not(windows))]
-fn local_time_str() -> String {
-    "00:00:00".to_string()
-}
-
-#[cfg(windows)]
-/// LEGACY (phase 1) — kept in the tree, uncalled, as a rollback path.
-///
-/// It resolved the app window by *title* across every window of the UI thread.
-/// winit's internal "Winit Thread Event Target" window and the tray-icon
-/// message window are *also* title-less, so they were treated as the app window:
-/// `MAIN_HWND` was overwritten with whichever window matched last (enumeration
-/// order is z-order, so "last" is effectively arbitrary) and `OrbWindow::place()`
-/// then moved/resized *that* window onto the orb on every frame, leaving the
-/// frozen "ghost" rectangles that accumulated with each dictation.
-///
-/// Evidence and the verification probe: `docs/GUI-BUGFIX-PLAN.md` §1-1 and
-/// `docs/reaserch/gui/probes/window-probe.ps1`.
-#[allow(dead_code)]
-fn apply_window_shapes_all_legacy() {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumThreadWindows, GetWindowTextLengthW, GetWindowTextW,
-    };
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-        let len = GetWindowTextLengthW(hwnd);
-        let mut buf = vec![0u16; (len + 1) as usize];
-        let actual = GetWindowTextW(hwnd, &mut buf);
-        let title = String::from_utf16_lossy(&buf[..actual as usize]);
-
-        if title.is_empty() || title == "OmniType" {
-            MAIN_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
-            enable_true_transparency(hwnd.0 as isize);
-        } else if title.contains("OmniType_Preview") {
-            enable_true_transparency(hwnd.0 as isize);
-        }
-        BOOL(1)
-    }
-
-    unsafe {
-        let thread_id = GetCurrentThreadId();
-        let _ = EnumThreadWindows(thread_id, Some(enum_proc), LPARAM(0));
-    }
-}
-
-/// Resolves and registers the **real** main window handle exactly once, straight
-/// from eframe's own raw platform window handle ([`eframe::Frame`] implements
-/// `raw_window_handle::HasWindowHandle`), then applies the alpha shaping to it.
-///
-/// Returns `true` when a handle was registered on this call.
-///
-/// This replaces title-based picking entirely: no thread-wide enumeration, no
-/// window ever has its title cleared or its styles stripped unless it is the
-/// window eframe hands us for the main viewport.
-#[cfg(windows)]
-pub fn register_main_hwnd(frame: &eframe::Frame) -> bool {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let Ok(handle) = frame.window_handle() else {
-        return false;
-    };
-    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return false;
-    };
-    let hwnd: isize = win32.hwnd.get();
-    if hwnd == 0 {
-        return false;
-    }
-    // phase 3.2: compare instead of "only when empty". winit can recreate the OS
-    // window (minimize/restore, DPI change); the cached handle then pointed at a
-    // dead window, the *new* one was never shaped, and it came up as a normal
-    // captioned window — one more "frame" on screen every time.
-    let previous = MAIN_HWND.swap(hwnd, std::sync::atomic::Ordering::Relaxed);
-    if previous == hwnd {
-        return false;
-    }
-    enable_true_transparency(hwnd);
-    if previous == 0 {
-        tracing::info!(hwnd, "main window handle registered from eframe's raw window handle");
-    } else {
-        tracing::warn!(
-            hwnd,
-            previous,
-            "main window handle changed; re-shaped the new OS window"
-        );
-    }
-    true
-}
-
-/// Drops the cached main-window handle so [`register_main_hwnd`] resolves it
-/// again. Called when a `SetWindowPos` on it fails, i.e. the OS window is gone
-/// (it can be recreated when the main viewport is reopened).
-#[cfg(windows)]
-pub fn invalidate_main_hwnd() {
-    MAIN_HWND.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Keeps the transcript preview host window framed correctly — matched by its
-/// **own** title (`OmniType_Preview`), never by "empty title", so no unrelated
-/// window can be captured.
-///
-/// phase 3.2: this used to run **once per bubble generation** (an optimisation
-/// against DWM churn). That was too clever: the preview window is a fresh OS
-/// window per bubble and winit applies its own attributes shortly after
-/// creation, so a one-shot shape could be overwritten and the bubble showed a
-/// caption again. `enforce_frameless_window` is a drift check (two cheap reads),
-/// so running it per frame costs nothing while the bubble is visible and the
-/// expensive path only runs when the window really drifted.
-/// (rollback: the generation guard is kept, commented, below.)
-#[cfg(windows)]
-pub fn shape_preview_window() {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumThreadWindows, GetWindowTextLengthW, GetWindowTextW,
-    };
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-        let len = GetWindowTextLengthW(hwnd);
-        let mut buf = vec![0u16; (len + 1) as usize];
-        let actual = GetWindowTextW(hwnd, &mut buf);
-        let title = String::from_utf16_lossy(&buf[..actual as usize]);
-        if title.contains("OmniType_Preview") && enforce_frameless_window(hwnd.0 as isize) {
-            tracing::debug!(hwnd = hwnd.0 as isize, "preview window re-stripped");
-        }
-        BOOL(1)
-    }
-
-    unsafe {
-        let thread_id = GetCurrentThreadId();
-        let _ = EnumThreadWindows(thread_id, Some(enum_proc), LPARAM(0));
-    }
-    // phase 3.2 (rollback): shape once per bubble generation instead of per frame.
-    // static SHAPED_GENERATION: std::sync::atomic::AtomicU64 =
-    //     std::sync::atomic::AtomicU64::new(u64::MAX);
-    // if SHAPED_GENERATION.load(std::sync::atomic::Ordering::Relaxed) == generation {
-    //     return;
-    // }
-    // SHAPED_GENERATION.store(generation, std::sync::atomic::Ordering::Relaxed);
-}
 
 /// Paints a Phosphor microphone icon inside `rect` (replaces the hand-drawn vector mic).
 #[allow(dead_code)]
@@ -3911,13 +3453,13 @@ impl OverlayApp {
             || self.dashboard_needs_shape
     }
 
-    /// Shows the toast preview window. The OS window itself is a bare glass
-    /// host (`OmniType_Preview`, so DWM corner clipping keeps working); the
-    /// notifications inside are fully managed by `egui_notify::Toasts` —
-    /// slide-in animation, dark card, live countdown, progress bar and ✕.
+    /// Shows the transcript card, or hides it when there is no bubble.
+    ///
+    /// The OS window is owned by [`crate::gui::preview_window`], which creates it
+    /// once and then only ever shows/hides it. This function decides *what* to
+    /// show; the module decides *how* the window is kept alive. See that
+    /// module's docs for why a per-bubble window was the bug.
     fn render_preview_toast_window(&mut self, ctx: &egui::Context) {
-        // phase 2: the bubble is independent of the orb and can be turned off
-        // entirely with `gui.show_transcript_bubble = false`.
         let bubble_enabled = self
             .settings
             .read()
@@ -3925,7 +3467,7 @@ impl OverlayApp {
             .unwrap_or(true);
         let now = Instant::now();
 
-        // Expire finished transcripts
+        // Expire finished transcripts, oldest first.
         while let Some((_, _, shown_at, total_secs)) = self.live_toasts.front() {
             if now.duration_since(*shown_at) >= Duration::from_secs(*total_secs) {
                 self.live_toasts.pop_front();
@@ -3936,197 +3478,69 @@ impl OverlayApp {
         if !bubble_enabled {
             // Disabled: drop queued bubbles instead of leaving them pending.
             self.live_toasts.clear();
-            return;
-        }
-        if self.live_toasts.is_empty() {
-            return;
-        }
-
-        // Active transcript entry
-        let (_, ref text, shown_at, total_secs) = *self.live_toasts.back().unwrap();
-        let elapsed = now.duration_since(shown_at).as_secs_f32();
-        let total = total_secs as f32;
-
-        let fade_in = (elapsed / 0.35).clamp(0.0, 1.0);
-        let fade_out = ((total - elapsed) / 0.8).clamp(0.0, 1.0);
-        let fade_alpha = (fade_in * fade_out).clamp(0.0, 1.0);
-
-        if fade_alpha <= 0.001 {
-            return;
         }
 
         let ppp = ctx.pixels_per_point();
+        let mut content = self
+            .live_toasts
+            .back()
+            .map(|(_, text, shown_at, total_secs)| build_card_content(ctx, text, *shown_at, *total_secs, now));
 
-        // Persian shaped typography with graceful dynamic wrapping and sizing
-        let formatted = format_persian_display(text);
-        let font_id = egui::FontId::proportional(13.5);
-        let max_text_w = 340.0_f32;
+        // Reported unconditionally, including when there is no bubble: the
+        // viewport has to stay in egui's output every frame or eframe will tear
+        // the window down, and a torn-down-but-not-yet-destroyed window is the
+        // pale, click-stealing box this replaces.
+        preview_window::report_window(ctx, content.as_mut(), ppp);
 
-        let mut layout_job = egui::text::LayoutJob::single_section(
-            formatted.clone(),
-            egui::text::TextFormat {
-                font_id: font_id.clone(),
-                color: egui::Color32::from_rgba_premultiplied(
-                    245, 248, 255, (235.0 * fade_alpha) as u8,
-                ),
-                ..Default::default()
-            },
-        );
-        layout_job.wrap = egui::text::TextWrapping::wrap_at_width(max_text_w);
-        layout_job.halign = egui::Align::RIGHT;
-        let galley = ctx.fonts(|f| f.layout_job(layout_job));
-        let text_size = galley.size();
-
-        let shadow_pad = 16.0_f32;
-        let pad_x = 20.0_f32;
-        let pad_y = 12.0_f32;
-        let dot_margin = 28.0_f32;
-
-        let bubble_w = (text_size.x + pad_x + dot_margin).clamp(240.0, 420.0);
-        let bubble_h = (text_size.y + pad_y * 2.0 + 6.0).max(48.0);
-
-        let win_w = bubble_w + shadow_pad * 2.0;
-        let win_h = bubble_h + shadow_pad * 2.0;
-
-        // Position: anchor cleanly at bottom center of screen, right above Windows taskbar
-        let (pos_x, pos_y) = taskbar_bottom_center_pt(win_w, win_h, ppp);
-
-        let mut dismiss = false;
-        let current_elapsed = elapsed;
-        let current_total = total;
-        let bubble_galley = galley.clone();
-
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("preview_toast_viewport"),
-            egui::ViewportBuilder::default()
-                .with_title("OmniType_Preview")
-                .with_position([pos_x, pos_y])
-                .with_inner_size([win_w, win_h])
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_always_on_top()
-                .with_resizable(false),
-            move |toast_ctx, _class| {
-                // phase 1: shape *this* preview window only (matched by its own
-                // title), once per bubble — never the thread's other windows.
-                #[cfg(windows)]
-                shape_preview_window();
-
-                let mut transparent_visuals = egui::Visuals::dark();
-                transparent_visuals.panel_fill = egui::Color32::TRANSPARENT;
-                transparent_visuals.window_fill = egui::Color32::TRANSPARENT;
-                transparent_visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
-                toast_ctx.set_visuals(transparent_visuals);
-
-                toast_ctx.request_repaint_after(Duration::from_millis(16));
-
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
-                    .show(toast_ctx, |ui| {
-                        let painter = ui.painter();
-                        let card_rect = egui::Rect::from_min_size(
-                            egui::pos2(shadow_pad, shadow_pad),
-                            egui::vec2(bubble_w, bubble_h),
-                        );
-
-                        // 1. Soft multi-layered transparent ambient shadow falloff (no hard rectangle edges)
-                        for i in 1..=4 {
-                            let sp = i as f32 * 3.5;
-                            let shadow_rect = card_rect.expand(sp);
-                            let a = ((20.0 / (i as f32 * 1.5)) * fade_alpha) as u8;
-                            painter.rect_filled(
-                                shadow_rect,
-                                16.0 + sp * 0.4,
-                                egui::Color32::from_black_alpha(a),
-                            );
-                        }
-
-                        // 2. Frosted glass body with deep translucent night tint
-                        let glass_fill = egui::Color32::from_rgba_premultiplied(
-                            18, 22, 34, (215.0 * fade_alpha) as u8,
-                        );
-                        painter.rect_filled(card_rect, 16.0, glass_fill);
-
-                        // 3. Delicate translucent glass border
-                        let border_stroke = egui::Stroke::new(
-                            1.0_f32,
-                            egui::Color32::from_rgba_premultiplied(
-                                255, 255, 255, (38.0 * fade_alpha) as u8,
-                            ),
-                        );
-                        painter.rect_stroke(card_rect, 16.0, border_stroke);
-
-                        // 4. Subtle specular highlight line along top inner rim
-                        let sheen_y = card_rect.min.y + 1.2;
-                        painter.line_segment(
-                            [
-                                egui::pos2(card_rect.min.x + 24.0, sheen_y),
-                                egui::pos2(card_rect.max.x - 24.0, sheen_y),
-                            ],
-                            egui::Stroke::new(
-                                1.0_f32,
-                                egui::Color32::from_rgba_premultiplied(
-                                    255, 255, 255, (48.0 * fade_alpha) as u8,
-                                ),
-                            ),
-                        );
-
-                        // 5. Mint glowing status indicator cue
-                        let dot_center = egui::pos2(card_rect.max.x - 18.0, card_rect.min.y + 18.0);
-                        painter.circle_filled(
-                            dot_center,
-                            5.5,
-                            egui::Color32::from_rgba_premultiplied(52, 211, 153, (55.0 * fade_alpha) as u8),
-                        );
-                        painter.circle_filled(
-                            dot_center,
-                            2.5,
-                            egui::Color32::from_rgba_premultiplied(52, 211, 153, (230.0 * fade_alpha) as u8),
-                        );
-
-                        // 6. Persian shaped typography with graceful dynamic layout
-                        let text_pos = egui::pos2(
-                            card_rect.max.x - dot_margin - text_size.x,
-                            card_rect.min.y + pad_y,
-                        );
-                        let text_color = egui::Color32::from_rgba_premultiplied(
-                            245, 248, 255, (235.0 * fade_alpha) as u8,
-                        );
-                        painter.galley(text_pos, bubble_galley, text_color);
-
-                        // 7. Subtle bottom progress indicator
-                        let remaining_ratio = ((current_total - current_elapsed) / current_total).clamp(0.0, 1.0);
-                        let bar_y = card_rect.max.y - 1.5;
-                        let bar_w = (card_rect.width() - 32.0) * remaining_ratio;
-                        painter.line_segment(
-                            [
-                                egui::pos2(card_rect.min.x + 16.0, bar_y),
-                                egui::pos2(card_rect.min.x + 16.0 + bar_w, bar_y),
-                            ],
-                            egui::Stroke::new(
-                                1.5_f32,
-                                egui::Color32::from_rgba_premultiplied(
-                                    52, 211, 153, (130.0 * fade_alpha) as u8,
-                                ),
-                            ),
-                        );
-
-                        // Click anywhere on card to dismiss
-                        let resp = ui.interact(
-                            card_rect,
-                            egui::Id::new("transcript_bubble_hit"),
-                            egui::Sense::click(),
-                        );
-                        if resp.clicked() {
-                            dismiss = true;
-                        }
-                    });
-            },
-        );
-
-        if dismiss {
+        if content.as_ref().is_some_and(|c| c.dismissed) {
             self.live_toasts.clear();
         }
+    }
+}
+
+/// Lays out one bubble and computes its fade.
+///
+/// Fades in over 0.35 s and out over the last 0.8 s, so a bubble that is
+/// replaced by a newer one does not pop.
+fn build_card_content(
+    ctx: &egui::Context,
+    text: &str,
+    shown_at: Instant,
+    total_secs: u64,
+    now: Instant,
+) -> preview_window::CardContent {
+    let elapsed = now.duration_since(shown_at).as_secs_f32();
+    let total = total_secs as f32;
+    let fade_in = (elapsed / 0.35).clamp(0.0, 1.0);
+    let fade_out = ((total - elapsed) / 0.8).clamp(0.0, 1.0);
+    let fade_alpha = (fade_in * fade_out).clamp(0.0, 1.0);
+
+    let formatted = format_persian_display(text);
+    let mut layout_job = egui::text::LayoutJob::single_section(
+        formatted,
+        egui::text::TextFormat {
+            font_id: egui::FontId::proportional(13.5),
+            color: egui::Color32::from_rgba_premultiplied(245, 248, 255, (235.0 * fade_alpha) as u8),
+            ..Default::default()
+        },
+    );
+    // Wrap at the card's inner width so a long transcript breaks into lines
+    // instead of being clipped at the window edge.
+    layout_job.wrap = egui::text::TextWrapping::wrap_at_width(
+        preview_window::CARD_MAX_W - preview_window::SHADOW_PAD * 2.0 - 56.0,
+    );
+    layout_job.halign = egui::Align::RIGHT;
+
+    let galley = ctx.fonts(|f| f.layout_job(layout_job));
+    let size = galley.size();
+
+    preview_window::CardContent {
+        text: galley,
+        text_size: [size.x, size.y],
+        fade_alpha,
+        elapsed_secs: elapsed,
+        total_secs: total,
+        dismissed: false,
     }
 }
 
@@ -4381,11 +3795,6 @@ impl eframe::App for OverlayApp {
                 self.next_toast_seq += 1;
                 self.live_toasts
                     .push_back((seq, trimmed.to_string(), now, TOAST_TOTAL_SECS));
-
-                // phase 1: a new bubble means a new preview OS window, so its
-                // alpha shaping has to run once more (see `shape_preview_window`).
-                #[cfg(windows)]
-                PREVIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 // Dark OmniType card: near-white caption with a live 10 s
                 // countdown footer, accent mic glyph, progress bar, ✕.

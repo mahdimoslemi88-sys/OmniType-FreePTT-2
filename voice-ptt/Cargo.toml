@@ -65,6 +65,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_Graphics_Dwm",
+    # HRGN, needed by the DWM_BLURBEHIND struct (see
+    # window_shape::disable_winit_blur_behind).
+    "Win32_Graphics_Gdi",
 ] }
 
 # Raw platform window handle: lets the overlay ask eframe for the *real* main
