@@ -7,6 +7,7 @@ pub mod downloader;
 pub mod engine;
 pub mod google;
 pub mod progress;
+pub mod plan;
 pub mod quota;
 pub mod router;
 pub mod whisper;

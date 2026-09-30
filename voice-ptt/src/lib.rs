@@ -100,6 +100,14 @@ mod single_instance {
     }
 }
 
+/// Whether the cloud API key came from the environment rather than the config
+/// file. Read once, at the edge, so the engine planner stays pure and testable.
+fn cloud_key_in_env() -> bool {
+    std::env::var("VOICE_PTT_CLOUD_KEY")
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Progress callback that logs download status.
 fn log_progress(phase: &'static str) -> impl Fn(u64, Option<u64>) {
     move |done, total| match total {
@@ -279,9 +287,19 @@ pub fn run() -> Result<()> {
 
     // Engine priority: cloud first (if configured with API key), then Google Free Speech
     // (no key needed, fast online), custom providers, then local whisper as the always-available fallback.
+    // Which engines exist, in what order, is decided by `asr::plan`: a pure
+    // function over the settings with its own unit tests, instead of sixty
+    // lines of interleaved logging and `push` that nothing could check. The
+    // environment read it needs happens here, at the one place that may touch
+    // the environment.
+    let plan = asr::plan::engine_plan(&settings, cloud_key_in_env());
+    let want_cloud = plan.cloud_provider().is_some();
+    let want_custom: Vec<String> = plan.custom_ids().iter().map(|s| s.to_string()).collect();
+    let want_antigravity = plan.wants_antigravity_probe();
+
     let usage_path = paths::resolve_usage_path();
     let mut engines: Vec<Arc<dyn asr::AsrEngine>> = Vec::new();
-    if settings.cloud.is_configured() {
+    if want_cloud {
         tracing::info!(
             provider = %settings.cloud.provider,
             model = %settings.cloud.model,
@@ -308,6 +326,10 @@ pub fn run() -> Result<()> {
 
     // Register user-defined custom cloud / local API endpoints
     for custom in &settings.custom_providers {
+        // The plan is the single source of truth for which providers exist.
+        if !want_custom.iter().any(|id| id == &custom.id) {
+            continue;
+        }
         tracing::info!(
             id = %custom.id,
             name = %custom.name,
@@ -325,7 +347,7 @@ pub fn run() -> Result<()> {
     // command line). It never outranks the engines above in auto mode — select
     // «Antigravity Live» explicitly, or let auto fall through to it.
     let mut antigravity_probe: Option<Arc<asr::AntigravityEngine>> = None;
-    if settings.antigravity.enabled {
+    if want_antigravity {
         let antigravity = Arc::new(asr::AntigravityEngine::new(settings.antigravity.clone()));
         tracing::info!(
             ready_timeout_secs = settings.antigravity.ready_timeout_secs,
@@ -342,6 +364,19 @@ pub fn run() -> Result<()> {
     // only falls through to it when the user explicitly allows that.
     router.set_allow_local_fallback(settings.asr.auto_local_fallback);
 
+    // A selection naming an engine that never registered is the one ASR failure
+    // the user cannot see: `transcribe` refuses to fall back (by design), so
+    // every dictation errors and the only clue is a log line nobody opens. Say
+    // it at startup instead.
+    if plan.selection == asr::plan::ActiveSelection::Missing {
+        tracing::warn!(
+            selected = %settings.active_engine,
+            registered = ?plan.engines.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            "the selected ASR engine is not registered — dictation will fail until it is \
+             re-enabled or the selection is changed to auto"
+        );
+    }
+
     // Antigravity discovery spawns PowerShell + netstat (a real subprocess per
     // probe), so it must stay off the UI thread — and phase 2 gates it on the
     // engine actually being selected: probing forever for an engine the user
@@ -354,11 +389,10 @@ pub fn run() -> Result<()> {
             if selected {
                 probe.maintain();
             }
-            let pause = if selected && asr::AsrEngine::health(probe.as_ref()).is_available() {
-                60
-            } else {
-                30
-            };
+            let pause = asr::plan::probe_pause_secs(
+                selected,
+                asr::AsrEngine::health(probe.as_ref()).is_available(),
+            );
             std::thread::sleep(std::time::Duration::from_secs(pause));
         });
     }
