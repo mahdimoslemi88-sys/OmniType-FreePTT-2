@@ -54,7 +54,7 @@
 > این بخش عمداً کوتاه نگه داشته می‌شود؛ اعداد تفصیلی در [MEASURED-FACTS.md](MEASURED-FACTS.md).
 
 - **کد:** ۱۸٬۶۹۵ خط Rust در ۴۲ فایل (پیش از ریفکتور `overlay/`).
-- **تست:** ۲۲۴ تست `--lib`، همه سبز. `cargo clippy --all-targets` صفر warning.
+- **تست:** ۲۳۷ تست `--lib`، همه سبز. `cargo clippy --all-targets` صفر warning.
 - **ریفکتور انجام‌شده:** `gui/overlay.rs` از ۴۲۵۰ خط به ۱۱۶۲ خط و ۹ ماژول مستقل رفت. `OverlayApp` از ۶۳ فیلد به ۴۳ فیلد رسید. **کامیت نشده.**
 - **ریلیز:** `v0.3.0` منتشر شده. لینک در بخش ۵.
 - **هالهٔ سفید بالای اورب:** **وجود دارد و درمان نشده.** ببین [بخش ۱۶ گزارش](GUI-WINDOW-ARTIFACT-REPORT.md).
@@ -115,7 +115,8 @@ src/
 │   ├── orb_animation.rs  فنر مقیاس
 │   ├── window_shape.rs   Win32/DWM + ClickRegion
 │   └── preview_window.rs ماژول dormant (۱۱ تست)
-├── asr/  antigravity/{mod,protocol,discovery} · cloud · downloader · google
+├── asr/  plan.rs (ترتیب موتورها — خالص و تست‌شده) · antigravity/{mod,protocol,
+│        discovery} · cloud · downloader · google
 │        progress · quota · router · whisper
 ├── audio/  capture · device · ring_buffer
 ├── state/  machine.rs (ماشین حالت دیکته) · status.rs (StatusChannel)
