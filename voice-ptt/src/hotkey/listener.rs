@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::hotkey::binding::{key_to_vk, HotkeyBinding, Key, Modifier};
+// Binding resolution and its failure report live in `diagnostics`; the
+// fallback itself is unchanged, only observable.
+use crate::hotkey::diagnostics::{resolve_or_default, HotkeyProblem, HotkeyRole, ResolvedBinding};
 
 /// Events produced by the hotkey listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,42 +33,69 @@ pub enum HotkeyEvent {
     Quit,
 }
 
-/// One binding resolved to virtual-key codes: `vk` is the main key, `mods` are
-/// the modifiers that must accompany it (empty = bare key).
-#[derive(Debug, Clone)]
-struct ResolvedBinding {
-    vk: u16,
-    mods: Vec<u16>,
-}
-
 /// The three hotkey actions, resolved from settings and ready for the poll loop.
 #[derive(Debug, Clone)]
 pub struct HotkeyConfig {
     record: ResolvedBinding,
     toggle_overlay: ResolvedBinding,
     quit: ResolvedBinding,
+    /// Every setting that could not be used as written, in the order they
+    /// were resolved. Empty means the user's config was honoured exactly.
+    problems: Vec<HotkeyProblem>,
 }
 
 /// Built-in defaults, used when settings are missing or unparseable.
+///
+/// Written out rather than derived, because a `Default` that resolved to
+/// "no key at all" would silently disable push-to-talk instead of falling
+/// back to a working one.
 impl Default for HotkeyConfig {
     fn default() -> Self {
-        Self {
-            record: resolve_or_default("CapsLock", "record"),
-            toggle_overlay: resolve_or_default("Ctrl+Alt+S", "toggle overlay"),
-            quit: resolve_or_default("Ctrl+Alt+Q", "quit"),
-        }
+        let config = Self {
+            record: resolve_or_default("CapsLock", HotkeyRole::Record).binding,
+            toggle_overlay: resolve_or_default("Ctrl+Alt+S", HotkeyRole::ToggleOverlay).binding,
+            quit: resolve_or_default("Ctrl+Alt+Q", HotkeyRole::Quit).binding,
+            problems: Vec::new(),
+        };
+        // The built-ins are known-good; anything here would be a typo in this
+        // file, not a user mistake, so it must not reach `problems`.
+        debug_assert!(config.problems.is_empty());
+        config
     }
 }
-
 impl HotkeyConfig {
     /// Builds the config from user settings, falling back to defaults for
-    /// any binding that fails to parse (each fallback is logged).
+    /// any binding that cannot be used (each fallback is logged *and* recorded
+    /// in `problems`, so a caller can surface it to the user).
     pub fn from_settings(settings: &crate::config::HotkeySettings) -> Self {
-        Self {
-            record: resolve_or_default(&settings.record, "record"),
-            toggle_overlay: resolve_or_default(&settings.toggle_overlay, "toggle overlay"),
-            quit: resolve_or_default(&settings.quit, "quit"),
+        let mut problems = Vec::new();
+        let mut take = |r: crate::hotkey::diagnostics::Resolution| {
+            if let Some(p) = r.problem {
+                problems.push(p);
+            }
+            r.binding
+        };
+        let config = Self {
+            record: take(resolve_or_default(&settings.record, HotkeyRole::Record)),
+            toggle_overlay: take(resolve_or_default(
+                &settings.toggle_overlay,
+                HotkeyRole::ToggleOverlay,
+            )),
+            quit: take(resolve_or_default(&settings.quit, HotkeyRole::Quit)),
+            problems,
+        };
+        for problem in &config.problems {
+            tracing::warn!(spec = ?problem, "{}", problem.message());
         }
+        config
+    }
+
+    /// Settings that could not be used, and what replaced them.
+    ///
+    /// The root of the planned `--doctor` report: a working app on the wrong
+    /// key is indistinguishable from a correct one unless this is read.
+    pub fn problems(&self) -> &[HotkeyProblem] {
+        &self.problems
     }
 }
 
@@ -118,7 +147,9 @@ impl HotkeyControl {
         if let Ok(mut slot) = self.shared.capture_result.lock() {
             *slot = None;
         }
-        self.shared.capture_cancelled.store(false, Ordering::Relaxed);
+        self.shared
+            .capture_cancelled
+            .store(false, Ordering::Relaxed);
         self.shared.capture_requested.store(true, Ordering::Relaxed);
     }
 
@@ -158,69 +189,28 @@ impl HotkeyControl {
     }
 }
 
-/// Resolves a binding string to VK codes, or logs and falls back to the default.
-fn resolve_or_default(spec: &str, what: &str) -> ResolvedBinding {
-    // The built-in defaults are known-good; a parse failure there would be a
-    // programming error, so it is allowed to panic the unit tests.
-    fn default_binding() -> HotkeyBinding {
-        HotkeyBinding::parse("CapsLock").unwrap()
-    }
-
-    match HotkeyBinding::parse(spec) {
-        Ok(b) => match resolve_binding(&b) {
-            Some(r) => r,
-            None => {
-                tracing::warn!(spec, what, "hotkey has no virtual-key equivalent; using default");
-                resolve_binding(&default_binding()).expect("default hotkey must resolve")
-            }
-        },
-        Err(e) => {
-            tracing::warn!(spec, what, error = %e, "unparseable hotkey; using default");
-            resolve_binding(&default_binding()).expect("default hotkey must resolve")
-        }
-    }
-}
-
-/// Maps a parsed binding to VK codes. Returns `None` if the main key has no
-/// VK equivalent.
-fn resolve_binding(b: &HotkeyBinding) -> Option<ResolvedBinding> {
-    Some(ResolvedBinding {
-        vk: key_vk_code(b.key)?,
-        mods: b.modifiers.iter().map(|m| modifier_vk_code(*m)).collect(),
-    })
-}
-
-/// VK code of a logical key, as a plain `u16` (platform-agnostic storage;
-/// the poll loop casts it back on Windows).
-fn key_vk_code(key: Key) -> Option<u16> {
-    #[cfg(windows)]
-    {
-        key_to_vk(key).map(|vk| vk.0)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = key;
-        None
-    }
-}
-
-/// VK code of a modifier, as a plain `u16`.
-fn modifier_vk_code(m: Modifier) -> u16 {
-    #[cfg(windows)]
-    {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT};
-        match m {
-            Modifier::Ctrl => VK_CONTROL.0,
-            Modifier::Alt => VK_MENU.0,
-            Modifier::Shift => VK_SHIFT.0,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = m;
-        0
-    }
-}
+// Superseded by `hotkey::diagnostics::resolve_or_default`, which does the same
+// fallback and additionally reports *why* it happened. Kept for the record —
+// the difference between the two is the whole point of the module.
+//
+// fn resolve_or_default(spec: &str, what: &str) -> ResolvedBinding {
+//     fn default_binding() -> HotkeyBinding {
+//         HotkeyBinding::parse("CapsLock").unwrap()
+//     }
+//     match HotkeyBinding::parse(spec) {
+//         Ok(b) => match resolve_binding(&b) {
+//             Some(r) => r,
+//             None => {
+//                 tracing::warn!(spec, what, "hotkey has no virtual-key equivalent; using default");
+//                 resolve_binding(&default_binding()).expect("default hotkey must resolve")
+//             }
+//         },
+//         Err(e) => {
+//             tracing::warn!(spec, what, error = %e, "unparseable hotkey; using default");
+//             resolve_binding(&default_binding()).expect("default hotkey must resolve")
+//         }
+//     }
+// }
 
 /// Handle to the running listener. Dropping it stops the thread.
 pub struct HotkeyListener {
@@ -329,11 +319,7 @@ fn run_loop(
     let is_modifier_vk = |vk: u16| matches!(vk, VK_SHIFT | VK_CONTROL | VK_ALT);
     let is_unsupported_modifier = |vk: u16| matches!(vk, VK_LWIN | VK_RWIN);
 
-    let initial = shared
-        .config
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_default();
+    let initial = shared.config.read().map(|c| c.clone()).unwrap_or_default();
     let mut record_was_down = binding_down(&initial.record);
     let mut toggle_was_down = binding_down(&initial.toggle_overlay);
     let mut quit_was_down = binding_down(&initial.quit);
@@ -351,11 +337,7 @@ fn run_loop(
     while !stop.load(Ordering::Relaxed) {
         // Live snapshot: a re-bind applied from the settings UI is honoured on
         // the very next tick, without restarting the app.
-        let config = shared
-            .config
-            .read()
-            .map(|c| c.clone())
-            .unwrap_or_default();
+        let config = shared.config.read().map(|c| c.clone()).unwrap_or_default();
 
         // ── shortcut-key capture ────────────────────────────────────────────
         if shared.capture_requested.swap(false, Ordering::Relaxed) {
@@ -428,7 +410,6 @@ fn run_loop(
         std::thread::sleep(POLL_INTERVAL);
     }
 }
-
 
 /// One tick of a key capture. Returns `Some(..)` when the capture finished
 /// (the chord was released, or it was cancelled / timed out).
@@ -541,6 +522,9 @@ fn run_loop(
 mod tests {
     use super::*;
     use crate::config::HotkeySettings;
+    // Only the tests need these: the poll loop works on the already-resolved
+    // `ResolvedBinding`, and `diagnostics` owns the key→VK translation.
+    use crate::hotkey::binding::{key_vk_code, modifier_vk_code, Key, Modifier};
 
     /// The listener must stop promptly when signaled (thread-join bounded).
     #[test]

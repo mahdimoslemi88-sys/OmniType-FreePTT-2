@@ -187,6 +187,13 @@ pub fn run() -> Result<()> {
     // right away; the big model streams in behind the UI.
     let (hk_tx, hk_rx) = std::sync::mpsc::channel::<HotkeyEvent>();
     let hotkey_config = HotkeyListener::config_from_settings(&settings.hotkey);
+    // A hotkey the settings could not supply is replaced by the built-in
+    // default so push-to-talk still works, but the user gets a working app on
+    // the wrong key. Say so at startup: this is the one signal that a typo in
+    // `config.toml` changed what their shortcut does.
+    for problem in hotkey_config.problems() {
+        tracing::warn!("{}", problem.message());
+    }
     let listener = HotkeyListener::spawn_with_config(hk_tx, hotkey_config)?;
     // Handle the dashboard keeps: live re-bind of shortcuts and the
     // system-wide key capture used by the settings UI.
@@ -215,8 +222,8 @@ pub fn run() -> Result<()> {
         .name("hotkey-bridge".into())
         .spawn(move || {
             for ev in hk_rx {
-                if matches!(ev, HotkeyEvent::ToggleOverlay) {
-                    bridge_overlay.raise(gui::Toggle::Overlay);
+                if let Some(toggle) = gui::Toggle::for_hotkey_event(&ev) {
+                    bridge_overlay.raise(toggle);
                 }
                 if bridge_tx.send(ev).is_err() {
                     break; // machine gone → shutting down

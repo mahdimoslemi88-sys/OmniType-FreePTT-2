@@ -432,6 +432,42 @@ pub fn key_to_vk(_key: Key) -> Option<VkCode> {
     None
 }
 
+/// VK code of a key, as a plain `u16`.
+///
+/// A thin wrapper over [`key_to_vk`] so the hotkey poll loop can compare
+/// against `GetAsyncKeyState` results without importing the Win32 `VIRTUAL_KEY`
+/// newtype. `None` is preserved rather than defaulted: an unbindable key is a
+/// real state that the caller must handle, not something to paper over.
+pub(crate) fn key_vk_code(key: Key) -> Option<u16> {
+    #[cfg(windows)]
+    {
+        key_to_vk(key).map(|vk| vk.0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = key;
+        None
+    }
+}
+
+/// VK code of a modifier, as a plain `u16`.
+pub(crate) fn modifier_vk_code(m: Modifier) -> u16 {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU, VK_SHIFT};
+        match m {
+            Modifier::Ctrl => VK_CONTROL.0,
+            Modifier::Alt => VK_MENU.0,
+            Modifier::Shift => VK_SHIFT.0,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = m;
+        0
+    }
+}
+
 /// Converts a Win32 virtual-key code back into a logical key.
 ///
 /// Inverse of [`key_to_vk`]; used by the key-capture path to name the key the
@@ -528,7 +564,10 @@ mod tests {
 
     #[test]
     fn rejects_modifiers_only() {
-        assert_eq!(HotkeyBinding::parse("Ctrl+Alt"), Err(HotkeyParseError::NoKey));
+        assert_eq!(
+            HotkeyBinding::parse("Ctrl+Alt"),
+            Err(HotkeyParseError::NoKey)
+        );
     }
 
     #[test]
@@ -556,10 +595,7 @@ mod tests {
     #[test]
     fn parses_numpad_and_mouse() {
         assert_eq!(HotkeyBinding::parse("Numpad5").unwrap().key, Key::Numpad(5));
-        assert_eq!(
-            HotkeyBinding::parse("Mouse1").unwrap().key,
-            Key::LeftMouse
-        );
+        assert_eq!(HotkeyBinding::parse("Mouse1").unwrap().key, Key::LeftMouse);
     }
 
     #[cfg(windows)]
@@ -577,10 +613,36 @@ mod tests {
     #[test]
     fn tokens_round_trip_through_parse() {
         for token in [
-            "CapsLock", "Space", "Tab", "Enter", "Escape", "Backspace", "Delete", "Insert",
-            "Home", "End", "PageUp", "PageDown", "Left", "Right", "Up", "Down", "ScrollLock",
-            "NumLock", "PrintScreen", "Pause", "Mouse1", "Mouse2", "F1", "F24", "Numpad0",
-            "Numpad9", "A", "Z", "0", "9",
+            "CapsLock",
+            "Space",
+            "Tab",
+            "Enter",
+            "Escape",
+            "Backspace",
+            "Delete",
+            "Insert",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "ScrollLock",
+            "NumLock",
+            "PrintScreen",
+            "Pause",
+            "Mouse1",
+            "Mouse2",
+            "F1",
+            "F24",
+            "Numpad0",
+            "Numpad9",
+            "A",
+            "Z",
+            "0",
+            "9",
         ] {
             let parsed = HotkeyBinding::parse(token).unwrap_or_else(|e| panic!("{token}: {e}"));
             let again = HotkeyBinding::parse(&parsed.to_token_string())

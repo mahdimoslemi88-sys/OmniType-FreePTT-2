@@ -25,6 +25,28 @@ pub enum Toggle {
     Quit,
 }
 
+impl Toggle {
+    /// The dashboard request a hotkey event implies, if any.
+    ///
+    /// This mapping used to be an `if matches!(ev, …)` inside the bridge
+    /// thread in `run()`: an event nobody matched was forwarded to the state
+    /// machine and produced no dashboard request, silently. Making it a
+    /// function means the exhaustive set of events is visible in one place, and
+    /// a new event variant is a compile error here rather than a no-op.
+    pub fn for_hotkey_event(ev: &crate::hotkey::HotkeyEvent) -> Option<Toggle> {
+        use crate::hotkey::HotkeyEvent;
+        match ev {
+            HotkeyEvent::ToggleOverlay => Some(Toggle::Overlay),
+            // Record and Cancel are the state machine's business; the overlay
+            // reacts to them through `StatusChannel`, not through a request.
+            HotkeyEvent::RecordDown
+            | HotkeyEvent::RecordUp
+            | HotkeyEvent::Cancel
+            | HotkeyEvent::Quit => None,
+        }
+    }
+}
+
 /// The dashboard's request flags. `Arc` so each consumer holds its own handle.
 #[derive(Clone)]
 pub struct DashboardFlags {
@@ -149,5 +171,34 @@ mod tests {
         let other = flags.clone();
         other.raise(Toggle::Settings);
         assert!(flags.take(Toggle::Settings));
+    }
+
+    /// The overlay hotkey must actually reach the dashboard. Before this was a
+    /// function, dropping the match arm meant the overlay hotkey silently did
+    /// nothing while still working for the state machine — a failure with no
+    /// error and no symptom anywhere but "the overlay never appears".
+    #[test]
+    fn the_overlay_hotkey_raises_the_overlay_request() {
+        use crate::hotkey::HotkeyEvent;
+        assert_eq!(
+            Toggle::for_hotkey_event(&HotkeyEvent::ToggleOverlay),
+            Some(Toggle::Overlay)
+        );
+    }
+
+    /// Record/cancel/quit drive the state machine, not the dashboard. If one of
+    /// them ever started raising a request it would be a new decision, and this
+    /// test is where that decision gets written down.
+    #[test]
+    fn the_state_machine_events_raise_no_dashboard_request() {
+        use crate::hotkey::HotkeyEvent;
+        for ev in [
+            HotkeyEvent::RecordDown,
+            HotkeyEvent::RecordUp,
+            HotkeyEvent::Cancel,
+            HotkeyEvent::Quit,
+        ] {
+            assert_eq!(Toggle::for_hotkey_event(&ev), None, "{ev:?}");
+        }
     }
 }
