@@ -19,7 +19,6 @@ pub mod state;
 pub mod updates;
 pub mod vad;
 
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
@@ -30,7 +29,7 @@ use crate::asr::whisper::{WhisperEngine, WhisperOptions};
 use crate::audio::{AudioCapture, CaptureConfig};
 use crate::config::dirs_or_cwd;
 use crate::config::Settings;
-use crate::gui::overlay::{OverlayApp, StatusClient};
+
 use crate::hotkey::{HotkeyEvent, HotkeyListener};
 use crate::processing::{Dictionary, Normalizer};
 use crate::state::machine::AppServices;
@@ -48,9 +47,7 @@ mod single_instance {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
     use windows::Win32::System::Threading::CreateMutexW;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONINFORMATION, MB_OK,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
 
     /// Owns the instance mutex; dropping it releases the instance.
     pub struct Guard(HANDLE);
@@ -73,9 +70,17 @@ mod single_instance {
             const MSG: &str = "OmniType FreePTT is already running.\r\n\
                 Check the system tray for its capsule icon.";
             let text: Vec<u16> = MSG.encode_utf16().chain(std::iter::once(0)).collect();
-            let title: Vec<u16> = "OmniType FreePTT".encode_utf16().chain(std::iter::once(0)).collect();
+            let title: Vec<u16> = "OmniType FreePTT"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             unsafe {
-                let _ = MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                let _ = MessageBoxW(
+                    None,
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONINFORMATION,
+                );
             }
             anyhow::bail!("another instance is already running");
         }
@@ -127,11 +132,15 @@ pub fn run() -> Result<()> {
     // ---- settings ---------------------------------------------------------
     let _data_dir = dirs_or_cwd();
     let config_path = paths::resolve_config_path();
-    let loaded_settings = Settings::load_or_create(&config_path).context("failed to load settings")?;
+    let loaded_settings =
+        Settings::load_or_create(&config_path).context("failed to load settings")?;
     let settings = Arc::new(loaded_settings.clone());
     let settings_rwlock = Arc::new(RwLock::new(loaded_settings));
     tracing::info!(?settings.audio, ?settings.vad, config = %config_path.display(), "settings loaded");
-    logging::stage("settings", &format!("config path: {}", config_path.display()));
+    logging::stage(
+        "settings",
+        &format!("config path: {}", config_path.display()),
+    );
 
     // ---- models (the only network access in the app) ----------------------
     // The model NAME is resolved up front, but the (possibly very large)
@@ -139,7 +148,9 @@ pub fn run() -> Result<()> {
     // fresh install is immediately usable (tray, hotkeys, cloud engines)
     // instead of sitting blind on a multi-hundred-MB fetch. Only the tiny
     // Silero VAD model is fetched synchronously here.
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let gpu = asr::whisper::detect_gpu();
     let model_name = settings.resolve_model_name(gpu, cores);
     tracing::info!(model = %model_name, gpu = gpu.unwrap_or("none"), "resolved ASR model");
@@ -174,23 +185,11 @@ pub fn run() -> Result<()> {
     let hotkey_control = listener.control();
 
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<HotkeyEvent>();
-    let overlay_flag = Arc::new(AtomicBool::new(false));
-    let dict_flag = Arc::new(AtomicBool::new(false));
-    let engine_flag = Arc::new(AtomicBool::new(false));
-    let history_flag = Arc::new(AtomicBool::new(false));
-    let settings_flag = Arc::new(AtomicBool::new(false));
-    let quit_flag = Arc::new(AtomicBool::new(false));
+    // One handle, cloned to the tray, the hotkey bridge and the GUI. They all
+    // raise the same six requests; see `gui::flags` for why they are grouped.
+    let flags = gui::DashboardFlags::new();
     let update_state = updates::new_shared_state();
-    gui::spawn_tray(
-        events_tx.clone(),
-        overlay_flag.clone(),
-        dict_flag.clone(),
-        engine_flag.clone(),
-        history_flag.clone(),
-        settings_flag.clone(),
-        quit_flag.clone(),
-        update_state.clone(),
-    )?;
+    gui::spawn_tray(events_tx.clone(), flags.clone(), update_state.clone())?;
 
     // Spawn background update checker (honors settings.updates.check_on_startup).
     // Spawned onto the runtime handle (tokio::spawn needs runtime context).
@@ -203,13 +202,13 @@ pub fn run() -> Result<()> {
 
     // ---- bridge: std channel → tokio channel ---------------------------------
     let bridge_tx = events_tx.clone();
-    let bridge_overlay = overlay_flag.clone();
+    let bridge_overlay = flags.clone();
     std::thread::Builder::new()
         .name("hotkey-bridge".into())
         .spawn(move || {
             for ev in hk_rx {
                 if matches!(ev, HotkeyEvent::ToggleOverlay) {
-                    bridge_overlay.store(true, std::sync::atomic::Ordering::Relaxed);
+                    bridge_overlay.raise(gui::Toggle::Overlay);
                 }
                 if bridge_tx.send(ev).is_err() {
                     break; // machine gone → shutting down
@@ -452,141 +451,21 @@ pub fn run() -> Result<()> {
     logging::stage("gui", "entering GUI event loop");
 
     // ---- GUI (main thread) ------------------------------------------------------
-    let status_client = Arc::new(StatusClient::new(machine.subscribe()));
-    let (icon_rgba, icon_w, icon_h) = gui::tray::app_icon_rgba();
-    // Zero-flash launch: generously sized native window with full padding for glow/ripples.
-    // The side is the orb's *fixed* canvas (the largest it ever draws at), not
-    // the idle one: the window is created once at this size and never resized,
-    // because resizing a transparent always-on-top window strands the pixels the
-    // old rect covered (see `Orb::max_canvas_points`).
-    let initial_side = gui::orb::Orb::initial_side_points();
-    let (init_x, init_y) = match (settings.gui.orb_position_x, settings.gui.orb_position_y) {
-        (Some(x), Some(y)) => (
-            x as f32 - initial_side * 0.5,
-            y as f32 - initial_side * 0.5,
-        ),
-        _ => {
-            #[cfg(windows)]
-            {
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
-                };
-                let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) } as f32;
-                let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) } as f32;
-                (sw * 0.5 - initial_side * 0.5, sh * 0.5 - initial_side * 0.5)
-            }
-            #[cfg(not(windows))]
-            {
-                (200.0, 200.0)
-            }
-        }
-    };
-
-    let native_options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Wgpu,
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_resizable(false)
-            .with_visible(settings.gui.show_overlay)
-            .with_position([init_x, init_y])
-            .with_inner_size([initial_side, initial_side])
-            .with_title("")
-            .with_icon(std::sync::Arc::new(eframe::egui::IconData {
-                rgba: icon_rgba,
-                width: icon_w,
-                height: icon_h,
-            })),
-        ..Default::default()
-    };
-
-    let gui_status = status_client.clone();
-    let gui_quit = quit_flag.clone();
-    let gui_overlay = overlay_flag.clone();
-    let gui_dict_flag = dict_flag.clone();
-    let gui_engine_flag = engine_flag.clone();
-    let gui_history_flag = history_flag.clone();
-    let gui_settings_flag = settings_flag.clone();
-    let gui_dict = dictionary.clone();
-    let gui_router = router.clone();
-    let gui_settings = settings_rwlock.clone();
-    let gui_config_path = config_path.clone();
-    let gui_events_tx = events_tx.clone();
-    let gui_update_state = update_state.clone();
-    let gui_hotkey_control = hotkey_control.clone();
-    eframe::run_native(
-        "voice-ptt",
-        native_options,
-        Box::new(move |cc| {
-            // Load native Windows fonts with 100% complete Persian/Arabic glyph coverage
-            let mut fonts = eframe::egui::FontDefinitions::default();
-            if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
-                fonts.font_data.insert(
-                    "segoe_ui".to_owned(),
-                    eframe::egui::FontData::from_owned(data),
-                );
-                fonts
-                    .families
-                    .entry(eframe::egui::FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "segoe_ui".to_owned());
-            }
-            if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\tahoma.ttf") {
-                fonts.font_data.insert(
-                    "tahoma".to_owned(),
-                    eframe::egui::FontData::from_owned(data),
-                );
-                fonts
-                    .families
-                    .entry(eframe::egui::FontFamily::Proportional)
-                    .or_default()
-                    .push("tahoma".to_owned());
-            }
-            if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
-                fonts.font_data.insert(
-                    "segoe_ui_symbol".to_owned(),
-                    eframe::egui::FontData::from_owned(data),
-                );
-                fonts
-                    .families
-                    .entry(eframe::egui::FontFamily::Proportional)
-                    .or_default()
-                    .push("segoe_ui_symbol".to_owned());
-            }
-            // Phosphor icon font — appended to the *same* definitions so it
-            // joins the fallback chain after Segoe UI: glyphs missing from the
-            // system fonts (the PUA icon codepoints) resolve to it, while
-            // Persian coverage from Segoe UI stays intact.
-            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-            cc.egui_ctx.set_fonts(fonts);
-
-            // Ensure the main overlay context has fully transparent panel and window fills
-            let mut transparent_visuals = eframe::egui::Visuals::dark();
-            transparent_visuals.panel_fill = eframe::egui::Color32::TRANSPARENT;
-            transparent_visuals.window_fill = eframe::egui::Color32::TRANSPARENT;
-            transparent_visuals.extreme_bg_color = eframe::egui::Color32::TRANSPARENT;
-            cc.egui_ctx.set_visuals(transparent_visuals);
-
-            Ok(Box::new(OverlayApp::new(
-                gui_status.clone(),
-                gui_events_tx,
-                gui_overlay,
-                gui_dict_flag,
-                gui_engine_flag,
-                gui_history_flag,
-                gui_settings_flag,
-                gui_quit,
-                gui_dict,
-                gui_router,
-                gui_settings,
-                gui_config_path,
-                gui_update_state,
-                Some(gui_hotkey_control),
-            )) as Box<dyn eframe::App>)
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("GUI failed: {e}"))?;
+    // Window geometry, fonts and visuals live in `gui::bootstrap` so they can
+    // be unit-tested; this only hands over the live dependencies. `machine` is
+    // still borrowed here for its background download + run loop above.
+    gui::bootstrap::run_gui(gui::bootstrap::GuiStartup {
+        status: machine.subscribe(),
+        settings: settings.clone(),
+        settings_rwlock: settings_rwlock.clone(),
+        config_path: config_path.clone(),
+        flags: flags.clone(),
+        events_tx: events_tx.clone(),
+        update_state: update_state.clone(),
+        hotkey_control: hotkey_control.clone(),
+        dictionary: dictionary.clone(),
+        router: router.clone(),
+    })?;
 
     // GUI closed → clean shutdown.
     listener.stop();

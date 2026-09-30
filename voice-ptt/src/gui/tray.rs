@@ -8,27 +8,19 @@ use anyhow::Result;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+use crate::gui::flags::{DashboardFlags, Toggle};
 use crate::hotkey::HotkeyEvent;
 
 /// Builds the tray and spawns the event-polling thread.
 ///
 /// * `hotkey_tx` — forwarded `Quit` events reach the state machine.
-/// * `overlay_toggle` — set when the user asks to show/hide the overlay.
-/// * `dict_toggle` — set when the user asks to open the dictionary manager GUI.
-/// * `engine_toggle` — set when the user asks to open the AI model/engine manager GUI.
-/// * `history_toggle` — set when the user asks to open the transcript history GUI.
-/// * `settings_toggle` — set when the user asks to open the in-app settings GUI.
-/// * `quit_flag` — set when the user asks to quit (GUI watches it to close).
+/// * `flags` — which panel the user asked for; the GUI takes each request and
+///   clears it. One struct rather than six parameters, because six of the same
+///   type in a row can be swapped without the compiler noticing.
 /// * `update_state` — shared update state for checking/downloading releases.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     hotkey_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
-    overlay_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    dict_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    engine_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    history_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    settings_toggle: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    quit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    flags: DashboardFlags,
     update_state: crate::updates::SharedUpdateState,
 ) -> Result<()> {
     // Tray labels follow the skill's section-8 contract. Routine config and
@@ -82,23 +74,27 @@ pub fn spawn(
             let receiver = MenuEvent::receiver();
             while let Ok(event) = receiver.recv() {
                 if event.id == show_id {
-                    overlay_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flags.raise(Toggle::Overlay);
                 } else if event.id == history_gui_id {
-                    history_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flags.raise(Toggle::History);
                 } else if event.id == engine_gui_id {
-                    engine_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flags.raise(Toggle::Engine);
                 } else if event.id == dict_gui_id {
-                    dict_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flags.raise(Toggle::Dictionary);
                 } else if event.id == settings_gui_id {
-                    settings_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flags.raise(Toggle::Settings);
                 } else if event.id == update_gui_id {
                     // Open settings where the update card is visible
-                    settings_toggle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flags.raise(Toggle::Settings);
                     // Check if an update URL is ready to open immediately
                     let url_to_open = {
                         if let Ok(st) = update_state_tray.read() {
                             if let crate::updates::UpdateState::Available(ref info) = *st {
-                                Some(info.installer_url.clone().unwrap_or_else(|| info.release_url.clone()))
+                                Some(
+                                    info.installer_url
+                                        .clone()
+                                        .unwrap_or_else(|| info.release_url.clone()),
+                                )
                             } else {
                                 None
                             }
@@ -115,7 +111,7 @@ pub fn spawn(
                         });
                     }
                 } else if event.id == quit_id {
-                    quit_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flags.raise(Toggle::Quit);
                     let _ = hotkey_tx.send(HotkeyEvent::Quit);
                     break;
                 }
@@ -246,7 +242,9 @@ mod tests {
         assert_eq!(h, 32);
         assert_eq!(rgba.len(), 32 * 32 * 4);
         let non_transparent = rgba.chunks(4).filter(|p| p[3] > 0).count();
-        assert!(non_transparent > 100, "expected non-transparent pixels, found {non_transparent}");
+        assert!(
+            non_transparent > 100,
+            "expected non-transparent pixels, found {non_transparent}"
+        );
     }
 }
-

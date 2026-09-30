@@ -2,4 +2,4 @@
 
 pub mod settings;
 
-pub use settings::{HotkeySettings, Settings, dirs_or_cwd};
+pub use settings::{GuiSettings, HotkeySettings, Settings, dirs_or_cwd};

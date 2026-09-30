@@ -29,38 +29,7 @@ use crate::processing::seam::{SeamMerge, SeamOptions, SeamStitcher};
 use crate::processing::{process_text, Dictionary, Normalizer};
 use crate::vad::{AnyVad, Endpoint, VadConfig};
 
-/// Visible application state (also mirrored to the UI).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppState {
-    Idle,
-    Recording,
-    Processing,
-    Typing,
-    Error(String),
-}
-
-/// External status packet emitted by the state machine on every transition.
-#[derive(Debug, Clone)]
-pub struct AppStatus {
-    pub state: AppState,
-    pub last_text: Option<String>,
-    pub vad_engine: &'static str,
-    /// Live partial transcript published by a streaming engine (Antigravity).
-    /// Only populated while `state == Processing`; cleared when we leave it.
-    pub partial: Option<String>,
-    /// True while the recording is latched hands-free (two quick presses of the
-    /// record key). Only meaningful while `state == Recording`.
-    pub latched: bool,
-    /// True while a *mid-session* chunk is being transcribed and typed.
-    ///
-    /// phase 3.2: this used to be a `AppState::Processing` transition, which
-    /// flipped the visible state (and therefore the orb's shape) on every chunk
-    /// boundary. The user asked for the opposite: while a session is running the
-    /// app should look like it is recording, and only a release/click should end
-    /// it. The state now stays `Recording` and this flag carries the (invisible)
-    /// "a chunk is in flight" fact for the UI.
-    pub chunk_busy: bool,
-}
+use super::status::{AppState, AppStatus, StatusChannel};
 
 /// VAD unit: engine + endpoint state guarded by one mutex.
 pub struct VadUnit {
@@ -266,8 +235,8 @@ pub struct AppServices {
 /// The running application.
 pub struct StateMachine {
     services: Arc<AppServices>,
-    status_tx: watch::Sender<AppStatus>,
-    status_rx: watch::Receiver<AppStatus>,
+    /// Owns the UI status channel and the rules for changing it (`state/status`).
+    status: StatusChannel,
     /// Chunk-seam repair state for the running dictation session. A plain mutex
     /// (never held across an `await`) is enough: `stitch` is pure string work.
     seam: std::sync::Mutex<SeamStitcher>,
@@ -279,19 +248,11 @@ impl StateMachine {
             Ok(u) => u.engine_name(),
             Err(_) => "…",
         };
-        let (status_tx, status_rx) = watch::channel(AppStatus {
-            state: AppState::Idle,
-            last_text: None,
-            vad_engine,
-            partial: None,
-            latched: false,
-            chunk_busy: false,
-        });
+        let status = StatusChannel::new(vad_engine);
         let seam = SeamStitcher::new(SeamOptions::from_streaming(&services.settings.streaming));
         Self {
             services: Arc::new(services),
-            status_tx,
-            status_rx,
+            status,
             seam: std::sync::Mutex::new(seam),
         }
     }
@@ -321,68 +282,16 @@ impl StateMachine {
 
     /// Subscribe to status updates (for the overlay/tray).
     pub fn subscribe(&self) -> watch::Receiver<AppStatus> {
-        self.status_rx.clone()
+        self.status.subscribe()
     }
 
-    fn set_state(&self, state: AppState) {
-        let _ = self.status_tx.send_if_modified(|s| {
-            let mut changed = false;
-            if s.state != state {
-                s.state = state.clone();
-                changed = true;
-            }
-            // Live partials belong to the processing phase only: dropping them
-            // on the way out keeps a stale fragment from outliving its session.
-            if s.partial.is_some() && !matches!(state, AppState::Processing) {
-                s.partial = None;
-                changed = true;
-            }
-            changed
-        });
-        tracing::debug!(?state, "state");
-    }
-
-    /// Publishes a live partial transcript from a streaming engine
-    /// (`asr::progress`). Ignored unless we are actually processing audio.
+    /// Forwards a live partial transcript from a streaming engine.
+    ///
+    /// The caller holds the machine, not the channel, so this stays a method on
+    /// `StateMachine` even though the rule it enforces now lives in
+    /// [`StatusChannel`].
     pub fn publish_partial(&self, text: &str) {
-        let _ = self.status_tx.send_if_modified(|s| {
-            if s.state != AppState::Processing || s.partial.as_deref() == Some(text) {
-                return false;
-            }
-            s.partial = Some(text.to_string());
-            true
-        });
-    }
-
-    /// Publishes the hands-free latch state (double-tap mode) to the UI.
-    fn set_latched(&self, latched: bool) {
-        let _ = self.status_tx.send_if_modified(|s| {
-            if s.latched == latched {
-                return false;
-            }
-            s.latched = latched;
-            true
-        });
-    }
-
-    /// Marks a mid-session chunk as in flight. Publishes on the same watch
-    /// channel as everything else, but never changes `state`: the orb must keep
-    /// its recording shape while the microphone is live (see `AppStatus`).
-    fn set_chunk_busy(&self, busy: bool) {
-        let _ = self.status_tx.send_if_modified(|s| {
-            if s.chunk_busy == busy {
-                return false;
-            }
-            s.chunk_busy = busy;
-            true
-        });
-    }
-
-    fn set_last_text(&self, text: String) {
-        let _ = self.status_tx.send_if_modified(|s| {
-            s.last_text = Some(text);
-            true
-        });
+        self.status.publish_partial(text);
     }
 
     /// Main loop. Consumes hotkey events until Quit or channel close.
@@ -401,7 +310,7 @@ impl StateMachine {
         // Hands-free latch (double-tap) state for the record key.
         let mut latch = LatchPolicy::new(&self.services.settings.hotkey);
 
-        self.set_state(AppState::Idle);
+        self.status.set_state(AppState::Idle);
 
         loop {
             tokio::select! {
@@ -416,27 +325,27 @@ impl StateMachine {
                             // failed utterance (offline engine, provider 403)
                             // must never freeze push-to-talk until restart.
                             let recording =
-                                self.status_rx.borrow().state == AppState::Recording;
+                                self.status.snapshot().state == AppState::Recording;
                             match latch.press(Instant::now(), recording) {
                                 LatchAction::Start => {
                                     self.begin_recording(&mut buffer, &mut vad_cursor);
                                 }
                                 LatchAction::Latched => {
-                                    self.set_latched(true);
+                                    self.status.set_latched(true);
                                     tracing::info!("hands-free latch engaged (double-tap)");
                                 }
                                 LatchAction::Finish => {
                                     let audio = self
                                         .take_and_stop(&mut buffer, &mut vad_cursor, chunk)
                                         .await;
-                                    self.set_latched(false);
+                                    self.status.set_latched(false);
                                     self.finalize(audio).await;
                                 }
                                 LatchAction::FinishAndRestart => {
                                     let audio = self
                                         .take_and_stop(&mut buffer, &mut vad_cursor, chunk)
                                         .await;
-                                    self.set_latched(false);
+                                    self.status.set_latched(false);
                                     self.finalize(audio).await;
                                     self.begin_recording(&mut buffer, &mut vad_cursor);
                                 }
@@ -445,7 +354,7 @@ impl StateMachine {
                         }
                         Some(HotkeyEvent::RecordUp) => {
                             let recording =
-                                self.status_rx.borrow().state == AppState::Recording;
+                                self.status.snapshot().state == AppState::Recording;
                             match latch.release(Instant::now(), recording) {
                                 LatchAction::AwaitSecondTap => {
                                     tracing::debug!(
@@ -457,7 +366,7 @@ impl StateMachine {
                                     let audio = self
                                         .take_and_stop(&mut buffer, &mut vad_cursor, chunk)
                                         .await;
-                                    self.set_latched(false);
+                                    self.status.set_latched(false);
                                     self.finalize(audio).await;
                                 }
                                 // Hands-free: the release is deliberately ignored.
@@ -468,10 +377,10 @@ impl StateMachine {
                             }
                         }
                         Some(HotkeyEvent::Cancel) => {
-                            if self.status_rx.borrow().state == AppState::Recording {
+                            if self.status.snapshot().state == AppState::Recording {
                                 // Cancel speech: discard buffer and stop capture without transcribing
                                 latch.reset();
-                                self.set_latched(false);
+                                self.status.set_latched(false);
                                 buffer.clear();
                                 vad_cursor = 0;
                                 let _ = self.services.capture.stop();
@@ -479,7 +388,7 @@ impl StateMachine {
                                     unit.endpoint.reset();
                                     unit.vad.reset();
                                 }
-                                self.set_state(AppState::Idle);
+                                self.status.set_state(AppState::Idle);
                                 tracing::info!("speech recording cancelled by user");
                             }
                         }
@@ -489,21 +398,21 @@ impl StateMachine {
                     }
                 }
                 _ = tick.tick() => {
-                    if self.status_rx.borrow().state == AppState::Recording {
+                    if self.status.snapshot().state == AppState::Recording {
                         match latch.tick(Instant::now(), true) {
                             // A lone tap whose second press never arrived.
                             LatchAction::Finish => {
                                 let audio = self
                                     .take_and_stop(&mut buffer, &mut vad_cursor, chunk)
                                     .await;
-                                self.set_latched(false);
+                                self.status.set_latched(false);
                                 self.finalize(audio).await;
                             }
                             _ => {
                                 if let Some(audio) =
                                     self.poll_vad(&mut buffer, &mut vad_cursor, chunk).await?
                                 {
-                                    self.set_latched(false);
+                                    self.status.set_latched(false);
                                     self.finalize(audio).await;
                                 } else if self.chunk_flush_due(buffer.len()).await {
                                     // phase 3: hand this chunk over while the
@@ -520,7 +429,7 @@ impl StateMachine {
                         // ring-buffer valve, cancel) also ends the hands-free
                         // session, so no stale latch survives it.
                         if latch.is_latched() {
-                            self.set_latched(false);
+                            self.status.set_latched(false);
                         }
                         latch.tick(Instant::now(), false);
                     }
@@ -538,7 +447,8 @@ impl StateMachine {
         // words this one starts with.
         self.reset_seam();
         if let Err(e) = self.services.capture.start() {
-            self.set_state(AppState::Error(format!("capture start failed: {e:#}")));
+            self.status
+                .set_state(AppState::Error(format!("capture start failed: {e:#}")));
             return;
         }
         // Reset endpoint state for the new utterance.
@@ -548,7 +458,7 @@ impl StateMachine {
             // state + context) so stale audio cannot bias the first frames.
             unit.vad.reset();
         }
-        self.set_state(AppState::Recording);
+        self.status.set_state(AppState::Recording);
         tracing::info!("recording started");
     }
 
@@ -663,7 +573,7 @@ impl StateMachine {
 
         // phase 3.2: no `set_state(Processing)` here. A chunk boundary must not
         // look like the recording stopped and restarted.
-        self.set_chunk_busy(true);
+        self.status.set_chunk_busy(true);
         let utterance = AudioUtterance {
             samples: audio,
             sample_rate,
@@ -706,18 +616,18 @@ impl StateMachine {
             Ok(chars) => tracing::info!(chars, "chunk text injected"),
             Err(e) => tracing::warn!(error = %e, "chunk injection failed"),
         }
-        self.set_last_text(merge.text);
+        self.status.set_last_text(merge.text);
         self.resume_after_chunk();
     }
 
     /// Back to `Recording` while the microphone is still live (chunked session),
     /// otherwise `Idle`.
     fn resume_after_chunk(&self) {
-        self.set_chunk_busy(false);
+        self.status.set_chunk_busy(false);
         if self.services.capture.is_recording() {
-            self.set_state(AppState::Recording);
+            self.status.set_state(AppState::Recording);
         } else {
-            self.set_state(AppState::Idle);
+            self.status.set_state(AppState::Idle);
         }
     }
 
@@ -751,7 +661,7 @@ impl StateMachine {
     /// Transcribes, post-processes and injects. Never returns Err to the
     /// caller: failures land in the Error state and we return to Idle.
     async fn finalize(&self, audio: Vec<f32>) {
-        self.set_state(AppState::Processing);
+        self.status.set_state(AppState::Processing);
 
         // Audio-level diagnostics: distinguishes "mic delivered silence"
         // (peak ≈ −∞ dBFS → wrong/muted device) from "audio arrived but VAD
@@ -786,7 +696,7 @@ impl StateMachine {
         };
         if !enough {
             tracing::info!("utterance discarded: not enough speech");
-            self.set_state(AppState::Idle);
+            self.status.set_state(AppState::Idle);
             return;
         }
 
@@ -802,13 +712,14 @@ impl StateMachine {
         let raw = match self.services.router.transcribe(&utterance).await {
             Ok(t) => t,
             Err(e) => {
-                self.set_state(AppState::Error(format!("ASR failed: {e:#}")));
+                self.status
+                    .set_state(AppState::Error(format!("ASR failed: {e:#}")));
                 return;
             }
         };
         if raw.trim().is_empty() {
             tracing::info!("transcription empty; nothing to type");
-            self.set_state(AppState::Idle);
+            self.status.set_state(AppState::Idle);
             return;
         }
 
@@ -821,12 +732,12 @@ impl StateMachine {
         let merge = self.stitch_seam(&processed);
         if merge.text.is_empty() {
             tracing::info!("final chunk was pure seam overlap; nothing to type");
-            self.set_state(AppState::Idle);
+            self.status.set_state(AppState::Idle);
             return;
         }
         tracing::info!(raw = %raw, typed = %merge.text, dropped = merge.dropped_words, backspaces = merge.backspaces, "text ready");
 
-        self.set_state(AppState::Typing);
+        self.status.set_state(AppState::Typing);
         if merge.backspaces > 0 {
             if let Err(e) = inject_backspaces(merge.backspaces) {
                 tracing::warn!(error = %e, "seam backspaces failed");
@@ -835,20 +746,21 @@ impl StateMachine {
         match inject_text(&merge.text) {
             Ok(n) => {
                 tracing::info!(chars = n, "text injected");
-                self.set_last_text(merge.text);
-                self.set_state(AppState::Idle);
+                self.status.set_last_text(merge.text);
+                self.status.set_state(AppState::Idle);
             }
             Err(e) => {
-                self.set_state(AppState::Error(format!("injection failed: {e:#}")));
+                self.status
+                    .set_state(AppState::Error(format!("injection failed: {e:#}")));
             }
         }
 
         // `Error` is transient: keep it visible just long enough to read, then
         // return to Idle so the next push-to-talk press starts a fresh
         // recording instead of being swallowed by a stale failure.
-        if matches!(self.status_rx.borrow().state, AppState::Error(_)) {
+        if matches!(self.status.snapshot().state, AppState::Error(_)) {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            self.set_state(AppState::Idle);
+            self.status.set_state(AppState::Idle);
         }
     }
 }
