@@ -9,6 +9,7 @@
 pub mod asr;
 pub mod audio;
 pub mod config;
+pub mod doctor;
 pub mod gui;
 pub mod hotkey;
 pub mod logging;
@@ -116,6 +117,27 @@ fn log_progress(phase: &'static str) -> impl Fn(u64, Option<u64>) {
     }
 }
 
+/// Whether this run is a diagnostic request rather than a normal launch.
+///
+/// `main.rs` builds with `#![windows_subsystem = "windows"]`, so there is no
+/// stdout and a flag would otherwise be invisible. The single argument form is
+/// checked on the process command line instead.
+pub fn doctor_requested() -> bool {
+    std::env::args().skip(1).any(|a| a == "--doctor")
+}
+
+/// Writes the diagnostic report and returns it, without starting the app.
+///
+/// Must stay free of the things that stop a real startup: no microphone, no
+/// model mapping, no window. It is needed exactly when the app cannot start.
+pub fn run_doctor() -> std::path::PathBuf {
+    let config_path = paths::resolve_config_path();
+    let settings = Settings::load_or_create(&config_path).unwrap_or_default();
+    let hotkeys = HotkeyListener::config_from_settings(&settings.hotkey);
+    let diagnosis = doctor::diagnose(&settings, &hotkeys, cloud_key_in_env(), &config_path);
+    doctor::write_default(&diagnosis)
+}
+
 /// Bootstraps the whole application. Blocks until the GUI closes.
 pub fn run() -> Result<()> {
     let started = std::time::Instant::now();
@@ -189,10 +211,15 @@ pub fn run() -> Result<()> {
     let hotkey_config = HotkeyListener::config_from_settings(&settings.hotkey);
     // A hotkey the settings could not supply is replaced by the built-in
     // default so push-to-talk still works, but the user gets a working app on
-    // the wrong key. Say so at startup: this is the one signal that a typo in
-    // `config.toml` changed what their shortcut does.
-    for problem in hotkey_config.problems() {
-        tracing::warn!("{}", problem.message());
+    // the wrong key. Written to a readable file, not just a log nobody opens.
+    let diagnosis = doctor::diagnose(&settings, &hotkey_config, cloud_key_in_env(), &config_path);
+    let report_path = doctor::write_default(&diagnosis);
+    if diagnosis.verdict != doctor::Verdict::Clean {
+        tracing::warn!(
+            report = %report_path.display(),
+            problems = diagnosis.problems.len(),
+            "the configuration is not being used as written — see the diagnostic report"
+        );
     }
     let listener = HotkeyListener::spawn_with_config(hk_tx, hotkey_config)?;
     // Handle the dashboard keeps: live re-bind of shortcuts and the

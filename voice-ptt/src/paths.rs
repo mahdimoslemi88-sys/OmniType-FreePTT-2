@@ -33,87 +33,74 @@ pub fn resolve_assets_dir() -> PathBuf {
 
 /// Resolves the dictionary.toml file location with portable exe-first priority.
 pub fn resolve_dictionary_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("dictionary.toml");
-            if p.is_file() {
-                return p;
-            }
-        }
-    }
-    let p = PathBuf::from("dictionary.toml");
-    if p.is_file() {
-        return p;
-    }
-    let p = dirs_or_cwd().join("dictionary.toml");
-    if p.is_file() {
-        return p;
-    }
-
-    // Default target for fresh creation: exe dir if writable, else AppData
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("dictionary.toml");
-            if std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&p).is_ok() {
-                return p;
-            }
-        }
-    }
-    let app_data = dirs_or_cwd();
-    let _ = std::fs::create_dir_all(&app_data);
-    app_data.join("dictionary.toml")
+    resolve_file("dictionary.toml")
 }
 
 /// Resolves the config.toml file location with portable exe-first priority.
 pub fn resolve_config_path() -> PathBuf {
+    resolve_file("config.toml")
+}
+
+/// Resolves where the diagnostic report is written, with the same portable
+/// exe-first priority as every other file.
+///
+/// The report is a *first* citizen file, not a log: `--doctor` writes it so a
+/// user can open it in Notepad, and a normal startup rewrites it so the
+/// answer is already on disk when someone finally asks "why isn't this
+/// working?". It lives next to `config.toml` because that is where a user
+/// being told to check something will look.
+pub fn resolve_doctor_report_path() -> PathBuf {
+    resolve_file("doctor-report.txt")
+}
+
+/// Resolves the cloud_usage.json file location with portable exe-first priority.
+pub fn resolve_usage_path() -> PathBuf {
+    resolve_file("cloud_usage.json")
+}
+
+/// The four-step file resolution shared by every file this app owns:
+/// existing exe-dir file → existing cwd file → existing AppData file →
+/// first *writable* target (exe dir, else AppData).
+///
+/// The last step is what keeps the location stable across launches: a file
+/// that does not exist yet has to land somewhere that will be found next time.
+fn resolve_file(file_name: &str) -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("config.toml");
+            let p = dir.join(file_name);
             if p.is_file() {
                 return p;
             }
         }
     }
-    let p = PathBuf::from("config.toml");
+    let p = PathBuf::from(file_name);
     if p.is_file() {
         return p;
     }
-    let p = dirs_or_cwd().join("config.toml");
+    let p = dirs_or_cwd().join(file_name);
     if p.is_file() {
         return p;
     }
 
-    // Default target for fresh creation: exe dir if writable, else AppData
+    // Fresh file: exe dir if writable, else AppData.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("config.toml");
-            if std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&p).is_ok() {
+            let p = dir.join(file_name);
+            if std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&p)
+                .is_ok()
+            {
                 return p;
             }
         }
     }
     let app_data = dirs_or_cwd();
     let _ = std::fs::create_dir_all(&app_data);
-    app_data.join("config.toml")
+    app_data.join(file_name)
 }
-
-/// Resolves the cloud_usage.json file location with portable exe-first priority.
-pub fn resolve_usage_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("cloud_usage.json");
-            if p.is_file() {
-                return p;
-            }
-        }
-    }
-    let p = PathBuf::from("cloud_usage.json");
-    if p.is_file() {
-        return p;
-    }
-    dirs_or_cwd().join("cloud_usage.json")
-}
-
 
 fn resolve_dir(dir_name: &str) -> PathBuf {
     // 1-3: reuse an existing directory (stable across launches).
