@@ -1,7 +1,7 @@
 # طرح ریفکتور مرحلهٔ دوم — بر پایهٔ اندازه‌گیری
 
 **تاریخ:** ۲۰۲۶-۰۹-۳۰ · **وضعیت:** گام ۱ تا ۵ **انجام شد** · **کامیت‌نشده**
-**پایه:** ۱۹٬۲۸۸ خط در ۵۲ فایل · ۲۳۷ تست سبز · clippy صفر warning
+**پایه:** ۱۹٬۲۸۸ خط در ۵۲ فایل · ۲۴۸ تست سبز · clippy صفر warning
 
 > هر عدد این سند با اسکریپت روی کد واقعی به‌دست آمده، نه با چشم. جایی که ادعای قبلی غلط بود
 > در بخش ۵ صریح اصلاح شده.
@@ -222,3 +222,25 @@ canary در `DashboardFlags::take` هم **نسوخت**: هیچ تستی `Overlay
 | state machine | ۲۱ |
 
 `state/machine.rs` حلقهٔ ضبط ۱۷۰ · قطعه‌ها ۱۵۶ · `finalize` ۱۰۱.
+
+---
+
+## ۱۱. گام ۷ — فاز tray + hotkeys
+
+| | قبل | بعد |
+|---|---|---|
+| `hotkey/listener.rs` | ۶۵۵ خط | **۶۳۷** (fallback قدیمی کامنت شد، نه حذف) |
+| `hotkey/diagnostics.rs` | — | **۳۱۹ خط، ۹ تست** |
+| `hotkey/binding.rs` | ۶۴۹ | ۶۹۵ (`key_vk_code`/`modifier_vk_code` منتقل شد) |
+| `gui/flags.rs` | ۱۵۳ | **۲۰۴** (`Toggle::for_hotkey_event` + ۲ تست) |
+| تست `--lib` | ۲۳۷ | **۲۴۸** |
+
+`key_vk_code` و `modifier_vk_code` به [binding.rs](../voice-ptt/src/hotkey/binding.rs) منتقل شدند
+چون نازک‌پوششی Win32 روی `Key`/`Modifier` هستند و `binding.rs` مالک آن انواع است — بدون این
+جابجایی، `diagnostics` مجبور می‌شد به `listener` وابسته شود و حلقه شکل می‌گرفت.
+
+### آنچه هنوز `--doctor` را می‌طلبد
+
+`HotkeyConfig::problems()` و `asr::plan::ActiveSelection::Missing` هر دو **مقدار** هستند و
+می‌شود خواندشان. آنچه مانده: نوشتنشان در فایل، چون `main.rs` با
+`#![windows_subsystem = "windows"]` هیچ stdout ندارد. این کار تقریباً آماده است.

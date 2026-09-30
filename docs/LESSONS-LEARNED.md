@@ -117,7 +117,7 @@ let draggable = matches!(mode, OrbMode::Idle | OrbMode::Error);
 **نتیجه:** canary درج شد، کامپایلر آن را تأیید کرد، و **هیچ تستی شکست نخورد**. یعنی هیچ تستی
 `set_state` را صدا نمی‌زند.
 
-**علت.** ۱۴ تست `state::machine` فقط **تابع��ای خالص** را می‌آزمایند: `should_flush_chunk`،
+**علت.** ۱۴ تست `state::machine` فقط **تابع‌های خالص** را می‌آزمایند: `should_flush_chunk`،
 `LatchPolicy`، `SeamStitcher`. هیچ‌کدام `StateMachine` نمی‌سازند و `run()` را اجرا نمی‌کنند.
 
 **چرا مهم است.** ۱۹۹ تست سبز در اینجا فقط می‌گویند «چیزی نشکست»، نه «کد منتقل‌شده درست کار

@@ -54,7 +54,7 @@
 > این بخش عمداً کوتاه نگه داشته می‌شود؛ اعداد تفصیلی در [MEASURED-FACTS.md](MEASURED-FACTS.md).
 
 - **کد:** ۱۸٬۶۹۵ خط Rust در ۴۲ فایل (پیش از ریفکتور `overlay/`).
-- **تست:** ۲۳۷ تست `--lib`، همه سبز. `cargo clippy --all-targets` صفر warning.
+- **تست:** ۲۴۸ تست `--lib`، همه سبز. `cargo clippy --all-targets` صفر warning.
 - **ریفکتور انجام‌شده:** `gui/overlay.rs` از ۴۲۵۰ خط به ۱۱۶۲ خط و ۹ ماژول مستقل رفت. `OverlayApp` از ۶۳ فیلد به ۴۳ فیلد رسید. **کامیت نشده.**
 - **ریلیز:** `v0.3.0` منتشر شده. لینک در بخش ۵.
 - **هالهٔ سفید بالای اورب:** **وجود دارد و درمان نشده.** ببین [بخش ۱۶ گزارش](GUI-WINDOW-ARTIFACT-REPORT.md).
@@ -122,7 +122,7 @@ src/
 ├── state/  machine.rs (ماشین حالت دیکته) · status.rs (StatusChannel)
 ├── vad/    mod · silero
 ├── config/settings.rs
-├── hotkey/  binding · listener
+├── hotkey/  binding (VK) · diagnostics (چرا هات‌کی عوض شد) · listener
 ├── processing/  dictionary · normalizer · seam
 └── paths.rs · updates.rs · logging.rs
 ```
