@@ -36,6 +36,7 @@
 | ۷ | کشف endpoint | `asr/antigravity/discovery.rs` | ۵۳۰ | ۹ |
 | ۸ | ترتیب موتورهای ASR | `asr/plan.rs` | ۳۵۹ | ۱۳ |
 | ۹ | گزارش هات‌کی | `hotkey/diagnostics.rs` | ۳۱۸ | ۹ |
+| ۱۰ | گزارش تشخیصی کاربر | `doctor.rs` + `paths.rs` | ۳۴۶ + ۱۶۶ | ۱۱ |
 
 **۱۶ ماژول تازه** از ۵۲ فایل ⇒ **۵۹ فایل** (مجموع ۲۰٬۷۸۰ خط شامل تست‌ها).
 
@@ -59,11 +60,11 @@
 
 | | قبل | بعد |
 |---|---|---|
-| `cargo test --lib` | **۱۹۹** | **۲۴۸** |
+| `cargo test --lib` | **۱۹۹** | **۲۵۹** |
 | `cargo clippy --all-targets` | صفر | **صفر** |
 | `cargo build --release` | سبز | **سبز** (۳۷٬۷۴۰٬۰۳۲ بایت) |
 
-توزیع ۲۴۸ تست: `asr` ۷۱ · `gui` ۵۰ · `processing` ۳۹ · `hotkey` ۳۰ · `state` ۲۲ · `audio` ۱۰ · `vad` ۹ · بقیه ۱۷.
+توزیع ۲۵۹ تست: `asr` ۷۱ · `gui` ۵۰ · `processing` ۳۹ · `hotkey` ۳۰ · `state` ۲۲ · `audio` ۱۰ · `vad` ۹ · بقیه ۱۷.
 
 ---
 
@@ -148,7 +149,7 @@
 | `state/machine.rs` | حلقهٔ ضبط ۱۷۰ · قطعه‌ها ۱۵۶ · `finalize` ۱۰۱ |
 | `OverlayApp` | ۳۰ فیلد |
 | `window_shape.rs` | ۱٬۰۵۲ خط، **عمداً دست‌نخورده** |
-| `--doctor` | هر دو مقدار تشخیصی ساخته شده‌اند؛ فقط نوشتن در فایل مانده |
+| `--doctor` | **ساخته و اجرا شد** — [MEASURED-FACTS.md](MEASURED-FACTS.md) بند ۱۳ |
 | نسخه | `v0.3.0` منتشر شده؛ کاربر نظرش را دربارهٔ `v0.2.1` نداده |
 | dist | `voice-ptt-dist/` هنوز نسخهٔ قبلی است |
 

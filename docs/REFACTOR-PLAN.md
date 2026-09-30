@@ -1,7 +1,7 @@
 # طرح ریفکتور مرحلهٔ دوم — بر پایهٔ اندازه‌گیری
 
 **تاریخ:** ۲۰۲۶-۰۹-۳۰ · **وضعیت:** گام ۱ تا ۵ **انجام شد** · **کامیت‌نشده**
-**پایه:** ۱۹٬۲۸۸ خط در ۵۲ فایل · ۲۴۸ تست سبز · clippy صفر warning
+**پایه:** ۱۹٬۲۸۸ خط در ۵۲ فایل · ۲۵۹ تست سبز · clippy صفر warning
 
 > هر عدد این سند با اسکریپت روی کد واقعی به‌دست آمده، نه با چشم. جایی که ادعای قبلی غلط بود
 > در بخش ۵ صریح اصلاح شده.
@@ -239,8 +239,8 @@ canary در `DashboardFlags::take` هم **نسوخت**: هیچ تستی `Overlay
 چون نازک‌پوششی Win32 روی `Key`/`Modifier` هستند و `binding.rs` مالک آن انواع است — بدون این
 جابجایی، `diagnostics` مجبور می‌شد به `listener` وابسته شود و حلقه شکل می‌گرفت.
 
-### آنچه هنوز `--doctor` را می‌طلبد
+### `--doctor` — انجام شد
 
-`HotkeyConfig::problems()` و `asr::plan::ActiveSelection::Missing` هر دو **مقدار** هستند و
-می‌شود خواندشان. آنچه مانده: نوشتنشان در فایل، چون `main.rs` با
-`#![windows_subsystem = "windows"]` هیچ stdout ندارد. این کار تقریباً آماده است.
+`HotkeyConfig::problems()` و `asr::plan::ActiveSelection::Missing` هر دو به
+[doctor.rs](../voice-ptt/src/doctor.rs) وصل شدند و گزارش در فایل نوشته می‌شود.
+جزئیات آزمون end-to-end در [MEASURED-FACTS.md](MEASURED-FACTS.md) بند ۱۳.
