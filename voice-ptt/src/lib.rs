@@ -483,20 +483,28 @@ pub fn run() -> Result<()> {
         let model_name = model_name.clone();
         rt.spawn(async move {
             let progress_cb = log_progress("whisper");
-            match downloader::ensure_model(&models_dir, &model_name, Some(&progress_cb)).await {
+            let outcome = match downloader::ensure_model(
+                &models_dir,
+                &model_name,
+                Some(&progress_cb),
+            )
+            .await
+            {
                 Ok(path) => {
-                    if engine.reload(&path) {
-                        tracing::info!(
-                            model = %path.display(),
-                            "whisper model ready (background download)"
-                        );
-                        logging::stage("models", "model file ready");
-                    }
+                    let reloaded = engine.reload(&path);
+                    asr::model_load::ModelLoad::classify(false, Ok(path), reloaded)
                 }
-                Err(e) => tracing::error!(
-                    error = %e,
-                    "whisper model download failed; local engine stays offline (cloud engines still work)"
-                ),
+                Err(e) => asr::model_load::ModelLoad::classify(false, Err(e.to_string()), false),
+            };
+            // `reload` returning false used to fall through this `if` and log
+            // nothing at all; `ModelLoad` keeps that case and says it out loud.
+            match outcome.level() {
+                logging::Severity::Info => {
+                    tracing::info!("{}", outcome.message());
+                    logging::stage("models", "model file ready");
+                }
+                logging::Severity::Warn => tracing::warn!("{}", outcome.message()),
+                logging::Severity::Error => tracing::error!("{}", outcome.message()),
             }
         });
     }
