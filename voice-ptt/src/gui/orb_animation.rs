@@ -52,6 +52,16 @@ impl OrbMode {
         }
     }
 
+    /// Whether the orb is being shaken sideways in this mode.
+    ///
+    /// A shake is a *translation* of the whole painted circle, not a larger
+    /// one, so it widens the orb's reach only for as long as it lasts. Read by
+    /// `gui::orb` so the click target covers the excursion in the mode that
+    /// shakes and is not charged for it in the four that cannot.
+    pub fn shakes(self) -> bool {
+        matches!(self, OrbMode::Error)
+    }
+
     /// Whether the hover enlargement is offered in this mode.
     ///
     /// Only the draggable modes get it (`Orb::show` gates `set_hover` on the

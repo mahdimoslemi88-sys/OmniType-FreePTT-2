@@ -20,7 +20,15 @@ const GLOW_EXTENT: f32 = 0.55;
 /// window from the drawing.
 const SHAKE_EXTENT: f32 = 0.22;
 const GLOW_LAYERS: usize = 12;
-const MIN_HIT_RADIUS: f32 = 24.0;
+/// Smallest radius the orb will answer a click on, in points — a floor for
+/// when the scale spring has the orb nearly collapsed.
+///
+/// It is *one* floor for the pointer test **and** for the Win32 window region,
+/// because there is only one target: the number the window claims from the
+/// desktop and the number egui listens on have to be the same circle, or the
+/// difference between them is a ring of pixels the window swallows and nothing
+/// answers (see [`interaction_radius_pt`]).
+const MIN_INTERACTION_RADIUS: f32 = 24.0;
 const COMPLETE_HOLD_SECS: f32 = 0.9;
 const ERROR_SHAKE_SECS: f32 = 0.55;
 
@@ -227,7 +235,13 @@ impl Orb {
                 let radius = BASE_DIAMETER * 0.5 * self.anim.current_scale;
                 let center = screen.center() + self.shake_offset(radius);
 
-                let hit_radius = (radius * 1.1).max(MIN_HIT_RADIUS);
+                // The pointer target is the orb's own painted circle, not a
+                // fraction of it: `radius * 1.1` was a fudge factor that had
+                // nothing to do with what `paint` draws, so the window region
+                // (drawn from the geometry) was 27.9 pt wider than this and the
+                // difference was a dead ring around the orb — clicks the window
+                // took from the desktop and threw away.
+                let hit_radius = interaction_radius_pt(self.anim.current_scale, mode.shakes());
                 let hit_rect = Rect::from_center_size(center, Vec2::splat(hit_radius * 2.0));
                 let response =
                     ui.interact(hit_rect, Id::new("omnitype_orb"), Sense::click_and_drag());
@@ -267,9 +281,11 @@ impl Orb {
         let side_px = (side_pt * ppp).ceil() as i32;
         // The window is a square and the orb is a circle in the middle of it,
         // so every click outside the orb's painted reach is a click this window
-        // takes from whatever is underneath. `painted_radius` is that reach; the
-        // window region is clipped to it. See `ClickRegion`.
-        let region_radius_px = (self.painted_radius_pt() * ppp).ceil() as i32;
+        // takes from whatever is underneath. `interaction_radius_pt` is that
+        // reach — and the same number sizes the pointer target, so the region
+        // and the hit test cannot drift apart. See `ClickRegion`.
+        let region_radius_px =
+            (interaction_radius_pt(self.anim.current_scale, mode.shakes()) * ppp).ceil() as i32;
         self.window
             .place(self.anim.current_position, side_px, region_radius_px, ppp);
         // phase 1: only resize when the canvas actually changed.
@@ -386,18 +402,6 @@ impl Orb {
             self.home = clamped;
             self.anim.snap_position(clamped);
         }
-    }
-
-    /// How far from the orb's centre it can paint this frame, in points.
-    ///
-    /// The same number bounds the click region and the window, so the two
-    /// cannot disagree — which is exactly how the region used to end up a few
-    /// points short of the success burst and shear its outermost particles.
-    /// Clamped to the canvas so the region never asks for more than the window
-    /// has.
-    fn painted_radius_pt(&self) -> f32 {
-        painted_reach_pt(self.anim.current_scale, true)
-            .clamp(MIN_HIT_RADIUS, Self::max_canvas_points() * 0.5)
     }
 
     /// Fixed window side in points: twice the furthest the orb can paint, for
@@ -985,6 +989,36 @@ mod win {
     }
 }
 
+/// The one radius, in points, that decides how big the orb is to a click.
+///
+/// Both the egui pointer rectangle and the Win32 window region come from here,
+/// and that is the whole point of the function existing:
+///
+/// * The window region is what stops the transparent square from stealing
+///   clicks from the desktop behind it. It *also* clips rendering, so it cannot
+///   be made smaller than the painted orb to match a smaller click target —
+///   that would shear the glow and the success burst with a hard circular edge.
+/// * The egui rect is what turns a click into a press/release. Anything the
+///   region claims that this rect does not cover is a click the window eats and
+///   drops.
+///
+/// They were derived separately (`radius * 1.1` here, `painted_reach_pt` there),
+/// which left a dead ring 27.9 pt wide at idle and 35.5 pt while recording —
+/// widest exactly when the orb is easiest to miss. Deriving both from the
+/// painted geometry makes the ring zero by construction rather than by tuning.
+///
+/// `with_shake` is true only in [`OrbMode::Error`], which is the only mode that
+/// shakes; charging the other four for a translation they cannot have would grow
+/// an invisible but live ring around a still orb.
+///
+/// Free-standing, and free of [`Orb`], so the five modes can be checked without
+/// building a window.
+fn interaction_radius_pt(scale: f32, with_shake: bool) -> f32 {
+    painted_reach_pt(scale, with_shake)
+        .max(MIN_INTERACTION_RADIUS)
+        .min(Orb::max_canvas_points() * 0.5)
+}
+
 /// How far out from the orb's centre it can paint, in points, at `scale`.
 ///
 /// `with_shake` is a separate term because the shake is a *translation* of the
@@ -1021,21 +1055,186 @@ fn keep_out_px(scale: f32, ppp: f32) -> f32 {
     (painted_reach_pt(scale, true) + EDGE_MARGIN_PT) * ppp
 }
 
-/// The painted reach, for `window_shape`'s click-through tests.
+/// The orb's click target, for `window_shape`'s click-through tests.
 ///
-/// The region the orb asks Win32 for and the reach this returns have to be the
-/// same number, or one of the two guarantees (no cropped glow / no stolen
-/// clicks) is silently lost. Exposing it here lets that be a test instead of an
-/// assumption.
+/// The region the orb asks Win32 for and the number egui hit-tests on are both
+/// this, or one of the two guarantees (no cropped glow / no stolen clicks) is
+/// silently lost. Exposing it here lets that be a test instead of an assumption.
 #[cfg(test)]
-pub(crate) fn painted_reach_pt_for_test(scale: f32) -> f32 {
-    painted_reach_pt(scale, true)
+pub(crate) fn interaction_radius_pt_for_test(scale: f32, with_shake: bool) -> f32 {
+    interaction_radius_pt(scale, with_shake)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::orb_animation::max_reachable_scale;
+    use crate::gui::orb_animation::{max_reachable_scale, HOVER_SCALE_BOOST};
+
+    /// `SetWindowRgn` clips *rendering* as well as hit-testing, so a region (and
+    /// a window) smaller than the painted orb would not merely shrink the click
+    /// target — it would shear the glow, or the success burst, off with a hard
+    /// circular edge. That failure is silent on screen, so the ceiling is pinned
+    /// here instead of being re-derived by eye.
+    ///
+    /// The measured defect, as a test: no click the window claims can die
+    /// between that window and the orb.
+    ///
+    /// The pointer rectangle and the Win32 region used to be derived
+    /// independently — `radius * 1.1` for the pointer, `painted_reach_pt` for
+    /// the region — and the difference was a ring 27.9 pt wide at idle and
+    /// 35.5 pt while recording (B0 §6-1): the window took the click, egui never
+    /// saw it, and neither did the app underneath. Both now come from
+    /// [`interaction_radius_pt`], so the property to pin is that this number is
+    /// never *inside* the painted circle.
+    #[test]
+    fn no_click_dies_between_the_window_region_and_the_orb() {
+        let mut scale = 0.2f32;
+        while scale <= max_reachable_scale() {
+            for mode in OrbMode::ALL {
+                let hit = interaction_radius_pt(scale, mode.shakes());
+                let painted = painted_reach_pt(scale, mode.shakes());
+                // The floor may push the target past the drawing — a collapsed
+                // orb is still clickable. It may never pull it inside the
+                // drawing, because that is the dead ring again.
+                assert!(
+                    hit >= painted - 0.001,
+                    "{mode:?} at scale {scale}: clicks die between {painted} pt \
+                     and {hit} pt"
+                );
+                assert!(hit <= Orb::max_canvas_points() * 0.5 + 0.001);
+            }
+            scale += 0.01;
+        }
+    }
+
+    /// The sizes themselves, as a table: what `radius * 1.1` used to claim,
+    /// against what the window now claims, for every mode and for hover.
+    ///
+    /// The right-hand column is spelled out rather than recomputed, so a change
+    /// to the drawing is a visible diff here instead of a silently larger click
+    /// target in a release nobody diffs. The left-hand column is the number B0
+    /// §6-1 measured the dead ring against.
+    #[test]
+    fn the_click_target_grew_from_a_guess_to_the_painted_circle() {
+        let hover = 1.0 + HOVER_SCALE_BOOST;
+        let cases: [(&str, f32, bool); 6] = [
+            ("Idle", 1.0, false),
+            ("Idle + hover", hover, false),
+            ("Recording", OrbMode::Recording.target_scale(), false),
+            ("Processing", OrbMode::Processing.target_scale(), false),
+            ("Complete", OrbMode::Complete.target_scale(), false),
+            ("Error", 1.0, true),
+        ];
+        let rows: Vec<String> = cases
+            .iter()
+            .map(|(name, scale, shake)| {
+                let old = (BASE_DIAMETER * 0.5 * scale * 1.1).max(MIN_INTERACTION_RADIUS);
+                format!(
+                    "{name}: {old:.1} pt -> {:.1} pt",
+                    interaction_radius_pt(*scale, *shake)
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "Idle: 33.0 pt -> 54.3 pt",
+                "Idle + hover: 35.6 pt -> 58.6 pt",
+                "Recording: 55.0 pt -> 90.5 pt",
+                "Processing: 49.5 pt -> 81.4 pt",
+                "Complete: 49.5 pt -> 81.4 pt",
+                "Error: 33.0 pt -> 60.9 pt",
+            ],
+            "the click target table changed"
+        );
+    }
+
+    /// The floor has to stay a floor: a scale the spring reaches mid-flight
+    /// (tapping push-to-talk quickly stacks overshoot on overshoot) must not
+    /// leave the orb unclickable, and it must not be larger than the window can
+    /// hold.
+    #[test]
+    fn a_collapsed_orb_is_still_clickable_and_still_inside_the_canvas() {
+        let collapsed = interaction_radius_pt(0.2, false);
+        assert_eq!(collapsed, MIN_INTERACTION_RADIUS);
+        assert!(collapsed > painted_reach_pt(0.2, false));
+        assert!(collapsed <= Orb::max_canvas_points() * 0.5);
+        // A nonsense scale cannot produce a nonsense target either.
+        assert_eq!(
+            interaction_radius_pt(f32::NAN, false),
+            MIN_INTERACTION_RADIUS
+        );
+        assert_eq!(
+            interaction_radius_pt(f32::INFINITY, false),
+            Orb::max_canvas_points() * 0.5
+        );
+    }
+
+    /// Only `Error` shakes, so only `Error` may be charged for the excursion.
+    /// If the other four were, each would grow an invisible-but-live ring —
+    /// clicks that work on a part of the screen nothing was ever drawn on.
+    ///
+    /// The expectations are written out per mode instead of being derived from
+    /// `shakes()`, because a table computed from the same predicate it is
+    /// supposed to check cannot fail: that is how the first version of this
+    /// test passed with `shakes()` returning `true` for everything (canary C20).
+    #[test]
+    fn only_the_shaking_mode_pays_for_the_shake() {
+        let hover = 1.0 + HOVER_SCALE_BOOST;
+        // (`name`, `mode`, `scale`, `expected`) — the expectation is spelled out
+        // per mode rather than derived from `shakes()`, because a table computed
+        // from the same predicate it is meant to check cannot fail. That is how
+        // the first version of this test stayed green while `shakes()` returned
+        // `true` for every mode (canary C20).
+        let cases: [(&str, OrbMode, f32, f32); 6] = [
+            ("Idle", OrbMode::Idle, 1.0, painted_reach_pt(1.0, false)),
+            (
+                "Idle + hover",
+                OrbMode::Idle,
+                hover,
+                painted_reach_pt(hover, false),
+            ),
+            (
+                "Recording",
+                OrbMode::Recording,
+                OrbMode::Recording.target_scale(),
+                painted_reach_pt(OrbMode::Recording.target_scale(), false),
+            ),
+            (
+                "Processing",
+                OrbMode::Processing,
+                OrbMode::Processing.target_scale(),
+                painted_reach_pt(OrbMode::Processing.target_scale(), false),
+            ),
+            (
+                "Complete",
+                OrbMode::Complete,
+                OrbMode::Complete.target_scale(),
+                painted_reach_pt(OrbMode::Complete.target_scale(), false),
+            ),
+            ("Error", OrbMode::Error, 1.0, painted_reach_pt(1.0, true)),
+        ];
+        for (name, mode, scale, want) in cases {
+            let got = interaction_radius_pt(scale, mode.shakes());
+            assert!(
+                (got - want).abs() < 0.001,
+                "{name}: {got} pt, and the expected answer for \
+                 {} is {want} pt",
+                if mode.shakes() {
+                    "a shaking orb"
+                } else {
+                    "a still orb"
+                },
+            );
+        }
+        // The two answers have to actually differ, or the table above would pass
+        // even if the shake term were quietly dropped everywhere.
+        let excursion = painted_reach_pt(1.0, true) - painted_reach_pt(1.0, false);
+        assert!(
+            (excursion - BASE_DIAMETER * 0.5 * reach::SHAKE).abs() < 0.001,
+            "the shake term is worth {excursion} pt, not one radius x SHAKE"
+        );
+    }
 
     /// `SetWindowRgn` clips *rendering* as well as hit-testing, so a region (and
     /// a window) smaller than the painted orb would not merely shrink the click

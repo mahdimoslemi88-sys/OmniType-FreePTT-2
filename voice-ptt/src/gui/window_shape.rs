@@ -26,6 +26,12 @@ extern "system" {
     /// Makes the window manager hit-test only inside `h_rgn`. Passing 0 clears
     /// the region and restores "the whole rect".
     fn SetWindowRgn(hwnd: isize, h_rgn: isize, b_redraw: i32) -> i32;
+    /// Reads the window region's bounding box back in window-relative
+    /// coordinates. Zero when the window carries no region at all (the box is
+    /// then emptied). Needs no buffer, so it is cheap enough to ask once a
+    /// frame — which is the point: it is the only way to tell whether the
+    /// window still has the region this process last gave it.
+    fn GetWindowRgnBox(hwnd: isize, lp_rect: *mut windows::Win32::Foundation::RECT) -> i32;
     fn SystemParametersInfoW(
         ui_action: u32,
         ui_param: u32,
@@ -363,12 +369,107 @@ pub fn click_region_px(region: ClickRegion, window_pt: [f32; 2], ppp: f32) -> Op
     }
 }
 
+/// The box, in window-relative pixels, that giving `px` to a window of
+/// `side_px` produces — or `None` when it means "this window carries no region
+/// at all".
+///
+/// Derived from the very coordinates handed to `CreateEllipticRgn` /
+/// `CreateRoundRectRgn` below, because that is the only place the two can be
+/// kept honest: [`window_region_box`] reads back exactly this shape's bounding
+/// box, so comparing them is a real check rather than a comparison of two
+/// separately-derived guesses.
+#[cfg(windows)]
+fn expected_region_box(px: ClickRegion, side_px: [i32; 2], ppp: f32) -> Option<[i32; 4]> {
+    let (side_w, side_h) = (side_px[0].max(0), side_px[1].max(0));
+    match px {
+        // `SetWindowRgn(hwnd, 0, 1)`, and `GetWindowRgnBox` reports nothing.
+        ClickRegion::Full => None,
+        // `right`/`bottom` are exclusive in both GDI region calls, which is why
+        // the `+ 1` here matches the `+ 1` handed to `CreateEllipticRgn`.
+        ClickRegion::Circle { radius_pt } => {
+            let r = (radius_pt * ppp).round() as i32;
+            let (cx, cy) = (side_w / 2, side_h / 2);
+            Some([cx - r, cy - r, cx + r + 1, cy + r + 1])
+        }
+        ClickRegion::RoundedRect { rect_pt, .. } => Some([
+            (rect_pt[0] * ppp).round() as i32,
+            (rect_pt[1] * ppp).round() as i32,
+            (rect_pt[2] * ppp).round() as i32,
+            (rect_pt[3] * ppp).round() as i32,
+        ]),
+    }
+}
+
+/// What the window says it is carrying: its region's bounding box in
+/// window-relative pixels, or `None` when it carries no region.
+///
+/// One `user32` call, no allocation, no buffer — cheap enough to be the thing
+/// that makes [`apply_click_region`]'s cache trustworthy instead of merely
+/// self-consistent.
+#[cfg(windows)]
+fn window_region_box(hwnd: isize) -> Option<[i32; 4]> {
+    use windows::Win32::Foundation::RECT;
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // Fails for a window with no region, which is exactly the case that has to
+    // read as `None`.
+    if unsafe { GetWindowRgnBox(hwnd, &mut rect) } == 0 {
+        return None;
+    }
+    Some([rect.left, rect.top, rect.right, rect.bottom])
+}
+
+/// Whether [`apply_click_region`] may skip the Win32 call this frame.
+///
+/// Two independent things have to agree, and the second one is the point:
+///
+/// * the cache says this process already asked for this handle and shape, and
+/// * the window itself reports that shape.
+///
+/// Either alone is insufficient. The cache alone went stale when Windows rebuilt
+/// the OS window behind the same `HWND` value — the handle comparison still
+/// matched, so `SetWindowRgn` was never called again and the rebuilt window
+/// claimed clicks over its whole square forever. Asking the window is the only
+/// check that survives that, because it reads the state that actually matters.
+#[cfg(windows)]
+fn region_is_current(
+    cached: Option<(isize, ClickRegion)>,
+    hwnd: isize,
+    px: ClickRegion,
+    side_px: [i32; 2],
+    ppp: f32,
+    observed: Option<[i32; 4]>,
+) -> bool {
+    cached == Some((hwnd, px)) && observed == expected_region_box(px, side_px, ppp)
+}
+
+/// Records the shape the window is now carrying, after `SetWindowRgn` succeeded.
+///
+/// Only ever called on the success path: a cache that stores an *intent* the
+/// window manager refused is exactly how a cache starts lying.
+#[cfg(windows)]
+fn cache_click_region(hwnd: isize, px: ClickRegion) {
+    if let Ok(mut last) = CLICK_REGION_CACHE.lock() {
+        *last = Some((hwnd, px));
+    }
+}
+
 /// Applies a click region, skipping the call when it has not changed.
 ///
 /// `SetWindowRgn` makes the window manager send `WM_WINDOWPOSCHANGING` and
 /// `WM_WINDOWPOSCHANGED`, so calling it every frame would put the window
 /// through a spurious move/activate cycle 60 times a second for a shape that
 /// only changes when the orb animates.
+///
+/// The cache is a *hint*, not the truth: [`region_is_current`] also asks the
+/// window what it is actually carrying. That is what covers the one case the
+/// cache alone cannot — the OS window being rebuilt behind the same `HWND`
+/// value, which [`super::window_shape::register_main_hwnd`] deliberately reports
+/// as "unchanged" precisely because the value did not change.
 #[cfg(windows)]
 pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2], ppp: f32) {
     if hwnd == 0 {
@@ -377,26 +478,28 @@ pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2],
     let Some(px) = click_region_px(region, window_pt, ppp) else {
         return;
     };
-    {
-        let Ok(mut last) = CLICK_REGION_CACHE.lock() else {
-            return;
-        };
-        if *last == Some((hwnd, px)) {
-            return;
-        }
-        *last = Some((hwnd, px));
-    }
 
     // Half-pixel inset: a region that exactly touches the window edge can leave
     // a hairline of unowned pixels along the far sides.
     let side_w = (window_pt[0] * ppp).round() as i32;
     let side_h = (window_pt[1] * ppp).round() as i32;
+    let side_px = [side_w, side_h];
+    {
+        let Ok(last) = CLICK_REGION_CACHE.lock() else {
+            return;
+        };
+        if region_is_current(*last, hwnd, px, side_px, ppp, window_region_box(hwnd)) {
+            return;
+        }
+    }
+
     let rgn: isize = match px {
         ClickRegion::Full => {
             let ok = unsafe { SetWindowRgn(hwnd, 0, 1) };
             if ok == 0 {
                 tracing::debug!(hwnd, "clearing the window region failed");
             } else {
+                cache_click_region(hwnd, px);
                 force_repaint(hwnd);
             }
             return;
@@ -430,6 +533,7 @@ pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2],
         return;
     }
     // On success the system owns the region and must not be told to delete it.
+    cache_click_region(hwnd, px);
 
     // Repaint, or the old boundary stays on screen.
     //
@@ -451,9 +555,23 @@ pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2],
 }
 
 /// Drops the cached region so the next [`apply_click_region`] call always
-/// reaches the window manager. Needed when a window is recreated behind the
-/// same handle, and by tests.
+/// reaches the window manager.
+///
+/// Deliberately **not** wired into production any more, and that is the outcome
+/// rather than an omission. It used to be the only answer to "the window may not
+/// be carrying the region this process last gave it", and it needed a caller who
+/// could *detect* that — which nobody can, because the failure it was written
+/// for (Windows rebuilding the OS window behind the same `HWND` value) is by
+/// definition invisible to a handle comparison. The read-back in
+/// [`window_region_box`] detects it without a caller, so this is left as the
+/// hook tests use to prove the cache is consulted at all.
+#[cfg(all(windows, test))]
+fn cached_click_region() -> Option<(isize, ClickRegion)> {
+    CLICK_REGION_CACHE.lock().ok().and_then(|c| *c)
+}
+
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn invalidate_click_region() {
     if let Ok(mut last) = CLICK_REGION_CACHE.lock() {
         *last = None;
@@ -1001,7 +1119,10 @@ const PREVIEW_RESHAPE_INTERVAL: u32 = 15;
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{click_region_px, transparency_mode_from, ClickRegion, TransparencyMode};
+    use super::{
+        click_region_px, expected_region_box, invalidate_click_region, region_is_current,
+        transparency_mode_from, ClickRegion, TransparencyMode,
+    };
 
     /// The transparency default is the one thing here a user can only verify by
     /// looking at the screen, so pin the mapping: an unset/unknown env var must
@@ -1081,7 +1202,7 @@ mod tests {
     /// `Orb::max_canvas_points()`, which is the only size the orb ever uses.
     #[test]
     fn the_orb_region_is_a_circle_whatever_the_window_is() {
-        let reach_pt = super::super::orb::painted_reach_pt_for_test(1.0);
+        let reach_pt = super::super::orb::interaction_radius_pt_for_test(1.0, true);
         let canvas = super::super::orb::Orb::max_canvas_points();
         assert!(
             canvas >= reach_pt * 2.0 - 0.001,
@@ -1117,7 +1238,7 @@ mod tests {
     /// taking the clicks back.
     #[test]
     fn a_generous_window_does_not_grow_the_region() {
-        let reach_pt = super::super::orb::painted_reach_pt_for_test(1.0);
+        let reach_pt = super::super::orb::interaction_radius_pt_for_test(1.0, true);
         let small = click_region_px(
             ClickRegion::Circle {
                 radius_pt: reach_pt,
@@ -1150,6 +1271,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The cache is a hint; the window is the authority.
+    ///
+    /// B0 §6-3: `invalidate_click_region` had no production caller, because the
+    /// one event that invalidates the cache — Windows rebuilding the OS window
+    /// behind the same `HWND` value — is invisible to a handle comparison by
+    /// definition. So the decision now reads the window's own region back, and
+    /// these are the four answers it has to give.
+    #[test]
+    fn the_region_is_reapplied_whenever_the_window_disagrees() {
+        let hwnd = 0x1234;
+        let region = ClickRegion::Circle { radius_pt: 60.0 };
+        let side_px = [300, 300];
+        let ppp = 1.25;
+        let expected = expected_region_box(region, side_px, ppp);
+        assert!(expected.is_some(), "a circle has a bounding box");
+
+        // Cache and window agree: nothing to do.
+        assert!(region_is_current(
+            Some((hwnd, region)),
+            hwnd,
+            region,
+            side_px,
+            ppp,
+            expected
+        ));
+        // Cache says yes, window says it is carrying nothing: this is the
+        // rebuilt-window case, and it has to reach `SetWindowRgn`.
+        assert!(!region_is_current(
+            Some((hwnd, region)),
+            hwnd,
+            region,
+            side_px,
+            ppp,
+            None
+        ));
+        // Cache says yes, window is carrying a different box: also reapply.
+        assert!(!region_is_current(
+            Some((hwnd, region)),
+            hwnd,
+            region,
+            side_px,
+            ppp,
+            Some([0, 0, 1, 1])
+        ));
+        // Nothing cached at all, even with the window already correct: the first
+        // frame after startup has to establish the cache.
+        assert!(!region_is_current(
+            None, hwnd, region, side_px, ppp, expected
+        ));
+        // A different handle is never "current", whatever the window reports.
+        assert!(!region_is_current(
+            Some((0x999, region)),
+            hwnd,
+            region,
+            side_px,
+            ppp,
+            expected
+        ));
+    }
+
+    /// The box the read-back is compared against must be the box GDI was
+    /// actually given, or the comparison above would flag a correct window as
+    /// wrong forever. The `+ 1` on right/bottom is GDI's exclusive bound.
+    #[test]
+    fn the_expected_box_is_the_coordinates_gdi_receives() {
+        // 60 pt at 125% = 75 px, centred in a 300 px window.
+        let box_px = expected_region_box(ClickRegion::Circle { radius_pt: 60.0 }, [300, 300], 1.25);
+        assert_eq!(box_px, Some([75, 75, 226, 226]));
+        // The card's rounded rect is compared against its own bounds.
+        assert_eq!(
+            expected_region_box(
+                ClickRegion::RoundedRect {
+                    rect_pt: [10.0, 20.0, 110.0, 60.0],
+                    radius_pt: 8.0
+                },
+                [200, 200],
+                2.0,
+            ),
+            Some([20, 40, 220, 120])
+        );
+        // `Full` means "no region at all", which is exactly what the read-back
+        // reports for a window that has none.
+        assert_eq!(
+            expected_region_box(ClickRegion::Full, [200, 200], 1.0),
+            None
+        );
+    }
+
+    /// `invalidate_click_region` now has no production caller on purpose (see
+    /// its doc), so this is where it has to keep working — and where the cache
+    /// it clears is proved to be the thing being consulted.
+    #[test]
+    fn the_region_cache_can_be_forced_back_to_empty() {
+        let hwnd = 0x1234;
+        let region = ClickRegion::Circle { radius_pt: 60.0 };
+        let side_px = [300, 300];
+        let ppp = 1.25;
+        let box_px = expected_region_box(region, side_px, ppp);
+        super::cache_click_region(hwnd, region);
+        assert!(region_is_current(
+            super::cached_click_region(),
+            hwnd,
+            region,
+            side_px,
+            ppp,
+            box_px
+        ));
+        invalidate_click_region();
+        assert!(
+            !region_is_current(
+                super::cached_click_region(),
+                hwnd,
+                region,
+                side_px,
+                ppp,
+                box_px
+            ),
+            "invalidating must make the cache miss even though the window agrees"
+        );
+        invalidate_click_region();
     }
 
     /// A circle is clipped to the window when it does not fit, because
