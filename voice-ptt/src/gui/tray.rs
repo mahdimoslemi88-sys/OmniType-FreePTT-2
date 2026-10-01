@@ -9,6 +9,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::gui::flags::{DashboardFlags, Toggle};
+use crate::gui::tray_warning::{OpenTarget, TrayWarning, BASE_TOOLTIP};
 use crate::hotkey::HotkeyEvent;
 
 /// Builds the tray and spawns the event-polling thread.
@@ -18,10 +19,15 @@ use crate::hotkey::HotkeyEvent;
 ///   clears it. One struct rather than six parameters, because six of the same
 ///   type in a row can be swapped without the compiler noticing.
 /// * `update_state` — shared update state for checking/downloading releases.
+/// * `warning` — `None` when the startup diagnosis was clean, in which case the
+///   tray looks exactly as it always did. `Some` adds a badge to the icon and
+///   one menu item that opens the report; the decisions about *what* they say
+///   are [`TrayWarning`]'s, not this function's.
 pub fn spawn(
     hotkey_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
     flags: DashboardFlags,
     update_state: crate::updates::SharedUpdateState,
+    warning: Option<TrayWarning>,
 ) -> Result<()> {
     // Tray labels follow the skill's section-8 contract. Routine config and
     // dictionary editing happens in the unified dashboard — no external editors.
@@ -42,6 +48,22 @@ pub fn spawn(
     let quit_id = quit.id().clone();
 
     let menu = Menu::new();
+    // The warning is the first thing offered and the only thing that changes
+    // when the diagnosis is not clean: a badge on the icon, a tooltip that says
+    // so, and a top-of-menu item that opens the report. Kept out of the `else`
+    // chain below because it is a different shape (optional item, plus a file
+    // to open rather than a flag to raise).
+    let warning_item = match &warning {
+        Some(w) => {
+            let item = MenuItem::new(w.menu_label(), true, None);
+            menu.append(&item)?;
+            menu.append(&PredefinedMenuItem::separator())?;
+            Some(item)
+        }
+        None => None,
+    };
+    let warning_id = warning_item.as_ref().map(|i| i.id().clone());
+
     menu.append(&show_hide)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&engine_gui)?;
@@ -54,12 +76,16 @@ pub fn spawn(
     menu.append(&quit)?;
 
     let (icon_rgba, icon_w, icon_h) = app_icon_rgba();
+    let (icon_rgba, tooltip) = match &warning {
+        Some(w) => (w.icon(icon_rgba, icon_w, icon_h), w.tooltip()),
+        None => (icon_rgba, BASE_TOOLTIP.to_string()),
+    };
     let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_w, icon_h)?;
 
     let _tray: Box<TrayIcon> = Box::new(
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("OmniType — AI Voice Typing & Industrial Speech Routing")
+            .with_tooltip(tooltip)
             .with_icon(icon)
             .build()?,
     );
@@ -73,7 +99,21 @@ pub fn spawn(
         .spawn(move || {
             let receiver = MenuEvent::receiver();
             while let Ok(event) = receiver.recv() {
-                if event.id == show_id {
+                if warning_id.as_ref() == Some(&event.id) {
+                    // One warning, one destination — chosen by the fact that
+                    // is wrong, not by how loud the badge is. Raising a flag
+                    // shows the window and switches the tab (see
+                    // `OverlayApp::open_dashboard`); the other arm opens a
+                    // file, because a report is not a panel of ours.
+                    if let Some(w) = &warning {
+                        match w.target() {
+                            OpenTarget::EnginePanel => flags.raise(Toggle::Engine),
+                            OpenTarget::Report => {
+                                crate::updates::open_path_in_default_app(w.report())
+                            }
+                        }
+                    }
+                } else if event.id == show_id {
                     flags.raise(Toggle::Overlay);
                 } else if event.id == history_gui_id {
                     flags.raise(Toggle::History);

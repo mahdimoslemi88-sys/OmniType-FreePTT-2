@@ -44,6 +44,10 @@ pub struct GuiStartup {
     pub events_tx: tokio::sync::mpsc::UnboundedSender<HotkeyEvent>,
     pub update_state: SharedUpdateState,
     pub hotkey_control: HotkeyControl,
+    /// The startup diagnosis, or `None` when the configuration was clean. Both
+    /// the tray icon and the dashboard callout read the *same* value, so the two
+    /// cannot end up describing different problems.
+    pub boot_warning: Option<crate::gui::tray_warning::TrayWarning>,
     pub dictionary: Arc<RwLock<Dictionary>>,
     pub router: AsrRouter,
     pub status: tokio::sync::watch::Receiver<AppStatus>,
@@ -198,6 +202,7 @@ pub fn run_gui(startup: GuiStartup) -> Result<()> {
         dictionary,
         router,
         status,
+        boot_warning,
     } = startup;
 
     let native_options = native_options(&settings);
@@ -219,6 +224,7 @@ pub fn run_gui(startup: GuiStartup) -> Result<()> {
                 config_path,
                 update_state,
                 Some(hotkey_control),
+                boot_warning,
             )) as Box<dyn eframe::App>)
         }),
     )

@@ -214,6 +214,7 @@ pub fn run() -> Result<()> {
     // the wrong key. Written to a readable file, not just a log nobody opens.
     let diagnosis = doctor::diagnose(&settings, &hotkey_config, cloud_key_in_env(), &config_path);
     let report_path = doctor::write_default(&diagnosis);
+    let tray_warning = gui::tray_warning::TrayWarning::new(&diagnosis, report_path.clone());
     if diagnosis.verdict != doctor::Verdict::Clean {
         tracing::warn!(
             report = %report_path.display(),
@@ -231,7 +232,12 @@ pub fn run() -> Result<()> {
     // raise the same six requests; see `gui::flags` for why they are grouped.
     let flags = gui::DashboardFlags::new();
     let update_state = updates::new_shared_state();
-    gui::spawn_tray(events_tx.clone(), flags.clone(), update_state.clone())?;
+    gui::spawn_tray(
+        events_tx.clone(),
+        flags.clone(),
+        update_state.clone(),
+        tray_warning.clone(),
+    )?;
 
     // Spawn background update checker (honors settings.updates.check_on_startup).
     // Spawned onto the runtime handle (tokio::spawn needs runtime context).
@@ -526,6 +532,7 @@ pub fn run() -> Result<()> {
         events_tx: events_tx.clone(),
         update_state: update_state.clone(),
         hotkey_control: hotkey_control.clone(),
+        boot_warning: tray_warning.clone(),
         dictionary: dictionary.clone(),
         router: router.clone(),
     })?;

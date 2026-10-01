@@ -4,6 +4,7 @@
 //! asynchronously, parses the latest version, checks if it is strictly newer than the current
 //! running version, and publishes state for the GUI overlay and system tray to notify the user.
 
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -255,18 +256,48 @@ pub fn spawn_background_checker(
 
 /// Opens a web URL in the user's default browser on Windows.
 pub fn open_url_in_browser(url: &str) {
+    open_path_in_default_app(Path::new(url))
+}
+
+/// Opens a local file with whatever program Windows associates with it.
+///
+/// A `.txt` diagnostic report lands in Notepad, which is the point: the report
+/// is written as plain text *because* there is no stdout, so the way to read it
+/// has to be the file association rather than anything this app invents.
+pub fn open_path_in_default_app(path: &Path) {
+    let target = path.to_string_lossy().into_owned();
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(start_args(&target))
             .spawn();
     }
     #[cfg(not(windows))]
     {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn();
+        let _ = std::process::Command::new("xdg-open").arg(&target).spawn();
     }
+}
+
+/// `cmd /C start` arguments that actually open `target`.
+///
+/// Two rules live here, and both fail *silently* — no error, no window, nothing
+/// a user could report:
+///
+/// 1. `start` is a `cmd` builtin, so it needs the `cmd /C` wrapper.
+/// 2. The first argument after `start` is the window title, not the target. The
+///    empty string is not a typo: without it, a quoted first argument is eaten
+///    as the title and nothing opens. It also has to be there even for an
+///    unquoted target, or `start` opens a *window titled* after the path.
+///
+/// The target itself is quoted because `%APPDATA%` and every default profile
+/// folder contain spaces.
+fn start_args(target: &str) -> Vec<String> {
+    vec![
+        "/C".to_string(),
+        "start".to_string(),
+        String::new(), // window title — deliberately empty
+        format!("\"{target}\""),
+    ]
 }
 
 fn chrono_time_str() -> String {
@@ -284,6 +315,25 @@ fn chrono_time_str() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_always_passes_an_empty_window_title() {
+        let args = start_args(r"C:\Users\Ada Lovelace\doctor-report.txt");
+        assert_eq!(args[0], "/C", "start is a cmd builtin");
+        assert_eq!(args[1], "start");
+        assert!(
+            args[2].is_empty(),
+            "start eats its first argument as the window title: {args:?}"
+        );
+        assert_eq!(args[3], "\"C:\\Users\\Ada Lovelace\\doctor-report.txt\"");
+    }
+
+    #[test]
+    fn start_quotes_the_target_so_spaces_survive() {
+        let args = start_args(r"C:\Program Files\OmniType\doctor-report.txt");
+        assert!(args[3].starts_with('"') && args[3].ends_with('"'));
+        assert!(args[3].contains("Program Files"));
+    }
 
     #[test]
     fn test_version_comparison_newer() {

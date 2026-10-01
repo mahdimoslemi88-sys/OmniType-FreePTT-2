@@ -45,6 +45,7 @@ pub(crate) fn app() -> OverlayApp {
         PathBuf::from("config.toml"),
         crate::updates::new_shared_state(),
         None,
+        None,
     )
 }
 

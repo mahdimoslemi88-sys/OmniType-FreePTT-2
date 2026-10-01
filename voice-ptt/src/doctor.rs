@@ -23,6 +23,7 @@ use std::path::Path;
 
 use crate::asr::plan::{engine_plan, ActiveSelection};
 use crate::config::Settings;
+use crate::hotkey::diagnostics::{HotkeyProblem, HotkeyRole, FALLBACK_SPEC};
 use crate::hotkey::HotkeyConfig;
 use crate::paths;
 
@@ -39,11 +40,65 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    fn label(self) -> &'static str {
+    /// The word used in the report *and* on the tray warning badge, so the two
+    /// never drift into calling the same state two different things.
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Verdict::Clean => "OK",
             Verdict::Substituted => "SUBSTITUTED",
             Verdict::Broken => "BROKEN",
+        }
+    }
+}
+
+/// One hotkey as the user asked for it, and as it will actually work.
+///
+/// The `problems` list already said "your record hotkey is broken". That is a
+/// sentence, not a state: it does not tell the user which key the app is
+/// listening for *now*, which is the only thing that answers "why does my
+/// shortcut do the wrong thing?". So the report carries both columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyLine {
+    pub role: HotkeyRole,
+    /// Exactly what `config.toml` asked for.
+    pub requested: String,
+    /// What the app is actually listening for.
+    pub effective: String,
+    /// Whether `effective` came from the built-in fallback.
+    pub substituted: bool,
+}
+
+impl HotkeyLine {
+    /// Builds the line for one role, consulting the recorded problems.
+    ///
+    /// `effective` is read off [`FALLBACK_SPEC`] rather than re-derived, so the
+    /// report cannot name a key the resolver no longer uses.
+    fn new(role: HotkeyRole, requested: &str, problems: &[HotkeyProblem]) -> Self {
+        let substituted = problems.iter().any(|p| p.role() == role);
+        let effective = if substituted {
+            FALLBACK_SPEC.to_string()
+        } else {
+            requested.to_string()
+        };
+        Self {
+            role,
+            requested: requested.to_string(),
+            effective,
+            substituted,
+        }
+    }
+
+    /// One fixed-width report row.
+    fn row(&self) -> String {
+        if self.substituted {
+            format!(
+                "  {:<15} {:<20} (asked for '{}' — replaced)",
+                self.role.label(),
+                self.effective,
+                self.requested
+            )
+        } else {
+            format!("  {:<15} {}", self.role.label(), self.effective)
         }
     }
 }
@@ -61,9 +116,20 @@ pub struct Diagnosis {
     pub assets_dir: String,
     /// One line per substituted or missing thing, already phrased for a human.
     pub problems: Vec<String>,
+    /// The three configurable hotkeys, requested and effective.
+    pub hotkeys: Vec<HotkeyLine>,
     /// Engine ids in router priority order.
     pub engines: Vec<String>,
     pub active_engine: String,
+    /// Whether `active_engine` names an engine that is not registered, so every
+    /// dictation fails.
+    ///
+    /// Stored as its own fact rather than read back out of `verdict`, even
+    /// though today `Verdict::Broken` means exactly this: the tray sends the
+    /// user to the Engines panel on the strength of it, and if a later change
+    /// made `Broken` mean "no cloud API key" the tray would quietly send a
+    /// cloud-key user to a page that cannot fix it. The fact outlives the label.
+    pub active_engine_missing: bool,
     /// Whether the API key came from the environment rather than the file. The
     /// report deliberately does not print either value.
     pub cloud_key_source: KeySource,
@@ -111,6 +177,7 @@ pub fn diagnose(
         );
     }
 
+    let active_engine_missing = plan.selection == ActiveSelection::Missing;
     let verdict = if plan.selection == ActiveSelection::Missing {
         Verdict::Broken
     } else if problems.is_empty() {
@@ -128,6 +195,20 @@ pub fn diagnose(
         problems,
         engines: plan.engines.iter().map(|e| e.id().to_string()).collect(),
         active_engine: settings.active_engine.clone(),
+        active_engine_missing,
+        hotkeys: vec![
+            HotkeyLine::new(
+                HotkeyRole::Record,
+                &settings.hotkey.record,
+                hotkeys.problems(),
+            ),
+            HotkeyLine::new(
+                HotkeyRole::ToggleOverlay,
+                &settings.hotkey.toggle_overlay,
+                hotkeys.problems(),
+            ),
+            HotkeyLine::new(HotkeyRole::Quit, &settings.hotkey.quit, hotkeys.problems()),
+        ],
         cloud_key_source: key_source(settings, cloud_key_in_env),
     }
 }
@@ -162,9 +243,28 @@ pub fn render(d: &Diagnosis) -> String {
     let _ = writeln!(out);
 
     let _ = writeln!(out, "asr");
-    let _ = writeln!(out, "  active    {}", d.active_engine);
+    // The verdict is on line 2 and the warning is in `problems`, but the `asr`
+    // block is what a user reads when they ask "why is nothing working?". A bare
+    // `active google` above `engines antigravity -> local_whisper` makes the
+    // user spot the omission themselves; marking it is the difference between a
+    // report and a puzzle.
+    if d.active_engine_missing {
+        let _ = writeln!(
+            out,
+            "  active    {}   ** NOT REGISTERED — not in the chain below, so dictation fails **",
+            d.active_engine
+        );
+    } else {
+        let _ = writeln!(out, "  active    {}", d.active_engine);
+    }
     let _ = writeln!(out, "  engines   {}", d.engines.join(" -> "));
     let _ = writeln!(out, "  cloud key from {}", d.cloud_key_source.label());
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "hotkeys");
+    for line in &d.hotkeys {
+        let _ = writeln!(out, "{}", line.row());
+    }
     let _ = writeln!(out);
 
     if d.problems.is_empty() {
@@ -214,6 +314,96 @@ mod tests {
         diagnose(settings, hotkeys, env, Path::new("C:/x/config.toml"))
     }
 
+    /// The report must say which key the app is *actually* listening for. The
+    /// `problems` list says the configured one was unusable; only the hotkeys
+    /// section answers "so what do I press?".
+    #[test]
+    fn the_report_lists_the_key_that_actually_works() {
+        let mut s = settings();
+        s.hotkey.record = "Shift+ف".into();
+        let d = diag(&s, &HotkeyConfig::from_settings(&s.hotkey), false);
+        let text = render(&d);
+        assert!(
+            text.contains("(asked for 'Shift+ف' — replaced)"),
+            "the substitution is not shown side by side:\n{text}"
+        );
+        assert!(
+            text.contains(FALLBACK_SPEC),
+            "the report never names the working key:\n{text}"
+        );
+    }
+
+    /// All three roles appear on every report, including the clean one. A
+    /// section that only appears when something broke cannot be read by someone
+    /// checking that nothing is wrong.
+    #[test]
+    fn every_report_lists_all_three_hotkeys() {
+        let d = diag(&settings(), &good_hotkeys(), false);
+        let text = render(&d);
+        for role in [
+            HotkeyRole::Record,
+            HotkeyRole::ToggleOverlay,
+            HotkeyRole::Quit,
+        ] {
+            assert!(
+                text.contains(role.label()),
+                "{} missing from a clean report:\n{text}",
+                role.label()
+            );
+        }
+        assert!(!text.contains("replaced"), "nothing was replaced:\n{text}");
+    }
+
+    /// A broken toggle-overlay hotkey falls back to the *same* key as record,
+    /// because one fallback serves every role. That is real and surprising, and
+    /// the report is where the user finds out.
+    #[test]
+    fn a_fallback_collision_on_one_key_is_visible() {
+        let mut s = settings();
+        s.hotkey.toggle_overlay = "nonsense+".into();
+        let d = diag(&s, &HotkeyConfig::from_settings(&s.hotkey), false);
+        let text = render(&d);
+        let lines: Vec<&str> = text
+            .lines()
+            // Only the `hotkeys` section: the `problems` sentences also name
+            // CapsLock, and counting those would pass for the wrong reason.
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("record") || t.starts_with("toggle overlay")
+            })
+            .filter(|l| l.contains("CapsLock"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "record and toggle overlay now share a key; the report must show both:\n{lines:?}"
+        );
+    }
+
+    /// The engine line carries the verdict, not just the name: a bare
+    /// `active google` above a chain that does not contain it is a puzzle.
+    #[test]
+    fn an_unregistered_engine_is_marked_in_the_asr_block() {
+        let mut s = settings();
+        s.active_engine = "google".into();
+        s.google.enabled = false;
+        let d = diag(&s, &good_hotkeys(), false);
+        let text = render(&d);
+        let asr_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("active"))
+            .unwrap_or_else(|| panic!("no active line in:\n{text}"));
+        assert!(asr_line.contains("NOT REGISTERED"), "{asr_line}");
+        assert!(asr_line.contains("google"), "{asr_line}");
+    }
+
+    /// …and nothing is marked when the engine really is registered.
+    #[test]
+    fn a_registered_engine_carries_no_warning_marker() {
+        let text = render(&diag(&settings(), &good_hotkeys(), false));
+        assert!(!text.contains("NOT REGISTERED"), "{text}");
+    }
+
     /// The default install must come out clean, or every user gets a report
     /// that says something is wrong and the report stops meaning anything.
     #[test]
@@ -250,6 +440,40 @@ mod tests {
         let d = diag(&s, &good_hotkeys(), false);
         assert_eq!(d.verdict, Verdict::Broken);
         assert!(d.problems[0].contains("google"), "{}", d.problems[0]);
+    }
+
+    /// The tray sends the user to the Engines panel on `active_engine_missing`,
+    /// so the fact has to be set wherever a dead engine is detected.
+    #[test]
+    fn a_dead_engine_selection_is_flagged_as_a_fact_not_just_a_verdict() {
+        let mut dead = settings();
+        dead.active_engine = "google".into();
+        dead.google.enabled = false;
+        let d = diag(&dead, &good_hotkeys(), false);
+        assert!(
+            d.active_engine_missing,
+            "the tray would send this user to the report instead of the Engines tab"
+        );
+        assert_eq!(d.active_engine, "google", "the tray names this engine");
+
+        // And the converse, so the flag cannot quietly mean something else.
+        for (verdict, expected) in [
+            (Verdict::Clean, false),
+            (Verdict::Substituted, false),
+            (Verdict::Broken, true),
+        ] {
+            let mut s = settings();
+            if verdict == Verdict::Broken {
+                s.active_engine = "google".into();
+                s.google.enabled = false;
+            }
+            if verdict == Verdict::Substituted {
+                s.hotkey.record = "Shift+ف".into();
+            }
+            let hotkeys = HotkeyConfig::from_settings(&s.hotkey);
+            let d = diag(&s, &hotkeys, false);
+            assert_eq!(d.active_engine_missing, expected, "verdict {verdict:?}");
+        }
     }
 
     /// Broken outranks substituted: with both present, "your dictation does

@@ -240,6 +240,13 @@ pub struct OverlayApp {
     /// Runtime handle to the global hotkey listener: live re-bind plus the
     /// system-wide "press a key to bind it" capture.
     hotkey: Option<HotkeyControl>,
+    /// The startup diagnosis, when it was not clean.
+    ///
+    /// Immutable for the process: the report is rewritten on every startup, not
+    /// on every settings edit, so this is what was true at boot. The dashboard
+    /// shows it as a callout because the tray badge is the only warning a user
+    /// cannot miss — and only if they look at the notification area.
+    boot_warning: Option<crate::gui::tray_warning::TrayWarning>,
     pub orb: Orb,
 }
 
@@ -268,6 +275,7 @@ impl OverlayApp {
         config_path: PathBuf,
         update_state: crate::updates::SharedUpdateState,
         hotkey: Option<HotkeyControl>,
+        boot_warning: Option<crate::gui::tray_warning::TrayWarning>,
     ) -> Self {
         let initial_visible = settings.read().map(|s| s.gui.show_overlay).unwrap_or(true);
 
@@ -318,6 +326,7 @@ impl OverlayApp {
             update_state,
             update_toast_notified: None,
             hotkey,
+            boot_warning,
             orb,
         }
     }
@@ -466,6 +475,15 @@ impl OverlayApp {
                                 // available width; subtracting again would
                                 // shrink content and leave the right side
                                 // visibly empty.
+                                // ── Boot warning ──
+                                // Above the tab bar and never hidden by it: a
+                                // problem with the configuration is a problem
+                                // with every tab, and burying it under the
+                                // currently-open tab is how it goes unnoticed.
+                                if let Some(w) = &self.boot_warning {
+                                    ui.add_space(6.0);
+                                    theme::callout(ui, theme::CalloutKind::Warning, &w.banner_body());
+                                }
                                 // ── Title row ──
                         ui.horizontal(|ui| {
                             ui.label(

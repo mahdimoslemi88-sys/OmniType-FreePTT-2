@@ -8,6 +8,7 @@ pub mod orb_palette;
 pub mod overlay;
 pub mod preview_window;
 pub mod tray;
+pub mod tray_warning;
 pub mod window_shape;
 
 pub use flags::{DashboardFlags, Toggle};

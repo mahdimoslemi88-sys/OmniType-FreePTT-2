@@ -60,6 +60,15 @@ pub enum HotkeyProblem {
 }
 
 impl HotkeyProblem {
+    /// Which configurable hotkey failed, so a caller can match a problem to the
+    /// role it belongs to without matching on the message text.
+    pub fn role(&self) -> HotkeyRole {
+        match self {
+            HotkeyProblem::Unparseable { role, .. } => *role,
+            HotkeyProblem::NoVirtualKey { role, .. } => *role,
+        }
+    }
+
     /// One line a user can act on, with the substitution spelled out.
     pub fn message(&self) -> String {
         match self {
@@ -107,6 +116,19 @@ impl Resolution {
     }
 }
 
+/// The key every unusable hotkey is replaced with.
+///
+/// Public because the diagnostic report has to print what the app is *actually*
+/// listening for, not a guess at it. The report used to hard-code "CapsLock" in
+/// prose while the resolver held the truth; if the fallback ever changes, the
+/// report would keep promising a key the app no longer listens to. One constant,
+/// two readers.
+///
+/// Note the consequence: this is the *same* key for all three roles, so a broken
+/// toggle-overlay hotkey can end up sharing the record key. The report shows both
+/// columns, which is how that becomes visible.
+pub const FALLBACK_SPEC: &str = "CapsLock";
+
 /// Resolves a binding string, falling back to the built-in default if it
 /// cannot be used.
 ///
@@ -118,7 +140,7 @@ pub fn resolve_or_default(spec: &str, role: HotkeyRole) -> Resolution {
     // The built-in default is known-good; failing to resolve it would be a typo
     // in this file rather than a user mistake, so it may panic.
     fn default_resolved() -> ResolvedBinding {
-        let binding = HotkeyBinding::parse("CapsLock").expect("default hotkey must parse");
+        let binding = HotkeyBinding::parse(FALLBACK_SPEC).expect("default hotkey must parse");
         resolve_binding(&binding).expect("default hotkey must resolve")
     }
 
