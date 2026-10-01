@@ -12,7 +12,10 @@ use super::orb_palette::{self, OrbPalette};
 // Sized to 60px diameter idle per companion specifications
 pub const BASE_DIAMETER: f32 = 60.0;
 
-const HOVER_SCALE_BOOST: f32 = 0.08; // 60pt -> ~65pt on hover
+/// Hover enlarges the orb a little. Read by `gui::orb`, which has to know the
+/// largest scale the window has to hold: hover is only offered in the modes
+/// that are draggable, so it can stack with that mode's own target.
+pub(crate) const HOVER_SCALE_BOOST: f32 = 0.08; // 60pt -> ~65pt on hover
 const SPRING_STIFFNESS: f32 = 170.0;
 /// Damping ratio of the scale spring. Read by `gui::orb`'s tests, which derive
 /// the scale overshoot from it rather than assuming the orb never exceeds its
@@ -49,6 +52,25 @@ impl OrbMode {
         }
     }
 
+    /// Whether the hover enlargement is offered in this mode.
+    ///
+    /// Only the draggable modes get it (`Orb::show` gates `set_hover` on the
+    /// same condition), which is why `largest_target_scale` applies the boost
+    /// per mode: multiplying the biggest target by it would invent a
+    /// `Recording`-sized orb that hover can never produce.
+    pub fn hoverable(self) -> bool {
+        matches!(self, OrbMode::Idle | OrbMode::Error)
+    }
+
+    /// Every mode, in the order the UI can show them.
+    pub const ALL: [OrbMode; 5] = [
+        OrbMode::Idle,
+        OrbMode::Recording,
+        OrbMode::Processing,
+        OrbMode::Complete,
+        OrbMode::Error,
+    ];
+
     pub fn palette(self) -> OrbPalette {
         match self {
             OrbMode::Idle | OrbMode::Error => orb_palette::IDLE,
@@ -67,6 +89,39 @@ impl OrbMode {
             OrbMode::Complete => TAU / 2.0,
         }
     }
+}
+
+/// Largest scale any mode ever *aims* for, hover included.
+pub fn largest_target_scale() -> f32 {
+    OrbMode::ALL
+        .iter()
+        .map(|m| {
+            let boost = if m.hoverable() {
+                HOVER_SCALE_BOOST
+            } else {
+                0.0
+            };
+            m.target_scale() * (1.0 + boost)
+        })
+        .fold(0.0f32, f32::max)
+}
+
+/// Largest scale the scale spring can actually reach, in points of `scale`.
+///
+/// Not simply [`largest_target_scale`]: `OrbAnimation` integrates a spring, and
+/// a spring overshoots. The step response of a second-order system peaks at
+/// `exp(-pi*zeta / sqrt(1 - zeta^2))` above its target, so that is the number to
+/// multiply by — doubled, because repeated hotkey taps can stack on velocity
+/// that has not yet damped out.
+///
+/// This is the number the host window has to be sized for. It lives here, next
+/// to the spring it describes, so the window and the animation cannot disagree
+/// about how large the orb can get; the test in `gui::orb` checks that the
+/// canvas derived from it actually holds the drawn orb.
+pub fn max_reachable_scale() -> f32 {
+    let zeta = SPRING_DAMPING_RATIO;
+    let overshoot = (-PI * zeta / (1.0f32 - zeta * zeta).sqrt()).exp();
+    largest_target_scale() * (1.0 + overshoot * 2.0)
 }
 
 pub fn ease_out_cubic(t: f32) -> f32 {
@@ -91,7 +146,9 @@ pub fn smoothstep(t: f32) -> f32 {
 pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let l = |x: u8, y: u8| -> u8 {
-        (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
     Color32::from_rgba_premultiplied(
         l(a.r(), b.r()),

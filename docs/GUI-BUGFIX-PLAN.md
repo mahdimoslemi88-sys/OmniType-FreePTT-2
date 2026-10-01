@@ -78,11 +78,11 @@ INFO ...: asr success engine="google" elapsed_ms=1900 chars=57
 **مکانیزم:**
 
 1. پنجرهٔ اصلی با عنوان خالی ساخته می‌شود: `lib.rs` → `.with_title("")`.
-2. `enable_true_transparency()` ([overlay.rs:952](voice-ptt/src/gui/overlay.rs#L952)) علاوه بر استایل‌زدایی، عنوان پنجره را هم با `SetWindowTextW(hwnd, "")` **پاک می‌کند**.
-3. `apply_window_shapes_all()` ([overlay.rs:1130](voice-ptt/src/gui/overlay.rs#L1130)) با `EnumThreadWindows` **همهٔ** پنجره‌های ترد را می‌گردد و هر پنجره‌ای را که «عنوانش خالی است یا دقیقاً `OmniType` است» پنجرهٔ اپ فرض می‌کند:
+2. `enable_true_transparency()` ([overlay.rs:952](../voice-ptt/src/gui/overlay.rs#L952)) علاوه بر استایل‌زدایی، عنوان پنجره را هم با `SetWindowTextW(hwnd, "")` **پاک می‌کند**.
+3. `apply_window_shapes_all()` ([overlay.rs:1130](../voice-ptt/src/gui/overlay.rs#L1130)) با `EnumThreadWindows` **همهٔ** پنجره‌های ترد را می‌گردد و هر پنجره‌ای را که «عنوانش خالی است یا دقیقاً `OmniType` است» پنجرهٔ اپ فرض می‌کند:
    - `MAIN_HWND` را روی آن ست می‌کند (آخرین تطبیق برنده است، نه پنجرهٔ درست)،
    - `enable_true_transparency` را رویش اجرا می‌کند.
-4. `Orb::show()` هر فریم `MAIN_HWND` را به `OrbWindow::place()` می‌دهد و `place()` با `SetWindowPos(hwnd, x, y, side, side)` آن پنجره را **به هندسهٔ Orb منتقل و ری‌سایز می‌کند** ([orb.rs:576](voice-ptt/src/gui/orb.rs#L576)).
+4. `Orb::show()` هر فریم `MAIN_HWND` را به `OrbWindow::place()` می‌دهد و `place()` با `SetWindowPos(hwnd, x, y, side, side)` آن پنجره را **به هندسهٔ Orb منتقل و ری‌سایز می‌کند** ([orb.rs:576](../voice-ptt/src/gui/orb.rs#L576)).
 
 پنجره‌های دیگری که «عنوان خالی» دارند و قربانی می‌شوند:
 
@@ -102,14 +102,14 @@ hwnd=0x009111A6 class=tray_icon_app             visible=False rect=(1329,436 162
 
 **چرا تعدادشان زیاد می‌شود؟** `apply_window_shapes_all()` در این مسیرها صدا زده می‌شود:
 
-- تا ۱۰ فریم اول استارتاپ ([overlay.rs:3897](voice-ptt/src/gui/overlay.rs#L3897))،
-- **بعد از هر متن تایپ‌شده** ([overlay.rs:4110](voice-ptt/src/gui/overlay.rs#L4110))،
+- تا ۱۰ فریم اول استارتاپ ([overlay.rs:3897](../voice-ptt/src/gui/overlay.rs#L3897))،
+- **بعد از هر متن تایپ‌شده** ([overlay.rs:4110](../voice-ptt/src/gui/overlay.rs#L4110))،
 - در هر درخواست باز کردن داشبورد/تنظیمات/تری‌منو،
-- و **هر فریم تا وقتی یک توست روی صفحه است** — چون داخل کلوژرِ viewport توست صدا زده می‌شود ([overlay.rs:3281](voice-ptt/src/gui/overlay.rs#L3281)).
+- و **هر فریم تا وقتی یک توست روی صفحه است** — چون داخل کلوژرِ viewport توست صدا زده می‌شود ([overlay.rs:3281](../voice-ptt/src/gui/overlay.rs#L3281)).
 
 هر بار ممکن است HWND به پنجرهٔ دیگری حل شود ⇒ یک پنجرهٔ دیگر «پارک» می‌شود ⇒ کادرها روی هم جمع می‌شوند. این با توصیف کاربر («بعد از هر بار ضبط/جای‌گذاری بیشتر می‌شود») دقیقاً می‌خواند.
 
-**شاهد جانبی:** در لاگ ۲۰۲۶-۰۹-۲۸ تعداد **۵٬۶۹۹** هشدار `wgpu_hal::vulkan::conv: Unrecognized present mode` و در ۰۹-۲۹ تعداد **۱٬۱۷۳** ثبت شده است (در بیلدهای قبل از مهاجرت به wgpu: صفر). این یعنی سطح (surface) مرتباً بازپیکربندی می‌شود؛ بخشی از آن به‌خاطر `ViewportCommand::InnerSize` است که **هر فریم** (حتی بدون تغییر) فرستاده می‌شود ([orb.rs:139](voice-ptt/src/gui/orb.rs#L139)).
+**شاهد جانبی:** در لاگ ۲۰۲۶-۰۹-۲۸ تعداد **۵٬۶۹۹** هشدار `wgpu_hal::vulkan::conv: Unrecognized present mode` و در ۰۹-۲۹ تعداد **۱٬۱۷۳** ثبت شده است (در بیلدهای قبل از مهاجرت به wgpu: صفر). این یعنی سطح (surface) مرتباً بازپیکربندی می‌شود؛ بخشی از آن به‌خاطر `ViewportCommand::InnerSize` است که **هر فریم** (حتی بدون تغییر) فرستاده می‌شود ([orb.rs:139](../voice-ptt/src/gui/orb.rs#L139)).
 
 ### ۱-۲. باکس متن و مصرف RAM (شکایت ۲)
 
@@ -117,9 +117,9 @@ hwnd=0x009111A6 class=tray_icon_app             visible=False rect=(1329,436 162
 
 **ب) `egui_notify` کاملاً مرده است ولی مدام پر می‌شود:**
 
-- `self.toasts.add(toast)` در دو نقطه صدا زده می‌شود ([overlay.rs:4010](voice-ptt/src/gui/overlay.rs#L4010) و [4090](voice-ptt/src/gui/overlay.rs#L4090)).
+- `self.toasts.add(toast)` در دو نقطه صدا زده می‌شود ([overlay.rs:4010](../voice-ptt/src/gui/overlay.rs#L4010) و [4090](../voice-ptt/src/gui/overlay.rs#L4090)).
 - در تمام پروژه **هیچ‌جا `toasts.show(...)` وجود ندارد** (جست‌وجو شد) ⇒ این توست‌ها هرگز رندر و هرگز منقضی نمی‌شوند.
-- `needs_animation_frames()` ([overlay.rs:3668](voice-ptt/src/gui/overlay.rs#L3668)) شرط `!self.toasts.toasts_mut().is_empty()` را دارد ⇒ **بعد از اولین دیکته، حلقهٔ رندر ۳۰fps تا ابد روشن می‌ماند.**
+- `needs_animation_frames()` ([overlay.rs:3668](../voice-ptt/src/gui/overlay.rs#L3668)) شرط `!self.toasts.toasts_mut().is_empty()` را دارد ⇒ **بعد از اولین دیکته، حلقهٔ رندر ۳۰fps تا ابد روشن می‌ماند.**
 
 **اندازه‌گیری روی همین دستگاه (idle، بدون دیکته):**
 
@@ -130,20 +130,20 @@ hwnd=0x009111A6 class=tray_icon_app             visible=False rect=(1329,436 162
 ```
 
 - مصرف CPU در حالت بیکار ≈ ۲٫۵–۵٪ یک هسته = اثر همان حلقهٔ دائمی.
-- جهش‌های دوره‌ای (private ۳۵۰→۴۰۲MB، handles ۹۱۲→۱۰۰۲، threads ۵۸→۶۷) با پروبِ پس‌زمینهٔ موتور **Antigravity** هم‌زمان است: ترد نگه‌دارنده هر ۳۰–۶۰ ثانیه `maintain()` را صدا می‌زند که **PowerShell + netstat** را اجرا می‌کند ([lib.rs:331](voice-ptt/src/lib.rs#L331)، [antigravity.rs:558](voice-ptt/src/asr/antigravity.rs#L558)) — حتی وقتی کاربر آن موتور را انتخاب نکرده و اصلاً Antigravity نصب/اجرا نیست.
+- جهش‌های دوره‌ای (private ۳۵۰→۴۰۲MB، handles ۹۱۲→۱۰۰۲، threads ۵۸→۶۷) با پروبِ پس‌زمینهٔ موتور **Antigravity** هم‌زمان است: ترد نگه‌دارنده هر ۳۰–۶۰ ثانیه `maintain()` را صدا می‌زند که **PowerShell + netstat** را اجرا می‌کند ([lib.rs:331](../voice-ptt/src/lib.rs#L331)، [antigravity.rs:558](../voice-ptt/src/asr/antigravity.rs#L558)) — حتی وقتی کاربر آن موتور را انتخاب نکرده و اصلاً Antigravity نصب/اجرا نیست.
 
 **پ) مدل لوکال: الان لود نمی‌شود ولی دو تله باز باقی است**
 
 - تأیید شد: private = 348MB ≪ ۱٫۶GB ⇒ مدل whisper در این سشن لود نشده. (فایل `ggml-large-v3-turbo.bin` با حجم ۱٫۶GB در `voice-ptt-dist/models/` هست و کنارش یک نسخهٔ تکراری `ggml-large-v3-turbo.bin1` هم افتاده.)
-- تلهٔ اول: `WhisperEngine::health()` ([whisper.rs:307](voice-ptt/src/asr/whisper.rs#L307)) برای موتور سردْ **Ready** برمی‌گرداند فقط به این خاطر که *فایل* روی دیسک هست. پس در حالت `auto` اگر Google شکست بخورد (قطعی شبکه، خطای HTTP، یا صدای بلندتر از سقف سرویس)، نوبت به لوکال می‌رسد و همان **لود ۱٫۶ گیگابایتی + inference سنگین CPU** اتفاق می‌افتد — همان حادثه‌ای که قبلاً اپ را مجبور به ری‌استارت می‌کرد. لاگ نشان می‌دهد `whisper.cpp` یک‌بار واقعاً اجرا شده است.
-- تلهٔ دوم: `resolve_model_name` روی هر دستگاه با GPU، `large-v3-turbo` را انتخاب می‌کند و اپ در پس‌زمینه ۱٫۶GB دانلود می‌کند ([lib.rs:411](voice-ptt/src/lib.rs#L411)).
+- تلهٔ اول: `WhisperEngine::health()` ([whisper.rs:307](../voice-ptt/src/asr/whisper.rs#L307)) برای موتور سردْ **Ready** برمی‌گرداند فقط به این خاطر که *فایل* روی دیسک هست. پس در حالت `auto` اگر Google شکست بخورد (قطعی شبکه، خطای HTTP، یا صدای بلندتر از سقف سرویس)، نوبت به لوکال می‌رسد و همان **لود ۱٫۶ گیگابایتی + inference سنگین CPU** اتفاق می‌افتد — همان حادثه‌ای که قبلاً اپ را مجبور به ری‌استارت می‌کرد. لاگ نشان می‌دهد `whisper.cpp` یک‌بار واقعاً اجرا شده است.
+- تلهٔ دوم: `resolve_model_name` روی هر دستگاه با GPU، `large-v3-turbo` را انتخاب می‌کند و اپ در پس‌زمینه ۱٫۶GB دانلود می‌کند ([lib.rs:411](../voice-ptt/src/lib.rs#L411)).
 
 ### ۱-۳. قطع خودکار ضبط (شکایت ۳)
 
 **علت ساختاری، نه محدودیت گوگل:**
 
-- `config.toml` → `audio.ring_seconds = 30` ⇒ `RingBuffer::new(16_000 × 30) = 480_000` نمونه ([capture.rs:70](voice-ptt/src/audio/capture.rs#L70)).
-- در ماشین حالت: `buffer.len() >= self.services.capture.capacity()` ⇒ `finalize()` ([machine.rs:236](voice-ptt/src/state/machine.rs#L236)).
+- `config.toml` → `audio.ring_seconds = 30` ⇒ `RingBuffer::new(16_000 × 30) = 480_000` نمونه ([capture.rs:70](../voice-ptt/src/audio/capture.rs#L70)).
+- در ماشین حالت: `buffer.len() >= self.services.capture.capacity()` ⇒ `finalize()` ([machine.rs:236](../voice-ptt/src/state/machine.rs#L236)).
 - `vad.cutoff_on_hold = false` ⇒ VAD هرگز وسط نگه‌داشتنِ کلید ضبط را قطع نمی‌کند؛ پس تنها قطعِ خودکار همان شیر اطمینان ۳۰ ثانیه‌ای است.
 
 **شاهد از لاگ‌ها:** بیشینهٔ `audio_secs` در همهٔ لاگ‌ها **۳۰٫۰۱ و ۳۰٫۰۲ ثانیه** و به‌تکرار است — یعنی دقیقاً روی سقف بافر، نه روی سکوت.
@@ -165,7 +165,7 @@ hwnd=0x009111A6 class=tray_icon_app             visible=False rect=(1329,436 162
 | دو ضربهٔ پشت‌سرهم | ضبط **قفل** می‌شود و بعد از رها کردن کلید هم ادامه پیدا می‌کند |
 | فشار بعدی (یا Esc/Cancel) | قفل ضبط را تمام می‌کند و متن تایپ می‌شود |
 
-**پیاده‌سازی:** `LatchPolicy` خالص و یونیت‌تست‌شده در [machine.rs](voice-ptt/src/state/machine.rs) (۵ تست:
+**پیاده‌سازی:** `LatchPolicy` خالص و یونیت‌تست‌شده در [machine.rs](../voice-ptt/src/state/machine.rs) (۵ تست:
 نگه‌داشتن، ضربهٔ تنها، دوبار ضربه، ضربهٔ دوم دیرهنگام، حالت خاموش) + فیلد `latched` در `AppStatus` تا UI
 بتواند وضعیت را نشان دهد. تنظیمات جدید در `[hotkey]`: `double_tap_latch = true`، `tap_max_ms = 350`،
 `double_tap_window_ms = 600` (کانفیگ‌های موجود چون `#[serde(default)]` دارند بی‌دردسر مقدار پیش‌فرض می‌گیرند).
@@ -174,19 +174,19 @@ hwnd=0x009111A6 class=tray_icon_app             visible=False rect=(1329,436 162
 
 | تغییر | فایل |
 |---|---|
-| `register_main_hwnd()`: گرفتن HWND واقعی از `eframe::Frame` (ترِیت `HasWindowHandle`) + `invalidate_main_hwnd()` | [overlay.rs](voice-ptt/src/gui/overlay.rs)، [Cargo.toml](voice-ptt/Cargo.toml) (`raw-window-handle = "0.6"`) |
-| `apply_window_shapes_all()` ⇒ به `apply_window_shapes_all_legacy` تغییر نام یافت، بدون فراخوانی، `#[allow(dead_code)]` | [overlay.rs](voice-ptt/src/gui/overlay.rs) |
-| `shape_preview_window(generation)`: فقط پنجرهٔ پیش‌نمایش، یک‌بار به‌ازای هر بابل | [overlay.rs](voice-ptt/src/gui/overlay.rs) |
-| کامنت‌شدن `SetWindowTextW("")` و fallback عنوان‌محورِ `FindWindowW` | [overlay.rs](voice-ptt/src/gui/overlay.rs)، [orb.rs](voice-ptt/src/gui/orb.rs) |
-| حذف سه نقطهٔ فراخوانی shape در مسیرهای داغ (توست، بنر آپدیت، بعد از هر متن، باز شدن داشبورد) | [overlay.rs](voice-ptt/src/gui/overlay.rs) |
-| `InnerSize` فقط در صورت تغییر اندازه + `invalidate_main_hwnd` روی شکست `SetWindowPos` | [orb.rs](voice-ptt/src/gui/orb.rs) |
+| `register_main_hwnd()`: گرفتن HWND واقعی از `eframe::Frame` (ترِیت `HasWindowHandle`) + `invalidate_main_hwnd()` | [overlay.rs](../voice-ptt/src/gui/overlay.rs)، [Cargo.toml](../voice-ptt/Cargo.toml) (`raw-window-handle = "0.6"`) |
+| `apply_window_shapes_all()` ⇒ به `apply_window_shapes_all_legacy` تغییر نام یافت، بدون فراخوانی، `#[allow(dead_code)]` | [overlay.rs](../voice-ptt/src/gui/overlay.rs) |
+| `shape_preview_window(generation)`: فقط پنجرهٔ پیش‌نمایش، یک‌بار به‌ازای هر بابل | [overlay.rs](../voice-ptt/src/gui/overlay.rs) |
+| کامنت‌شدن `SetWindowTextW("")` و fallback عنوان‌محورِ `FindWindowW` | [overlay.rs](../voice-ptt/src/gui/overlay.rs)، [orb.rs](../voice-ptt/src/gui/orb.rs) |
+| حذف سه نقطهٔ فراخوانی shape در مسیرهای داغ (توست، بنر آپدیت، بعد از هر متن، باز شدن داشبورد) | [overlay.rs](../voice-ptt/src/gui/overlay.rs) |
+| `InnerSize` فقط در صورت تغییر اندازه + `invalidate_main_hwnd` روی شکست `SetWindowPos` | [orb.rs](../voice-ptt/src/gui/orb.rs) |
 
 **راستی‌آزمایی کد:** `cargo check/clippy --all-targets` بدون هشدار، `cargo test --lib` = **۱۵۷/۱۵۷**
 (۵ تست جدید قفل)، `--features light-theme` هم سبز (۲۳ هشدار «const بلااستفاده» از قبل موجود است
 و به این فاز مربوط نیست — پاک‌سازی‌اش در فاز ۲).
 
 **راستی‌آزمایی بصری (باقی‌مانده — نیازمند بستن اپ در حال اجرا):** باید exe تازه در dist قرار بگیرد و با
-[window-probe.ps1](docs/reaserch/gui/probes/window-probe.ps1) ثابت شود که `Winit Thread Event Target`
+[window-probe.ps1](../docs/reaserch/gui/probes/window-probe.ps1) ثابت شود که `Winit Thread Event Target`
 و `tray_icon_app` دیگر روی هندسهٔ orb نمی‌نشینند.
 
 **exe آماده:** `voice-ptt/target/release/voice-ptt.exe` (بیلد فاز ۰–۲). کپی به `voice-ptt-dist/`

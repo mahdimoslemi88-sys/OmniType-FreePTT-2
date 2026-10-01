@@ -192,7 +192,6 @@ fn log_window_geometry(hwnd: isize) {
     );
 }
 
-
 /// `DWMWA_*` attributes this app sets. Spelled out because the `windows` crate
 /// is built without the `Win32_Graphics_Dwm` feature.
 #[cfg(windows)]
@@ -299,14 +298,9 @@ pub enum ClickRegion {
     /// No region: the window takes the hit over its whole rect.
     Full,
     /// A circle centred on the window.
-    Circle {
-        radius_pt: f32,
-    },
+    Circle { radius_pt: f32 },
     /// A rounded rectangle. `rect_pt` is `[left, top, right, bottom]`.
-    RoundedRect {
-        rect_pt: [f32; 4],
-        radius_pt: f32,
-    },
+    RoundedRect { rect_pt: [f32; 4], radius_pt: f32 },
 }
 
 /// Converts a region to physical pixels against a window of `window_pt`.
@@ -337,12 +331,11 @@ pub fn click_region_px(region: ClickRegion, window_pt: [f32; 2], ppp: f32) -> Op
             // window anyway and the shape bought nothing.
             let max_px = ((window_w.min(window_h) * ppp) * 0.5).round() as i32;
             let radius_px = radius_px.clamp(1, max_px.max(1));
-            Some(ClickRegion::Circle { radius_pt: radius_px as f32 / ppp })
+            Some(ClickRegion::Circle {
+                radius_pt: radius_px as f32 / ppp,
+            })
         }
-        ClickRegion::RoundedRect {
-            rect_pt,
-            radius_pt,
-        } => {
+        ClickRegion::RoundedRect { rect_pt, radius_pt } => {
             let mut left = (rect_pt[0] * ppp).round() as i32;
             let mut top = (rect_pt[1] * ppp).round() as i32;
             let mut right = (rect_pt[2] * ppp).round() as i32;
@@ -385,7 +378,9 @@ pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2],
         return;
     };
     {
-        let Ok(mut last) = CLICK_REGION_CACHE.lock() else { return };
+        let Ok(mut last) = CLICK_REGION_CACHE.lock() else {
+            return;
+        };
         if *last == Some((hwnd, px)) {
             return;
         }
@@ -412,10 +407,7 @@ pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2],
             let cy = side_h / 2;
             unsafe { CreateEllipticRgn(cx - r, cy - r, cx + r + 1, cy + r + 1, 1) }
         }
-        ClickRegion::RoundedRect {
-            rect_pt,
-            radius_pt,
-        } => {
+        ClickRegion::RoundedRect { rect_pt, radius_pt } => {
             let l = (rect_pt[0] * ppp).round() as i32;
             let t = (rect_pt[1] * ppp).round() as i32;
             let r = (rect_pt[2] * ppp).round() as i32;
@@ -513,8 +505,7 @@ fn disable_winit_blur_behind(hwnd: isize) {
         hRgnBlur: HRGN(std::ptr::null_mut()),
         fTransitionOnMaximized: BOOL(0),
     };
-    let result =
-        unsafe { DwmEnableBlurBehindWindow(HWND(hwnd as *mut std::ffi::c_void), &behind) };
+    let result = unsafe { DwmEnableBlurBehindWindow(HWND(hwnd as *mut std::ffi::c_void), &behind) };
     if let Err(err) = result {
         tracing::debug!(hwnd, ?err, "could not clear the winit blur-behind layer");
     }
@@ -544,7 +535,7 @@ pub fn enable_true_transparency(hwnd: isize) {
                 | WS_MAXIMIZEBOX.0
                 | WS_SYSMENU.0
                 | WS_BORDER.0
-                | 0x0080_0000 /* WS_DLGFRAME */))
+                | 0x0080_0000/* WS_DLGFRAME */))
             | WS_POPUP.0;
         let style_changed = stripped as i32 != cur_style;
         let _ = SetWindowLongW(win_hwnd, GWL_STYLE, stripped as i32);
@@ -555,7 +546,7 @@ pub fn enable_true_transparency(hwnd: isize) {
             & !(0x0000_0100 /* WS_EX_WINDOWEDGE */
                 | 0x0000_0200 /* WS_EX_CLIENTEDGE */
                 | 0x0002_0000 /* WS_EX_STATICEDGE */
-                | 0x0000_0001 /* WS_EX_DLGMODALFRAME */);
+                | 0x0000_0001/* WS_EX_DLGMODALFRAME */);
         let ex_changed = stripped_ex as i32 != cur_ex;
         let _ = SetWindowLongW(win_hwnd, GWL_EXSTYLE, stripped_ex as i32);
 
@@ -656,7 +647,8 @@ fn window_style_is_shaped(style: i32, ex: i32) -> bool {
             | WS_DLGFRAME)
         != 0;
     let not_popup = s & WS_POPUP.0 == 0;
-    let edged = e & (WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_DLGMODALFRAME) != 0;
+    let edged =
+        e & (WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_DLGMODALFRAME) != 0;
     !(framed || not_popup || edged)
 }
 
@@ -752,7 +744,9 @@ pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, _corne
     use windows::Win32::Foundation::RECT;
 
     let mut work_area = RECT::default();
-    let ok = unsafe { SystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, &mut work_area, 0) };
+    let ok = unsafe {
+        SystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, &mut work_area, 0)
+    };
     if ok != 0 {
         let center_x = (work_area.left + work_area.right) / 2;
         let taskbar_top = work_area.bottom;
@@ -762,7 +756,15 @@ pub fn position_above_taskbar(hwnd: isize, width_px: i32, height_px: i32, _corne
 
         unsafe {
             // SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040
-            SetWindowPos(hwnd, -1 /* HWND_TOPMOST */, left, top, width_px, height_px, 0x0010 | 0x0040);
+            SetWindowPos(
+                hwnd,
+                -1, /* HWND_TOPMOST */
+                left,
+                top,
+                width_px,
+                height_px,
+                0x0010 | 0x0040,
+            );
         }
         enable_true_transparency(hwnd);
     }
@@ -773,7 +775,9 @@ pub fn taskbar_bottom_center_pt(win_w_pt: f32, win_h_pt: f32, ppp: f32) -> (f32,
     use windows::Win32::Foundation::RECT;
 
     let mut work_area = RECT::default();
-    let ok = unsafe { SystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, &mut work_area, 0) };
+    let ok = unsafe {
+        SystemParametersInfoW(0x0030 /* SPI_GETWORKAREA */, 0, &mut work_area, 0)
+    };
     if ok != 0 {
         let center_x = (work_area.left + work_area.right) / 2;
         let taskbar_top = work_area.bottom;
@@ -884,7 +888,10 @@ pub fn register_main_hwnd(frame: &eframe::Frame) -> bool {
     enable_true_transparency(hwnd);
     log_window_geometry(hwnd);
     if previous == 0 {
-        tracing::info!(hwnd, "main window handle registered from eframe's raw window handle");
+        tracing::info!(
+            hwnd,
+            "main window handle registered from eframe's raw window handle"
+        );
     } else {
         tracing::warn!(
             hwnd,
@@ -955,7 +962,9 @@ pub fn ensure_preview_window_shaped() {
         // the backdrop on, and it runs on a different code path from ours, so a
         // single one-shot pass is a race rather than a guarantee.
         let is_new = PREVIEW_HWND.swap(raw, Relaxed) != raw;
-        let due = FRAMES.load(Relaxed).is_multiple_of(PREVIEW_RESHAPE_INTERVAL);
+        let due = FRAMES
+            .load(Relaxed)
+            .is_multiple_of(PREVIEW_RESHAPE_INTERVAL);
         if is_new || due {
             apply_viewport_transparency(raw);
             FRAMES.store(0, Relaxed);
@@ -992,7 +1001,7 @@ const PREVIEW_RESHAPE_INTERVAL: u32 = 15;
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{transparency_mode_from, TransparencyMode};
+    use super::{click_region_px, transparency_mode_from, ClickRegion, TransparencyMode};
 
     /// The transparency default is the one thing here a user can only verify by
     /// looking at the screen, so pin the mapping: an unset/unknown env var must
@@ -1048,5 +1057,120 @@ mod tests {
             TransparencyMode::DwmExtendFrame,
             TransparencyMode::DwmExtendNone
         );
+    }
+    // ── click-through ───────────────────────────────────────────────────
+    //
+    // The transparent part of the orb window must not take clicks from whatever
+    // is underneath. That is a property of the *region*, not of the window: a
+    // smaller window would achieve it by accident, and a bigger one would lose
+    // it. The tests below hold the window size fixed and move the region, so
+    // they describe the mechanism rather than one number.
+
+    /// The region the orb asks for is a circle of exactly its painted reach —
+    /// never the whole rect, never a different size.
+    ///
+    /// That single number is the whole of the click-through guarantee:
+    /// `WindowFromPoint` only offers a point to a window whose region contains
+    /// it, so every pixel past the circle reaches the application below. The
+    /// region is not allowed to grow either, or the orb would steal clicks from
+    /// the desktop over pixels nothing was ever painted on.
+    ///
+    /// The window is swept rather than fixed, because the guarantee has to be a
+    /// property of the *mechanism*: a smaller window would satisfy it by
+    /// accident and a bigger one would lose it. Every window here is at least
+    /// `Orb::max_canvas_points()`, which is the only size the orb ever uses.
+    #[test]
+    fn the_orb_region_is_a_circle_whatever_the_window_is() {
+        let reach_pt = super::super::orb::painted_reach_pt_for_test(1.0);
+        let canvas = super::super::orb::Orb::max_canvas_points();
+        assert!(
+            canvas >= reach_pt * 2.0 - 0.001,
+            "the orb's own canvas ({canvas} pt) is smaller than the reach it has to hold"
+        );
+        for side_pt in [canvas, canvas + 1.0, 300.0, 400.0, 900.0, 2_000.0] {
+            for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+                let got = click_region_px(
+                    ClickRegion::Circle {
+                        radius_pt: reach_pt,
+                    },
+                    [side_pt, side_pt],
+                    ppp,
+                )
+                .expect("a circle inside a square window is always usable");
+                match got {
+                    ClickRegion::Circle { radius_pt } => {
+                        // Rounding to whole pixels is the only slack allowed.
+                        assert!(
+                            (radius_pt - reach_pt).abs() <= 0.5 / ppp,
+                            "side {side_pt} @ {ppp}x: region {radius_pt} pt !=                              painted reach {reach_pt} pt"
+                        );
+                    }
+                    other => panic!("side {side_pt} @ {ppp}x: region became {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A window smaller than the orb cannot happen, but a window *larger* than
+    /// the region must not have the region grown to fill it: the clamp in
+    /// `click_region_px` is what stops a future oversized canvas from quietly
+    /// taking the clicks back.
+    #[test]
+    fn a_generous_window_does_not_grow_the_region() {
+        let reach_pt = super::super::orb::painted_reach_pt_for_test(1.0);
+        let small = click_region_px(
+            ClickRegion::Circle {
+                radius_pt: reach_pt,
+            },
+            [240.0, 240.0],
+            1.0,
+        );
+        let huge = click_region_px(
+            ClickRegion::Circle {
+                radius_pt: reach_pt,
+            },
+            [900.0, 900.0],
+            1.0,
+        );
+        assert_eq!(small, huge, "the region must not depend on the window size");
+    }
+
+    /// The region may never be degenerate. `SetWindowRgn` fails on an empty
+    /// region and, given one that degenerates at runtime, leaves a window nobody
+    /// can see and everybody can click — so these are the inputs that must fall
+    /// back to `Full` rather than produce a zero-size circle.
+    #[test]
+    fn an_unusable_window_or_scale_falls_back_to_the_full_rect() {
+        for window_pt in [[0.0f32, 0.0], [-10.0, 240.0], [f32::NAN, 240.0]] {
+            for ppp in [0.0f32, -1.0, f32::NAN] {
+                assert_eq!(
+                    click_region_px(ClickRegion::Circle { radius_pt: 50.0 }, window_pt, ppp),
+                    Some(ClickRegion::Full),
+                    "window {window_pt:?} @ {ppp}x"
+                );
+            }
+        }
+    }
+
+    /// A circle is clipped to the window when it does not fit, because
+    /// `SetWindowRgn` intersects the region with the window rect anyway. The orb
+    /// never hits this — its canvas is derived from the same number — but a
+    /// clamped region must still be a sane circle rather than a zero one.
+    #[test]
+    fn an_oversized_circle_is_clipped_not_rejected() {
+        let got = click_region_px(
+            ClickRegion::Circle {
+                radius_pt: 10_000.0,
+            },
+            [200.0, 200.0],
+            1.0,
+        )
+        .expect("clipping is not rejection");
+        match got {
+            ClickRegion::Circle { radius_pt } => {
+                assert!((radius_pt - 100.0).abs() < 0.001, "{radius_pt}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

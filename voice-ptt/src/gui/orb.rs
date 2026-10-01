@@ -8,19 +8,102 @@ use eframe::egui::{
 };
 
 pub use super::orb_animation::OrbMode;
-use super::orb_animation::{ease_out_cubic, lerp_color, smoothstep, OrbAnimation, BASE_DIAMETER};
+use super::orb_animation::{
+    ease_out_cubic, lerp_color, max_reachable_scale, smoothstep, OrbAnimation, BASE_DIAMETER,
+};
 use super::orb_palette::OrbPalette;
 
-/// Window side = orb diameter * factor + 2 * padding (generous room for glow/rings/overshoot).
-const CANVAS_FACTOR: f32 = 1.90;
-const CANVAS_PADDING: f32 = 24.0;
 const GLOW_EXTENT: f32 = 0.55;
 /// Upper bound on `shake_offset`, as a fraction of the orb radius.
+/// `shake_offset` multiplies by this constant; it used to repeat the number
+/// `0.22` inline, so editing one of the two would have silently desynced the
+/// window from the drawing.
 const SHAKE_EXTENT: f32 = 0.22;
 const GLOW_LAYERS: usize = 12;
 const MIN_HIT_RADIUS: f32 = 24.0;
 const COMPLETE_HOLD_SECS: f32 = 0.9;
 const ERROR_SHAKE_SECS: f32 = 0.55;
+
+/// How far the orb's painted edge stays from the edge of the monitor's work
+/// area while it is being dragged, in points.
+///
+/// The window is a fixed transparent square around the orb, so the only thing
+/// that decides how close the orb *looks* to the screen edge is where its
+/// centre is allowed to go. Holding the centre a whole canvas-half away (which
+/// is what this used to do) is what made the orb look marooned in the middle
+/// of the desktop; a small visible margin is what a user expects from a
+/// desktop companion.
+const EDGE_MARGIN_PT: f32 = 6.0;
+
+/// How far out the orb can paint, as a multiple of `r` — the radius *after*
+/// breathing. One constant per thing the painter actually draws, each read
+/// straight off the code that draws it, so the host window is sized from the
+/// drawing rather than from a factor chosen to look about right.
+mod reach {
+    /// `paint`: `r = radius * (1 + breath * breath_amp)`. `breath()` is
+    /// `sin()`, so it is in `[-1, 1]`, and `breath_amp` peaks at
+    /// `0.04 + 0.06 * level` while Recording with `level == 1`.
+    pub(super) const BREATH: f32 = 1.10;
+
+    /// `paint_glow`: layers at `r * (1 + GLOW_EXTENT * t)`, `t` up to 1.
+    /// Filled circles, so there is no stroke to add.
+    pub(super) const GLOW: f32 = 1.0 + super::GLOW_EXTENT;
+
+    /// `paint_recording`: the expanding wave tops out at
+    /// `r * (1.03 + 0.42)`, stroked with `r * 0.03`, and `paint` is called with
+    /// that mode's own `breath_amp`, so `r` already carries the breathing.
+    pub(super) const RECORDING_WAVE: f32 = 1.03 + 0.42 + 0.03 / 2.0;
+
+    /// `paint_processing`: the orbit particles sit at `r * 1.36` and are
+    /// `r * 0.03 * (0.7 + 0.5 * t)` across, so their outer edge is that plus
+    /// their own radius.
+    pub(super) const PROCESSING_PARTICLES: f32 = 1.36 + 0.03 * 1.2;
+
+    /// `paint_complete`: the success burst is the furthest anything ever gets —
+    /// ten particles at `r * (1.05 + 0.55)`, each `r * 0.045` across. The
+    /// expanding ring behind them only reaches `r * (1.02 + 0.5) + r * 0.06/2`.
+    pub(super) const COMPLETE_PARTICLES: f32 = 1.05 + 0.55 + 0.045;
+
+    const fn max2(a: f32, b: f32) -> f32 {
+        if a > b {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// The furthest any single term reaches: the radius the window has to hold.
+    pub(super) const ART: f32 = max2(
+        max2(GLOW, RECORDING_WAVE),
+        max2(PROCESSING_PARTICLES, COMPLETE_PARTICLES),
+    );
+
+    /// `shake_offset` slides the whole orb sideways by up to this × radius, so
+    /// the painted circle travels as well.
+    pub(super) const SHAKE: f32 = super::SHAKE_EXTENT;
+
+    /// The two facts about the terms above that used to be tests, checked at
+    /// compile time instead: the success burst really is the furthest thing the
+    /// painter draws, and `ART` really is the maximum of the four terms.
+    ///
+    /// A test would only notice these on the next run; a build failure notices
+    /// them while the drawing is still being edited, which is the moment the
+    /// numbers are actually in question.
+    const _: () = {
+        assert!(
+            ART == COMPLETE_PARTICLES,
+            "the success burst is no longer the furthest drawn term: the window has to be re-derived"
+        );
+        assert!(COMPLETE_PARTICLES > GLOW);
+        assert!(COMPLETE_PARTICLES > PROCESSING_PARTICLES);
+        assert!(COMPLETE_PARTICLES > RECORDING_WAVE);
+        // How much room each of the others has left, so the margins are visible
+        // rather than implied.
+        assert!(ART - GLOW > 0.09);
+        assert!(ART - PROCESSING_PARTICLES > 0.24);
+        assert!(ART - RECORDING_WAVE > 0.17);
+    };
+}
 
 /// What happened this frame; the overlay decides what to do with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,7 +125,9 @@ pub struct Orb {
     window: win::OrbWindow,
     /// Idle resting center, physical screen pixels.
     home: Pos2,
-    canvas_scale: f32,
+    /// True until `home` has been brought inside the work area with a real
+    /// `pixels_per_point` (see [`Orb::new`] and [`Orb::clamp_home`]).
+    home_needs_clamp: bool,
     drag: Option<DragState>,
     shown_mode: OrbMode,
     complete_hold: f32,
@@ -59,18 +144,24 @@ pub struct Orb {
 
 impl Orb {
     /// `window_title` must match the overlay viewport title (used to find the HWND).
-    /// `saved_center` = `(orb_position_x, orb_position_y)` from settings, if present.
+    /// `saved_center` = `(orb_position_x, orb_position_y)` from settings, in
+    /// physical pixels.
+    ///
+    /// A restored position is **not** clamped here: the edge margin is in points
+    /// and `pixels_per_point` is not known until the first frame, so clamping
+    /// now compared pixels against points — 1.25x too permissive on this
+    /// machine. [`Self::clamp_home`] does it as soon as `ppp` is real.
     pub fn new(window_title: &str, saved_center: Option<(i32, i32)>) -> Self {
-        let idle_half = Self::max_canvas_points() * 0.5;
         let home = match saved_center {
-            Some((x, y)) => win::clamp_center(Pos2::new(x as f32, y as f32), idle_half),
+            Some((x, y)) => Pos2::new(x as f32, y as f32),
             None => win::primary_screen_center(),
         };
         Self {
             anim: OrbAnimation::new(home),
             window: win::OrbWindow::new(window_title),
             home,
-            canvas_scale: 1.0,
+            // Reconciled with the work area on the first frame, once ppp is real.
+            home_needs_clamp: saved_center.is_some(),
             drag: None,
             shown_mode: OrbMode::Idle,
             complete_hold: 0.0,
@@ -143,7 +234,7 @@ impl Orb {
 
                 self.handle_pointer(ui, &response, mode, ppp, &mut out);
 
-                let draggable = matches!(mode, OrbMode::Idle | OrbMode::Error);
+                let draggable = mode.hoverable();
                 let hovered = response.hovered() || self.drag.is_some();
                 self.anim.set_hover(hovered && draggable);
 
@@ -160,15 +251,18 @@ impl Orb {
                 self.paint(ui.painter(), center, radius, mode);
             });
 
-        let canvas_scale = self.update_canvas_scale();
+        if self.home_needs_clamp {
+            self.home_needs_clamp = false;
+            self.clamp_home(ppp);
+        }
         // The OS window is created ONCE, at the largest canvas the orb can ever
-        // reach, and never resized. Resizing a transparent always-on-top window
-        // leaves the pixels the old rect had covered on screen: dictation grows
-        // the window 203 -> 298 px and going idle shrinks it back, and every
+        // paint into, and never resized. Resizing a transparent always-on-top
+        // window leaves the pixels the old rect had covered on screen: dictation
+        // grew the window 203 -> 298 px and going idle shrank it back, and every
         // cycle stranded a full-width band above the orb (measured: 298x28 px,
         // centred on the orb, in the exact rows the larger window used to own).
-        // The orb keeps animating inside a fixed, fully transparent canvas; only
-        // a drag moves the window.
+        // The orb animates inside a fixed, fully transparent canvas; only a drag
+        // moves the window.
         let side_pt = Self::max_canvas_points();
         let side_px = (side_pt * ppp).ceil() as i32;
         // The window is a square and the orb is a circle in the middle of it,
@@ -178,13 +272,12 @@ impl Orb {
         let region_radius_px = (self.painted_radius_pt() * ppp).ceil() as i32;
         self.window
             .place(self.anim.current_position, side_px, region_radius_px, ppp);
-        debug_assert!(side_pt >= Self::canvas_side_points(canvas_scale));
         // phase 1: only resize when the canvas actually changed.
         if self.sent_side_pt != Some(side_pt) {
             self.sent_side_pt = Some(side_pt);
-            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::InnerSize(eframe::egui::vec2(
-                side_pt, side_pt,
-            )));
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::InnerSize(
+                eframe::egui::vec2(side_pt, side_pt),
+            ));
         }
 
         ctx.request_repaint_after(self.repaint_interval(mode));
@@ -232,7 +325,7 @@ impl Orb {
         ppp: f32,
         out: &mut OrbOutput,
     ) {
-        let draggable = matches!(mode, OrbMode::Idle | OrbMode::Error);
+        let draggable = mode.hoverable();
 
         if draggable && self.drag.is_none() && response.drag_started() {
             if let Some(cursor) = win::cursor_position() {
@@ -251,8 +344,12 @@ impl Orb {
                         (cx - drag.cursor_start.0) as f32,
                         (cy - drag.cursor_start.1) as f32,
                     );
-                    let half = Self::canvas_side_points(self.canvas_scale) * ppp * 0.5;
-                    let c = win::clamp_center(drag.center_start + delta, half);
+                    // The cursor delta is already in physical pixels, so this is
+                    // where points become pixels — once, in `keep_out_px`.
+                    let c = win::clamp_center(
+                        drag.center_start + delta,
+                        keep_out_px(self.anim.current_scale, ppp),
+                    );
                     self.home = c;
                     self.anim.snap_position(c);
                 }
@@ -267,50 +364,51 @@ impl Orb {
         }
     }
 
-    fn update_canvas_scale(&mut self) -> f32 {
-        let target = self.anim.target_scale;
-        let current = self.anim.current_scale;
-        // Grow the window immediately, shrink it only once the orb has settled.
-        self.canvas_scale = if self.anim.scale_settled() {
-            target
-        } else {
-            target.max(current).max(self.canvas_scale)
-        };
-        self.canvas_scale
+    /// Brings `home` inside the work area, keeping the orb's **painted** edge
+    /// `EDGE_MARGIN_PT` away from it.
+    ///
+    /// The orb can only be dragged in [`OrbMode::Idle`] and
+    /// [`OrbMode::Error`], so the reach used here is the one it has while
+    /// draggable — which is what lets it sit close to the edge instead of a
+    /// whole transparent canvas away. Growing afterwards (dictation takes the
+    /// orb to 1.7x) is safe precisely because the window is centred on the orb
+    /// and holds the largest reach, so a bigger orb never runs out of canvas; it
+    /// only comes nearer the screen edge, and springs back in when the orb
+    /// shrinks.
+    fn clamp_home(&mut self, ppp: f32) {
+        let clamped = win::clamp_center(self.home, keep_out_px(self.anim.current_scale, ppp));
+        if clamped != self.home {
+            tracing::info!(
+                from = %format_args!("({}, {})", self.home.x, self.home.y),
+                to = %format_args!("({:.0}, {:.0})", clamped.x, clamped.y),
+                "orb pulled back inside the work area"
+            );
+            self.home = clamped;
+            self.anim.snap_position(clamped);
+        }
     }
 
-    fn canvas_side_points(scale: f32) -> f32 {
-        BASE_DIAMETER * scale * CANVAS_FACTOR + CANVAS_PADDING * 2.0
-    }
-
-    /// How far out from its centre the orb can ever paint, in points.
+    /// How far from the orb's centre it can paint this frame, in points.
     ///
-    /// This is the radius the window's click region may be clipped to without
-    /// ever clipping the orb itself, so it has to be the **worst** case, not the
-    /// typical one. Each term is the ceiling of one thing [`Self::paint`] draws
-    ///:
-    ///
-    /// * `radius * 1.10` — `paint` multiplies by `1 + breath * breath_amp`,
-    ///   and `breath_amp` peaks at `0.04 + 0.06 * level` when Recording;
-    /// * `* (1 + GLOW_EXTENT)` — `paint_glow` layers reach
-    ///   `r * (1 + GLOW_EXTENT * t)` with `t` up to 1;
-    /// * `radius * 1.18` — the rings sit at `r * 1.18`, which is inside the
-    ///   glow term but is kept as an explicit floor so changing `GLOW_EXTENT`
-    ///   cannot silently shrink the clickable area;
-    /// * `+ radius * SHAKE_EXTENT` — `shake_offset` slides the whole orb
-    ///   sideways, so the circle has to travel with it.
-    ///
+    /// The same number bounds the click region and the window, so the two
+    /// cannot disagree — which is exactly how the region used to end up a few
+    /// points short of the success burst and shear its outermost particles.
     /// Clamped to the canvas so the region never asks for more than the window
     /// has.
     fn painted_radius_pt(&self) -> f32 {
-        region_radius_pt(self.anim.current_scale, Self::max_canvas_points() * 0.5)
+        painted_reach_pt(self.anim.current_scale, true)
+            .clamp(MIN_HIT_RADIUS, Self::max_canvas_points() * 0.5)
     }
 
-    /// Fixed window side in points: the canvas at the biggest scale the orb ever
-    /// reaches (`Recording`). Sizing the window to this once, instead of tracking
-    /// the animated scale, is what keeps the window from ever being resized.
-    fn max_canvas_points() -> f32 {
-        Self::canvas_side_points(OrbMode::Recording.target_scale())
+    /// Fixed window side in points: twice the furthest the orb can paint, for
+    /// the largest scale the spring can reach.
+    ///
+    /// Sizing the window to this once, instead of tracking the animated scale,
+    /// is what keeps it from ever being resized. A resized transparent
+    /// always-on-top window strands the pixels its old rect covered, which is
+    /// the ghost-aura artifact measured in `docs/GUI-WINDOW-ARTIFACT-REPORT.md`.
+    pub fn max_canvas_points() -> f32 {
+        painted_reach_pt(max_reachable_scale(), true) * 2.0
     }
 
     fn repaint_interval(&self, mode: OrbMode) -> Duration {
@@ -342,7 +440,7 @@ impl Orb {
             return Vec2::ZERO;
         }
         let k = self.error_shake / ERROR_SHAKE_SECS;
-        Vec2::new((self.time * 42.0).sin() * radius * 0.22 * k, 0.0)
+        Vec2::new((self.time * 42.0).sin() * radius * reach::SHAKE * k, 0.0)
     }
 
     fn voice_level(&self) -> f32 {
@@ -350,8 +448,10 @@ impl Orb {
             return level.clamp(0.0, 1.0);
         }
         let t = self.time;
-        (0.5 + 0.28 * (t * 7.3).sin() + 0.14 * (t * 11.9 + 1.3).sin() + 0.08 * (t * 3.1 + 0.7).sin())
-            .clamp(0.0, 1.0)
+        (0.5 + 0.28 * (t * 7.3).sin()
+            + 0.14 * (t * 11.9 + 1.3).sin()
+            + 0.08 * (t * 3.1 + 0.7).sin())
+        .clamp(0.0, 1.0)
     }
 
     // ── rendering ─────────────────────────────────────────────────────
@@ -584,7 +684,11 @@ fn paint_body(painter: &Painter, c: Pos2, r: f32, pal: &OrbPalette) {
         let t = i as f32 / (layers - 1) as f32;
         let layer_r = r * (1.0 - 0.78 * t);
         let offset = light * (t * 0.85);
-        painter.circle_filled(c + offset, layer_r, lerp_color(pal.rim, pal.core, smoothstep(t)));
+        painter.circle_filled(
+            c + offset,
+            layer_r,
+            lerp_color(pal.rim, pal.core, smoothstep(t)),
+        );
     }
 
     // Glass edge
@@ -632,7 +736,10 @@ fn paint_comet_arc(
         let fade = 1.0 - f0;
         painter.line_segment(
             [c + Vec2::angled(a0) * radius, c + Vec2::angled(a1) * radius],
-            Stroke::new(width * (0.35 + 0.65 * fade), with_alpha(color, fade.powf(1.3))),
+            Stroke::new(
+                width * (0.35 + 0.65 * fade),
+                with_alpha(color, fade.powf(1.3)),
+            ),
         );
     }
 }
@@ -644,10 +751,13 @@ mod win {
 
     use eframe::egui::Pos2;
     use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetSystemMetrics, SetWindowPos, HWND_TOPMOST, SM_CXSCREEN,
-        SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+        SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        SWP_NOACTIVATE, SWP_NOOWNERZORDER,
     };
 
     pub struct OrbWindow {
@@ -668,8 +778,21 @@ mod win {
             }
         }
 
+        /// Points the window at `raw`.
+        ///
+        /// The overlay hands the handle over on **every** frame, so this has to
+        /// be a no-op when the handle has not changed. It used to clear `last`
+        /// unconditionally, which threw away the cached rect ~60 times a second
+        /// and made [`Self::place`] call `SetWindowPos` on every frame — the
+        /// dedup it exists to provide was unreachable. A genuinely new window
+        /// owns no cached rect and still gets placed once; a window that has
+        /// gone away (`raw == 0`) also drops it, so the handle can be resolved
+        /// again from scratch.
         pub fn set_raw(&mut self, raw: isize) {
-            if self.raw != raw && raw != 0 {
+            if self.raw == raw {
+                return;
+            }
+            if raw != 0 {
                 #[cfg(windows)]
                 crate::gui::window_shape::enable_true_transparency(raw);
             }
@@ -677,9 +800,23 @@ mod win {
             self.last = None;
         }
 
+        /// The rect [`Self::place`] last committed, for tests.
+        #[cfg(test)]
+        pub fn last_rect(&self) -> Option<(i32, i32, i32, i32)> {
+            self.last
+        }
+
+        /// Pretends [`Self::place`] committed `rect`, so a test can check what
+        /// survives a [`Self::set_raw`] without owning a real window.
+        #[cfg(test)]
+        pub fn seed_last_for_test(&mut self, rect: (i32, i32, i32, i32)) {
+            self.last = Some(rect);
+        }
+
         fn hwnd(&mut self) -> Option<HWND> {
             if self.raw == 0 {
-                let main = crate::gui::window_shape::MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+                let main =
+                    crate::gui::window_shape::MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
                 if main != 0 {
                     self.raw = main;
                     #[cfg(windows)]
@@ -708,7 +845,11 @@ mod win {
         /// its click region to a circle of `region_radius_px`. No-op if neither
         /// changed.
         pub fn place(&mut self, center: Pos2, side_px: i32, region_radius_px: i32, ppp: f32) {
-            let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+            let ppp = if ppp.is_finite() && ppp > 0.0 {
+                ppp
+            } else {
+                1.0
+            };
             let side = side_px.max(1);
             let x = (center.x - side as f32 * 0.5).round() as i32;
             let y = (center.y - side as f32 * 0.5).round() as i32;
@@ -774,7 +915,15 @@ mod win {
         Pos2::new(w as f32 * 0.5, h as f32 * 0.5)
     }
 
-    /// Keep a window of half-size `half` (physical px) inside the virtual desktop.
+    /// Keeps a window of half-size `half` (physical px) inside the **work area**
+    /// of the monitor `p` is on, falling back to the virtual desktop.
+    ///
+    /// The work area rather than the whole monitor is what a user means by "the
+    /// edge of the screen": `SM_CXVIRTUALSCREEN` includes the taskbar, so
+    /// clamping to it let the orb be dragged under the taskbar and out of
+    /// reach. `MonitorFromPoint` also makes the answer per-monitor, so a second
+    /// display with a different resolution or a taskbar on another edge gets its
+    /// own bounds.
     pub fn clamp_center(p: Pos2, half: f32) -> Pos2 {
         let (vx, vy, vw, vh) = unsafe {
             (
@@ -787,97 +936,288 @@ mod win {
         if vw <= 0 || vh <= 0 {
             return p;
         }
+        let (mut left, mut top, mut right, mut bottom) =
+            (vx as f32, vy as f32, (vx + vw) as f32, (vy + vh) as f32);
+        if let Some(work) = work_area_at(p) {
+            (left, top, right, bottom) = work;
+        }
         let clamp = |v: f32, lo: f32, hi: f32| if lo <= hi { v.clamp(lo, hi) } else { v };
         Pos2::new(
-            clamp(p.x, vx as f32 + half, (vx + vw) as f32 - half),
-            clamp(p.y, vy as f32 + half, (vy + vh) as f32 - half),
+            clamp(p.x, left + half, right - half),
+            clamp(p.y, top + half, bottom - half),
         )
+    }
+
+    /// Usable desktop of the monitor nearest to `p`, physical pixels.
+    ///
+    /// `None` when the monitor cannot be resolved, which sends the caller back
+    /// to the virtual desktop rather than to an unbounded position.
+    fn work_area_at(p: Pos2) -> Option<(f32, f32, f32, f32)> {
+        #[cfg(windows)]
+        {
+            let pt = POINT {
+                x: p.x.round() as i32,
+                y: p.y.round() as i32,
+            };
+            let mon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+            if mon.is_invalid() {
+                return None;
+            }
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetMonitorInfoW(mon, &mut info) }.as_bool() {
+                let rc = info.rcWork;
+                // A work area the monitor cannot honour (a degenerate one would
+                // make the clamp an empty interval) falls back to the caller.
+                if rc.right > rc.left && rc.bottom > rc.top {
+                    return Some((
+                        rc.left as f32,
+                        rc.top as f32,
+                        rc.right as f32,
+                        rc.bottom as f32,
+                    ));
+                }
+            }
+        }
+        None
     }
 }
 
-/// How far out from the orb's centre the click region may be clipped, in points,
-/// for an orb currently at `scale` and a canvas half-width of `canvas_half`.
+/// How far out from the orb's centre it can paint, in points, at `scale`.
+///
+/// `with_shake` is a separate term because the shake is a *translation* of the
+/// whole orb rather than a bigger circle: it can only be active in
+/// [`OrbMode::Error`], so a caller that knows the orb is not shaking leaves it
+/// out instead of paying for it in every mode.
 ///
 /// Free-standing so the ceiling it encodes can be tested without building an
-/// [`Orb`]: see `tests::region_never_crops_the_glow`. Every term is a ceiling of
-/// something [`paint`] and [`paint_glow`] actually draw, and the sum is what the
-/// region has to contain.
-fn region_radius_pt(scale: f32, canvas_half: f32) -> f32 {
+/// [`Orb`]: see `tests::the_window_holds_every_pixel_every_mode_can_paint`.
+/// Every term is the ceiling of something [`Orb::paint`] actually draws, and the
+/// sum is what both the window and the click region have to contain.
+fn painted_reach_pt(scale: f32, with_shake: bool) -> f32 {
     let radius = BASE_DIAMETER * 0.5 * scale;
-    let breathed = radius * 1.10; // `paint`: 1 + breath * breath_amp, amp <= 0.10
-    let glowed = breathed * (1.0 + GLOW_EXTENT); // `paint_glow`: r * (1 + GLOW_EXTENT * t), t <= 1
-    let rings = breathed * 1.18;
-    let shaken = radius * SHAKE_EXTENT;
-    let reach = glowed.max(rings) + shaken;
-    reach.clamp(MIN_HIT_RADIUS, canvas_half)
+    let art = radius * reach::BREATH * reach::ART;
+    if with_shake {
+        art + radius * reach::SHAKE
+    } else {
+        art
+    }
+}
+
+/// How far the orb's centre has to stay from the edge of the work area, in
+/// physical pixels: its painted reach at `scale` plus the visible margin.
+///
+/// The drag and the restored position both go through this, so they cannot
+/// disagree — which they used to, because the drag used the canvas half in
+/// pixels and the restore used the same number in points.
+fn keep_out_px(scale: f32, ppp: f32) -> f32 {
+    let ppp = if ppp.is_finite() && ppp > 0.0 {
+        ppp
+    } else {
+        1.0
+    };
+    (painted_reach_pt(scale, true) + EDGE_MARGIN_PT) * ppp
+}
+
+/// The painted reach, for `window_shape`'s click-through tests.
+///
+/// The region the orb asks Win32 for and the reach this returns have to be the
+/// same number, or one of the two guarantees (no cropped glow / no stolen
+/// clicks) is silently lost. Exposing it here lets that be a test instead of an
+/// assumption.
+#[cfg(test)]
+pub(crate) fn painted_reach_pt_for_test(scale: f32) -> f32 {
+    painted_reach_pt(scale, true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::orb_animation::SPRING_DAMPING_RATIO;
     use super::*;
+    use crate::gui::orb_animation::max_reachable_scale;
 
-    /// The largest scale the animation can actually reach.
+    /// `SetWindowRgn` clips *rendering* as well as hit-testing, so a region (and
+    /// a window) smaller than the painted orb would not merely shrink the click
+    /// target — it would shear the glow, or the success burst, off with a hard
+    /// circular edge. That failure is silent on screen, so the ceiling is pinned
+    /// here instead of being re-derived by eye.
     ///
-    /// Not simply `Recording.target_scale()`: `OrbAnimation` integrates a
-    /// spring, and a spring overshoots. The step response of a second-order
-    /// system peaks at `exp(-pi*zeta / sqrt(1 - zeta^2))` above its target, so
-    /// that is the number to sweep to — doubled, because repeated hotkey taps
-    /// can stack on velocity that has not yet damped out.
-    fn max_reachable_scale() -> f32 {
-        let zeta = SPRING_DAMPING_RATIO;
-        let overshoot = (-PI * zeta / (1.0f32 - zeta * zeta).sqrt()).exp();
-        let biggest = OrbMode::Recording.target_scale();
-        biggest * (1.0 + overshoot * 2.0)
-    }
-
-    /// `SetWindowRgn` clips *rendering* as well as hit-testing, so a region
-    /// smaller than the painted orb would not merely shrink its click target —
-    /// it would shear the glow off with a hard circular edge. This is the one
-    /// failure mode of the region approach that is silent on screen, so the
-    /// ceiling is pinned here instead of being re-derived by eye.
+    /// Swept across every mode and the whole range the scale spring can reach,
+    /// because the mode only decides *which* term is the furthest one, and
+    /// `reach::ART` has to be the maximum over all of them.
     #[test]
-    fn region_never_crops_the_glow() {
+    fn the_window_holds_every_pixel_every_mode_can_paint() {
         let canvas_half = Orb::max_canvas_points() * 0.5;
         let top = max_reachable_scale();
-        let mut scale = 0.2;
-        while scale <= top {
-            let region = region_radius_pt(scale, canvas_half);
-
-            // What `paint` + `paint_glow` + the shake can actually reach.
-            let radius = BASE_DIAMETER * 0.5 * scale;
-            let painted = radius * 1.10 * (1.0 + GLOW_EXTENT) + radius * SHAKE_EXTENT;
-
-            assert!(
-                region + 0.001 >= painted,
-                "scale {scale}: region {region} < painted reach {painted}"
-            );
-            assert!(
-                region <= canvas_half + 0.001,
-                "scale {scale}: region {region} does not fit a canvas half of {canvas_half}"
-            );
-            scale += 0.01;
+        for mode in OrbMode::ALL {
+            for shaking in [false, true] {
+                // Only Error shakes, and a shake is a translation of the whole
+                // orb: a mode that cannot shake must not be charged for it.
+                let shaken = shaking && mode == OrbMode::Error;
+                let mut scale = 0.2;
+                while scale <= top {
+                    let reach = painted_reach_pt(scale, shaken);
+                    assert!(
+                        reach <= canvas_half + 0.001,
+                        "{mode:?} at scale {scale} paints to {reach} pt, \
+                         but the window half is only {canvas_half} pt"
+                    );
+                    scale += 0.01;
+                }
+            }
         }
     }
 
-    /// `min(MAX_REACHABLE, canvas half)` is what the region actually becomes, so
-    /// the window only has to be big enough for the *reachable* orb — a bigger
-    /// window would just be more desktop to protect.
+    /// The whole point of deriving the canvas: it is *exactly* twice the worst
+    /// painted reach, with no factor and no padding left over.
+    ///
+    /// A slack factor is how the old `CANVAS_FACTOR = 1.90` plus
+    /// `CANVAS_PADDING = 24` came to be right by accident — `1.90 * diameter`
+    /// alone was too small, and the 48 pt of padding hid it. A test that only
+    /// checks the canvas is big enough cannot see that; this one fails if anyone
+    /// re-introduces a round number.
     #[test]
-    fn the_window_is_big_enough_for_the_biggest_orb() {
-        let top = max_reachable_scale();
+    fn the_canvas_is_exactly_the_painted_reach_and_no_more() {
+        let side = Orb::max_canvas_points();
+        let needed = painted_reach_pt(max_reachable_scale(), true) * 2.0;
+        assert!(
+            (side - needed).abs() < 0.001,
+            "canvas is {side} pt but the worst painted reach needs {needed} pt"
+        );
+        // Sanity on the size itself, so a change to the drawing that makes the
+        // orb much bigger or smaller shows up as a visible diff.
+        assert!(
+            (side - 237.0).abs() < 8.0,
+            "canvas moved to {side} pt (it was 238 pt before the derivation)"
+        );
+    }
+
+    /// Which drawing term the window is actually sized for, as a number.
+    ///
+    /// The *fact* that it is the success burst is asserted at compile time (see
+    /// the `const` block in `reach`); this is here so the arithmetic shows up in
+    /// test output and a change to any term is a visible diff rather than a
+    /// silent resizing of the window.
+    #[test]
+    fn the_window_is_sized_for_the_success_burst() {
+        assert_eq!(reach::ART, reach::COMPLETE_PARTICLES);
+        assert!(
+            (reach::ART - 1.645).abs() < 0.001,
+            "the furthest drawn term is now {}, not the 1.645 the window was derived from",
+            reach::ART
+        );
+    }
+
+    /// Dragging has to keep the orb's *painted* edge on screen, which is a very
+    /// different number from half the transparent canvas: this is the whole
+    /// difference between an orb that sits next to the edge and one that floats
+    /// in the middle of the desktop.
+    #[test]
+    fn dragging_keeps_the_orb_near_the_edge_instead_of_marooning_it() {
+        let keep_out = painted_reach_pt(1.0, true) + EDGE_MARGIN_PT;
+        let old_keep_out = 238.0 * 0.5; // what the canvas half used to demand
+                                        // The margin on top of the painted edge is exactly the visible margin,
+                                        // and nothing else: this is the number that says the orb is no longer
+                                        // being held a whole transparent canvas away from the edge.
+        assert!((keep_out - painted_reach_pt(1.0, true) - EDGE_MARGIN_PT).abs() < 0.001);
+        assert!(
+            keep_out < old_keep_out * 0.65,
+            "idle keep-out is {keep_out} pt; the old canvas half was {old_keep_out} pt"
+        );
+    }
+
+    /// Growing after being parked at the edge must not crop the orb, and the
+    /// reason is structural rather than another clamp: the window is centred on
+    /// the orb and holds the worst reach, so the orb cannot outgrow its canvas.
+    #[test]
+    fn growing_after_being_parked_at_the_edge_still_fits_the_window() {
         let canvas_half = Orb::max_canvas_points() * 0.5;
-        let reach = region_radius_pt(top, canvas_half);
-        assert!(
-            reach <= canvas_half + 0.001,
-            "the largest reachable orb ({top} scale) paints to {reach} pt but the window half is {canvas_half} pt"
-        );
-        // And the clamp is not what saved it: without the canvas the orb would
-        // have needed more room than the window has.
-        let unclamped = region_radius_pt(top, f32::INFINITY);
-        assert!(
-            unclamped <= canvas_half + 0.001,
-            "the canvas is too small: {unclamped} pt of orb in a {canvas_half} pt window"
-        );
+        let parked_keep_out = painted_reach_pt(1.0, true) + EDGE_MARGIN_PT;
+        for mode in OrbMode::ALL {
+            let grown = painted_reach_pt(mode.target_scale(), mode == OrbMode::Error);
+            // It still fits the window that is centred on it.
+            assert!(
+                grown <= canvas_half + 0.001,
+                "{mode:?} paints to {grown} pt in a {canvas_half} pt window"
+            );
+            // So the only consequence of parking at the edge is that the orb
+            // comes visually closer to it, by exactly the growth in reach.
+            let encroachment = grown - parked_keep_out;
+            assert!(
+                encroachment < canvas_half,
+                "{mode:?} would reach {encroachment} pt past the work-area edge"
+            );
+        }
+    }
+
+    /// The restored position and the drag have to agree, or the orb jumps the
+    /// first time it is touched. Both go through the same keep-out, so this is a
+    /// statement about the single number they share.
+    #[test]
+    fn the_restored_home_and_the_drag_use_the_same_keep_out() {
+        // At 100% the keep-out is the painted reach plus the margin, in points
+        // that happen to be pixels.
+        let reach = painted_reach_pt(1.0, true);
+        assert!((keep_out_px(1.0, 1.0) - (reach + EDGE_MARGIN_PT)).abs() < 0.001);
+        // The same expression at 125%: the margin has to scale with the display
+        // or the orb ends up proportionally closer to the edge than intended.
+        assert!((keep_out_px(1.0, 1.25) - 1.25 * (reach + EDGE_MARGIN_PT)).abs() < 0.001);
+        // A nonsensical scale factor falls back to 1.0 rather than collapsing the
+        // margin to nothing (which would let the orb be dragged off-screen).
+        assert_eq!(keep_out_px(1.0, 0.0), keep_out_px(1.0, 1.0));
+        assert_eq!(keep_out_px(1.0, f32::NAN), keep_out_px(1.0, 1.0));
+    }
+
+    #[test]
+    fn the_keep_out_scales_with_the_display() {
+        // 1.25x is this machine. A 200% display has to double the margin too, or
+        // the orb ends up proportionally closer to the edge than intended.
+        assert!((keep_out_px(1.0, 2.0) - 2.0 * keep_out_px(1.0, 1.0)).abs() < 0.001);
+    }
+
+    mod win {
+        use super::super::win::OrbWindow;
+
+        /// The reported bug: the overlay calls `set_hwnd` on every frame, and
+        /// `set_raw` used to clear the cached rect every time, so `place` issued
+        /// a `SetWindowPos` on every single frame.
+        ///
+        /// The cache is what makes moving the orb cheap, and the alternative is
+        /// not merely wasteful on this app: a moving transparent window strands
+        /// the pixels of its old rect, which is the artifact measured in
+        /// `docs/GUI-WINDOW-ARTIFACT-REPORT.md`.
+        #[test]
+        fn resending_the_same_handle_keeps_the_cached_rect() {
+            let mut w = OrbWindow::new("OmniType");
+            // A genuinely new handle owns no cached rect and must be placed once.
+            w.seed_last_for_test((10, 20, 300, 300));
+            w.set_raw(0x1234);
+            assert_eq!(w.last_rect(), None);
+
+            // The same handle again — which is every frame — must not throw the
+            // rect away.
+            w.seed_last_for_test((10, 20, 300, 300));
+            w.set_raw(0x1234);
+            assert_eq!(
+                w.last_rect(),
+                Some((10, 20, 300, 300)),
+                "the same handle every frame must not discard the rect"
+            );
+        }
+
+        /// A window that has gone away has to give the rect up, so the handle can
+        /// be resolved from scratch and the new one placed.
+        #[test]
+        fn losing_the_handle_clears_the_cached_rect() {
+            let mut w = OrbWindow::new("OmniType");
+            w.set_raw(0x1234);
+            w.seed_last_for_test((1, 2, 3, 4));
+            w.set_raw(0);
+            assert_eq!(w.last_rect(), None);
+            // ...and a zero handle is idempotent rather than a slow leak of state.
+            w.set_raw(0);
+            assert_eq!(w.last_rect(), None);
+        }
     }
 }
