@@ -57,6 +57,16 @@
 | [mutation-check-startup.sh](mutation-check-startup.sh) | کاناری جهشی بوت: دانلود مدل + گارد اجرای state machine — ۱۲ تصمیم |
 | `../third_party/egui-notify/` | کد وام‌گرفته‌شده، دست‌نخورده |
 
+### اجرای رودمپ (موج صفر اجرا شده)
+| فایل | چه چیزی |
+|---|---|
+| [execution/STATUS.md](execution/STATUS.md) | **دفتر پیگیری موج‌ها** — وضعیت هر بسته، مالکیت فایل، یافته‌های قفل‌شده، و شش تصمیم باز که مال کاربر است |
+| [execution/CONTRACTS.md](execution/CONTRACTS.md) | قراردادهای مشترک (K0) — ۹ قرارداد، هرکدام با وضعیت «موجود» یا «پیشنهاد» و محل ثبت پیشنهادی |
+| [execution/B0-orb-baseline.md](execution/B0-orb-baseline.md) | خط مبنای اُرب: مسیر پنجره، چهار شعاع، ماتریس حالت‌ها، سه یافتهٔ باز، و معیارهای پذیرش `O1` |
+| [execution/T0-text-baseline.md](execution/T0-text-baseline.md) | خط مبنای متن: جدول ۱۷ نمونهٔ اجراشد��، سه کلمهٔ سالمِ خراب‌شده، و آنچه در کد اصلاً وجود ندارد |
+| [execution/S0-session-baseline.md](execution/S0-session-baseline.md) | خط مبنای جلسه: نمودار رویداد→اثر→emit، نبودِ شناسه و مقصد، لغوی که بی‌اثر است |
+| [../voice-ptt/tests/fixtures/text-baseline/](../voice-ptt/tests/fixtures/text-baseline/) | نمونه‌های ساختگی متن — فعلاً مستندکردن اجرایی، نه تست |
+
 > هر دو اسکریپت کاناری از [canary-harness.sh](canary-harness.sh) استفاده می‌کنند. این هارنس روی درخت قرمز `ABORT` می‌کند و از **یک اسنپ‌شات پاک** بازگردانی می‌کند، چون `.bak` چرخشی پشته است و یک اجرای قطع‌شده می‌تواند جهش‌هایش را ابدی کند (بندهای ۱۶–۱۹ [LESSONS-LEARNED.md](LESSONS-LEARNED.md)).
 
 ---

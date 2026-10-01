@@ -1,0 +1,171 @@
+{
+  "meta": {
+    "package": "T0",
+    "measured_on": "2026-10-01",
+    "how_measured": "temporary integration test calling the public API (Normalizer::normalize, processing::process_text, SeamStitcher::stitch) with the strings below; the probe was deleted afterwards, nothing else changed",
+    "note": "ZWNJ is U+200C, written here as \\u200c so it is visible. `current` is what the code produced today; `expected` is what the roadmap says must hold; `verdict` is the gap between them.",
+    "encoding": "all strings are Persian unless stated"
+  },
+  "cases": [
+    {
+      "id": "T0-001",
+      "stage": "normalize",
+      "note": "roadmap §4.1 names this word explicitly",
+      "input": "كلمات",
+      "current": "کلم\u200cات",
+      "expected": "کلمات",
+      "verdict": "BREAKS"
+    },
+    {
+      "id": "T0-002",
+      "stage": "normalize",
+      "note": "roadmap §4.1 names this word explicitly",
+      "input": "تمام",
+      "current": "تم\u200cام",
+      "expected": "تمام",
+      "verdict": "BREAKS"
+    },
+    {
+      "id": "T0-003",
+      "stage": "normalize",
+      "note": "roadmap §4.1 names this word explicitly",
+      "input": "ميكروفون",
+      "current": "می\u200cکروفون",
+      "expected": "میکروفون",
+      "verdict": "BREAKS"
+    },
+    {
+      "id": "T0-004",
+      "stage": "normalize",
+      "note": "same rule as 001, different stem",
+      "input": "اتمام",
+      "current": "اتم\u200cام",
+      "expected": "اتمام",
+      "verdict": "BREAKS"
+    },
+    {
+      "id": "T0-005",
+      "stage": "normalize",
+      "note": "the -ها rule working as intended",
+      "input": "كتابهاي",
+      "current": "کتاب\u200cهای",
+      "expected": "کتاب‌های",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-006",
+      "stage": "normalize",
+      "note": "correct ZWNJ must survive untouched",
+      "input": "مي\u200cروم",
+      "current": "می\u200cروم",
+      "expected": "می‌روم",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-007",
+      "stage": "normalize",
+      "note": "a mis-split prefix must not be invented when the engine already spaced it",
+      "input": "مي روم",
+      "current": "می روم",
+      "expected": "می روم (or می‌روم — the roadmap leaves this open; must be decided, not defaulted)",
+      "verdict": "UNDECIDED"
+    },
+    {
+      "id": "T0-008",
+      "stage": "normalize",
+      "note": "teh marbuta",
+      "input": "كلمة",
+      "current": "کلمه",
+      "expected": "کلمه",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-009",
+      "stage": "normalize",
+      "note": "hamza is deleted rather than mapped; information loss",
+      "input": "مسأله",
+      "current": "مساله",
+      "expected": "UNDECIDED — roadmap has no rule for bare hamza",
+      "verdict": "UNDECIDED"
+    },
+    {
+      "id": "T0-010",
+      "stage": "normalize",
+      "note": "trailing tanwin is left alone",
+      "input": "مرحبا",
+      "current": "مرحبا",
+      "expected": "UNDECIDED — same as 009",
+      "verdict": "UNDECIDED"
+    },
+    {
+      "id": "T0-011",
+      "stage": "normalize",
+      "note": "punctuation attaches to the previous word, one space after",
+      "input": "این یک جمله است . واقعاً ؟",
+      "current": "این یک جمله است. واقعاً؟",
+      "expected": "این یک جمله است. واقعاً؟",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-012",
+      "stage": "normalize",
+      "note": "Arabic-Indic digits are mapped to Persian digits",
+      "input": "شماره ١٢٣",
+      "current": "شماره ۱۲۳",
+      "expected": "شماره ۱۲۳",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-013",
+      "stage": "normalize",
+      "note": "ASCII digits are NOT touched — there is no number option in settings at all",
+      "input": "۱۲۳abc 456",
+      "current": "۱۲۳abc 456",
+      "expected": "UNDECIDED — roadmap §4.1 wants an independent number option",
+      "verdict": "MISSING"
+    },
+    {
+      "id": "T0-014",
+      "stage": "full",
+      "note": "dictionary correction on top of normalisation",
+      "input": "من با پاتون و لينوكس كار ميكنم",
+      "current": "من با پایتون و لینوکس کار می\u200cکنم",
+      "expected": "من با پایتون و لینوکس کار می\u200cکنم",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-015",
+      "stage": "seam",
+      "note": "first chunk of a streamed session",
+      "input": "این یک آزمون است و ادامه دارد",
+      "current": "text unchanged, dropped 0, backspaces 0",
+      "expected": "same",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-016",
+      "stage": "seam",
+      "note": "overlap tail repeated by the recogniser must be dropped",
+      "input": "و ادامه دارد تا پایان (chunk 2, after T0-015)",
+      "current": "text = \"تا پایان\", dropped 3, backspaces 0",
+      "expected": "same",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-017",
+      "stage": "seam",
+      "note": "a truncated word is kept as-is until the full word arrives; no backspace is invented",
+      "input": "می\u200cخوا (chunk 3)",
+      "current": "text = \"می\u200cخوا\", dropped 0, backspaces 0",
+      "expected": "same",
+      "verdict": "OK"
+    }
+  ],
+  "missing_capabilities": [
+    "no raw / conservative / formal mode: process_text always normalises then corrects (processing/mod.rs:15)",
+    "no settings switch for the normaliser at all — [streaming] is the only text-related section (config/settings.rs:42)",
+    "no independent options for numbers, punctuation or ZWNJ (roadmap §4.1)",
+    "no punctuation/space policy at the injection boundary: inject_text types exactly the string it is given (output/injector.rs:23)",
+    "no target check: nothing between process_text and SendInput looks at which window is focused"
+  ]
+}
