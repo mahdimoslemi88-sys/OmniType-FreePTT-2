@@ -17,7 +17,7 @@
 
 | نوع | پیشنهاد محل ثبت | دلیل |
 |---|---|---|
-| `SessionId`, `ChunkId`, `SessionKind`, `SessionPhase` | `voice-ptt/src/state/session.rs` | کنار قواعد جلسه که تولیدشان می‌کند |
+| `SessionId`, `ChunkId`, `SessionKind`, `SessionPhase` — **موجود در S1** | `voice-ptt/src/state/session.rs` | کنار قواعد جلسه که تولیدشان می‌کند |
 | `TargetIdentity`, `TargetValidity` | `voice-ptt/src/output/target.rs` (تازه) | چیزی که درج لازم دارد، نه چیزی که رابط لازم دارد |
 | `InjectRequest`, `InjectOutcome` | `voice-ptt/src/output/injector.rs` | مرز واقعی سیستم‌عامل |
 | `BoundaryPolicy` | `voice-ptt/src/output/boundary.rs` (تازه) | سیاست مرز، مستقل از روتر و تزریق |
@@ -35,7 +35,8 @@
 
 ## ۱. جلسه و قطعه
 
-**وضعیت: وجود ندارد.** `SessionDriver` فقط دو پرچم دارد ([session.rs:182](../../voice-ptt/src/state/session.rs#L182)).
+**وضعیت: پیاده‌شده (`S1`، [S1-handoff.md](S1-handoff.md)).** `SessionDriver` فقط دو پرچم داشت
+([session.rs:182](../../voice-ptt/src/state/session.rs#L182)).
 رابط کاربری «جلسه» را از لبهٔ `AppState::Recording` حدس می‌زند
 ([overlay.rs:1024](../../voice-ptt/src/gui/overlay.rs#L1024))، که نه در بوت، نه در لغو، نه
 در پاسخ دیررس معنا دارد.
@@ -44,9 +45,10 @@
 pub struct SessionId(pub u64);          // یکتا در فرایند، از ۱ شروع می‌شود
 pub struct ChunkId(pub u32);           // درون یک جلسه، از ۱، بدون وقفه
 
-pub enum SessionKind { PushToTalk, LatchedHandsFree, Chunked }
+pub enum SessionKind { PushToTalk, HandsFree }
 
-/// چرخهٔ عمر. **پایانِ ضبط، پایانِ جلسه نیست.**
+/// **پایانِ ضبط، پایانِ جلسه نیست.** (اجرا: `S1` — امضای واقعی در
+/// [S1-handoff.md](S1-handoff.md))
 ///
 /// این تفکیک یک اشتباه را خنثی می‌کند: اگر «بسته‌شدن جلسه» را با «رهاکردن میکروفون» یکی
 /// بگیریم، متنِ قطعهٔ پایانی که طبق تعریف بعد از رهاکردن میکروفون آماده می‌شود، «دیررسِ
@@ -68,9 +70,9 @@ pub enum SessionPhase {
 1. جلسه با `Effect::BeginRecording` **ساخته** و در همان‌جا `Recording` می‌شود؛ شناسه در
    همان لحظه تخصیص می‌یابد.
 2. **خروج از `Recording` ≠ بستن جلسه.** `take_and_stop` فقط میکروفون را می‌بندد و جلسه
-   به `AwaitingResult` می‌رود. جلسه فقط در سه حالت بسته می‌شود: نتیجهٔ قطعهٔ پایانی رسید
-   (`Completed`)، کاربر لغو کرد (`Cancelled`)، یا جلسهٔ تازه‌ای شروع شد و این یکی دیگر
-   معنی ندارد.
+   به `AwaitingResult` می‌رود. جلسه فقط در **دو** حالت بسته می‌شود: نتیجهٔ قطعهٔ پایانی رسید
+   (`Completed`) یا کاربر لغو کرد (`Cancelled`). شروع جلسهٔ تازه فقط «دیگر جاری نیست» را
+   عوض می‌کند و جلسهٔ قبلی را نمی‌بندد — وگرنه قاعدهٔ ۷ نقض می‌شد.
 3. پاسخِ جلسهٔ `Cancelled` یا `Completed` **درج نمی‌شود** و نتیجهٔ آن
    `NotAttempted { reason: LateForCancelledSession | LateForCompletedSession }` است.
    پاسخِ `AwaitingResult` **باید** درج شود — این مسیر عادی است، نه استثنا.

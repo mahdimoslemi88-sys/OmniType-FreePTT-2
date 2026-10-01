@@ -35,8 +35,8 @@ use crate::processing::{process_text, Dictionary, Normalizer};
 use crate::vad::{AnyVad, Endpoint, VadConfig};
 
 use super::session::{
-    endpoint_decision, frames_to_feed, split_chunk, Effect, EndpointDecision, SessionBuffers,
-    SessionDriver,
+    endpoint_decision, frames_to_feed, split_chunk, ChunkId, Effect, EndpointDecision,
+    SessionBuffers, SessionDriver, SessionId,
 };
 use super::status::{AppState, AppStatus, StatusChannel};
 use super::utterance::{
@@ -86,6 +86,32 @@ enum EmitOutcome {
     Typed { chars: usize },
     /// The keystrokes themselves failed.
     InjectionFailed { error: String },
+    /// No key was pressed at all, because the session that owns this text had
+    /// already ended differently.
+    ///
+    /// This is the machine's stand-in for `InjectOutcome::NotAttempted`; the
+    /// injector owns that type (wave 2, `T2`) and maps its reasons onto these.
+    NotAttempted { reason: &'static str },
+}
+
+/// Which visible state an outcome ends the session in.
+///
+/// Extracted so the rule can be tested without a microphone, an engine or a
+/// focused window — and because the one that matters is easy to get wrong: a
+/// refused result is **not** a failure. The user cancelled, so showing the error
+/// badge would blame the app for something they asked for, and the next
+/// press-to-talk would be swallowed behind a red orb the user cannot explain.
+fn state_after_emit(outcome: &EmitOutcome) -> AppState {
+    match outcome {
+        EmitOutcome::InjectionFailed { error } => {
+            AppState::Error(format!("injection failed: {error}"))
+        }
+        // Typed, refused, and skipped all end up idle: in each case the machine
+        // is ready for the next press.
+        EmitOutcome::Typed { .. } | EmitOutcome::NotAttempted { .. } | EmitOutcome::Skipped(_) => {
+            AppState::Idle
+        }
+    }
 }
 
 /// The running application.
@@ -231,20 +257,30 @@ impl StateMachine {
             match effect {
                 Effect::BeginRecording => {
                     let open = self.begin_recording(&mut bufs.audio, &mut bufs.vad_cursor);
-                    self.with_session(|s| s.began_recording(open));
+                    let session = self.with_session(|s| s.began_recording(open));
+                    // The kind is in the log because it is the difference between
+                    // "held the key" and "tapped twice and walked away", and a
+                    // bug report about the wrong one is otherwise unreadable.
+                    let kind = session.and_then(|id| self.with_session(|s| s.kind_of(id)));
+                    tracing::info!(
+                        ?session,
+                        ?kind,
+                        samples = bufs.audio.len(),
+                        "recording started"
+                    );
                 }
                 Effect::FinishSession => {
                     let audio = self
                         .take_and_stop(&mut bufs.audio, &mut bufs.vad_cursor, frame)
                         .await;
-                    self.end_session();
-                    self.finalize(audio).await;
+                    let session = self.end_session();
+                    self.finalize(session, audio).await;
                 }
                 Effect::DiscardSession => {
                     // No await follows, so the end-of-batch sync below takes
                     // the badge down just as promptly.
                     self.discard_recording(&mut bufs.audio, &mut bufs.vad_cursor);
-                    self.with_session(|s| s.note_capture_live(false));
+                    self.with_session(|s| s.cancelled());
                 }
                 Effect::PollAudio => {
                     // The driver only ever asks for this while it believes a
@@ -255,15 +291,17 @@ impl StateMachine {
                         .poll_vad(&mut bufs.audio, &mut bufs.vad_cursor, frame)
                         .await?
                     {
-                        self.end_session();
-                        self.finalize(audio).await;
+                        let session = self.end_session();
+                        self.finalize(session, audio).await;
                     } else if self.chunk_flush_due(bufs.audio.len()).await {
                         // phase 3: hand this chunk over while the microphone
                         // keeps running; the session only ends on key release
                         // (or the safety cap).
                         let chunk_audio =
                             self.take_chunk(&mut bufs.audio, &mut bufs.vad_cursor).await;
-                        self.process_chunk(chunk_audio).await;
+                        let session = self.with_session(|s| s.current_session());
+                        let chunk = session.and_then(|id| self.with_session(|s| s.next_chunk(id)));
+                        self.process_chunk(session, chunk, chunk_audio).await;
                     }
                 }
             }
@@ -283,14 +321,22 @@ impl StateMachine {
         self.status.set_latched(self.with_session(|s| s.latched()));
     }
 
-    /// Closes the session and takes the badge down with it.
+    /// Stops the session's recording and takes the badge down with it.
     ///
     /// The badge has to go *before* `finalize`, which can spend seconds in the
     /// recogniser, and it goes down here rather than on the next tick so a press
     /// that lands right now still starts a recording.
-    fn end_session(&self) {
-        self.with_session(|s| s.ended_session());
+    ///
+    /// The session itself stays **open and waiting** for its last result, which
+    /// is why the id is returned rather than thrown away: `finalize` needs it to
+    /// decide whether the text it is about to produce is still wanted.
+    fn end_session(&self) -> Option<SessionId> {
+        let session = self.with_session(|s| s.current_session());
+        if let Some(id) = session {
+            self.with_session(|s| s.ended_session(id));
+        }
         self.sync_latch_badge();
+        session
     }
 
     /// Clears the buffer and the seam memory, then opens the microphone.
@@ -315,7 +361,6 @@ impl StateMachine {
             unit.vad.reset();
         }
         self.status.set_state(AppState::Recording);
-        tracing::info!("recording started");
         true
     }
 
@@ -430,12 +475,44 @@ impl StateMachine {
     /// *means*, not in how text reaches the window, so the backspace-then-type
     /// sequence exists once. A failed backspace is only a warning — the text
     /// still goes in, exactly as it did before this was extracted.
-    fn emit(&self, kind: &'static str, raw: &str, plan: &TypePlan) -> EmitOutcome {
+    fn emit(
+        &self,
+        kind: &'static str,
+        session: Option<SessionId>,
+        chunk: Option<ChunkId>,
+        raw: &str,
+        plan: &TypePlan,
+    ) -> EmitOutcome {
         let (text, backspaces) = match plan {
             TypePlan::Skip(reason) => return EmitOutcome::Skipped(*reason),
             TypePlan::Type { text, backspaces } => (text, *backspaces),
         };
-        tracing::info!(kind, raw = %raw, typed = %text, backspaces, "text ready");
+        // The acceptance question is asked here, at the boundary, rather than
+        // when the transcription started: a session can be cancelled while the
+        // engine is still working, and the text that arrives afterwards is
+        // text the user did not ask for any more.
+        //
+        // Note what this is *not*: a session that stopped recording is still
+        // accepted, because that is the ordinary path for the final chunk.
+        if let Some(id) = session {
+            if let Err(reason) = self.with_session(|s| s.accepts_result(id)) {
+                tracing::warn!(
+                    session = id.0,
+                    reason,
+                    "result arrived too late; not typing it"
+                );
+                return EmitOutcome::NotAttempted { reason };
+            }
+        }
+        tracing::info!(
+            kind,
+            session = session.map(|id| id.0),
+            chunk = chunk.map(|c| c.0),
+            raw = %raw,
+            typed = %text,
+            backspaces,
+            "text ready"
+        );
         if backspaces > 0 {
             if let Err(e) = inject_backspaces(backspaces) {
                 tracing::warn!(error = %e, "seam backspaces failed");
@@ -455,7 +532,12 @@ impl StateMachine {
     /// A failed chunk is logged and skipped — a long dictation must never be
     /// aborted because one round trip failed (the final chunk still reports
     /// errors through [`Self::finalize`]).
-    async fn process_chunk(&self, audio: Vec<f32>) {
+    async fn process_chunk(
+        &self,
+        session: Option<SessionId>,
+        chunk: Option<ChunkId>,
+        audio: Vec<f32>,
+    ) {
         if audio.is_empty() {
             return;
         }
@@ -491,7 +573,7 @@ impl StateMachine {
         // mid-word leaves a fragment behind. Both are repaired here, so a long
         // dictation reads as one continuous text instead of stuttering.
         let plan = plan_typing(&raw, &self.stitch_seam(&processed));
-        match self.emit("chunk", &raw, &plan) {
+        match self.emit("chunk", session, chunk, &raw, &plan) {
             EmitOutcome::Skipped(reason) => {
                 tracing::info!(reason = reason.as_str(), "chunk produced nothing to type");
             }
@@ -503,6 +585,9 @@ impl StateMachine {
             }
             EmitOutcome::InjectionFailed { error } => {
                 tracing::warn!(%error, "chunk injection failed");
+            }
+            EmitOutcome::NotAttempted { reason } => {
+                tracing::warn!(reason, "chunk not typed");
             }
         }
         self.resume_after_chunk();
@@ -545,7 +630,22 @@ impl StateMachine {
 
     /// Transcribes, post-processes and injects. Never returns Err to the
     /// caller: failures land in the Error state and we return to Idle.
-    async fn finalize(&self, audio: Vec<f32>) {
+    async fn finalize(&self, session: Option<SessionId>, audio: Vec<f32>) {
+        self.finalize_inner(session, audio).await;
+        // The session is finished on *every* path out of here — result typed,
+        // result refused, not enough speech, ASR failed, nothing to type. Doing
+        // it here rather than at each return is what keeps an abandoned session
+        // from sitting open forever, which would make every later check against
+        // it meaningless.
+        //
+        // (A panic inside `finalize_inner` skips this; `state::machine_run`
+        // catches that and the process is going down anyway.)
+        if let Some(id) = session {
+            self.with_session(|s| s.result_arrived(id));
+        }
+    }
+
+    async fn finalize_inner(&self, session: Option<SessionId>, audio: Vec<f32>) {
         self.status.set_state(AppState::Processing);
 
         // Audio-level diagnostics: distinguishes "mic delivered silence"
@@ -605,6 +705,9 @@ impl StateMachine {
         // The final chunk of a streamed session sits on the same seam as the
         // mid-session ones, so it is stitched the same way.
         let plan = plan_typing(&raw, &self.stitch_seam(&processed));
+        // The last piece of audio gets the next chunk id of the same session,
+        // so a streamed dictation reads 1..n across chunks and then this one.
+        let chunk = session.and_then(|id| self.with_session(|s| s.next_chunk(id)));
         // The visible state moves to `Typing` *before* the keystrokes go out, so
         // the orb shows it. A mid-session chunk deliberately does not (phase
         // 3.2), which is why this stays in the finalise path and not in `emit`.
@@ -616,20 +719,23 @@ impl StateMachine {
             }
             TypePlan::Type { .. } => self.status.set_state(AppState::Typing),
         }
-        match self.emit("final", &raw, &plan) {
+        let outcome = self.emit("final", session, chunk, &raw, &plan);
+        match &outcome {
             EmitOutcome::Typed { chars } => {
                 tracing::info!(chars, "text injected");
                 if let TypePlan::Type { text, .. } = &plan {
                     self.status.set_last_text(text.clone());
                 }
-                self.status.set_state(AppState::Idle);
+            }
+            EmitOutcome::NotAttempted { reason } => {
+                tracing::info!(reason, "final result not typed");
             }
             EmitOutcome::InjectionFailed { error } => {
-                self.status
-                    .set_state(AppState::Error(format!("injection failed: {error}")));
+                tracing::error!(%error, "final injection failed");
             }
             EmitOutcome::Skipped(_) => unreachable!("plan was checked above"),
         }
+        self.status.set_state(state_after_emit(&outcome));
 
         // `Error` is transient: keep it visible just long enough to read, then
         // return to Idle so the next push-to-talk press starts a fresh
@@ -645,6 +751,33 @@ impl StateMachine {
 mod tests {
     use super::*;
     use crate::config::settings::StreamingSettings;
+
+    /// The bug this pins: a result refused because its session was cancelled
+    /// used to be able to land on the error badge. To a user that reads as "the
+    /// app failed" for something they just asked for, and it keeps push-to-talk
+    /// looking broken for the length of the badge.
+    #[test]
+    fn a_refused_result_is_not_shown_as_an_error() {
+        let refused = EmitOutcome::NotAttempted {
+            reason: "late result of a cancelled session",
+        };
+        assert_eq!(state_after_emit(&refused), AppState::Idle);
+
+        // A genuine insertion failure is still an error — the two must not be
+        // flattened into each other by the fix above.
+        let failed = EmitOutcome::InjectionFailed {
+            error: "blocked".to_string(),
+        };
+        assert!(matches!(
+            state_after_emit(&failed),
+            AppState::Error(_) | AppState::Idle
+        ));
+        assert_ne!(
+            state_after_emit(&refused),
+            state_after_emit(&failed),
+            "a refusal must not be reported the way a failure is"
+        );
+    }
 
     #[test]
     fn seam_repair_can_be_switched_off_from_settings() {

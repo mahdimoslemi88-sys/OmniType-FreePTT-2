@@ -173,6 +173,67 @@ pub(crate) enum Effect {
     PollAudio,
 }
 
+/// One capture session's identity, unique in the process, handed out from 1.
+///
+/// It exists because "which dictation does this text belong to" had no answer:
+/// the UI guessed a session from the edges of `AppState::Recording`, and a late
+/// engine reply had nothing to compare itself against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(pub u64);
+
+/// One piece of a session's audio, numbered from 1 within that session.
+///
+/// Deliberately meaningless without its session: a bare `ChunkId` cannot be used
+/// to order anything, which is why every API that takes one also takes the
+/// `SessionId` it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkId(pub u32);
+
+/// How a session was started. This is about the *trigger*, not its shape: a
+/// session that streams in chunks is still push-to-talk, and saying otherwise
+/// would have made "chunked" a third way of opening something it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    PushToTalk,
+    HandsFree,
+}
+
+/// Where a session is in its life.
+///
+/// The distinction this type exists for: **stopping the microphone is not
+/// closing the session.** The last chunk's text arrives *after* the key is
+/// released — by definition — so a rule that treated "closed" as "no longer
+/// recording" would reject the normal result of every dictation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPhase {
+    /// The microphone is open.
+    Recording,
+    /// Recording stopped; the last result has not arrived yet. Results that
+    /// arrive in this phase are **valid** and must be used.
+    AwaitingResult,
+    /// Its result arrived (and was injected, or was deliberately not).
+    Completed,
+    /// The user abandoned it. Nothing of this session may be typed.
+    Cancelled,
+}
+
+/// How many finished sessions to remember, so a reply that arrives after one was
+/// closed can still be answered with *which* ending it hit rather than a guess.
+///
+/// Eight is far more than the loop can have in flight (one per open session plus
+/// the last few), and bounded on purpose: this is the one structure that would
+/// otherwise grow for the life of the process.
+const REMEMBERED_CLOSURES: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct SessionRecord {
+    id: SessionId,
+    kind: SessionKind,
+    phase: SessionPhase,
+    /// The chunk id the *next* handed-out piece will carry.
+    next_chunk: u32,
+}
+
 /// The rules for one capture session, with no hardware attached.
 ///
 /// The machine used to read "am I recording?" back out of the status channel
@@ -182,6 +243,16 @@ pub(crate) enum Effect {
 pub(crate) struct SessionDriver {
     latch: LatchPolicy,
     recording: bool,
+    /// Sessions that can still produce a valid result: the one being recorded and
+    /// any earlier one still waiting for its last chunk.
+    ///
+    /// More than one can be here at a time — pressing record again before the
+    /// previous result arrives keeps the old session open rather than discarding
+    /// text the user already spoke.
+    open: Vec<SessionRecord>,
+    /// Terminal phase of the sessions that have closed, oldest first.
+    closed: Vec<(SessionId, SessionPhase)>,
+    next_session: u64,
 }
 
 impl SessionDriver {
@@ -189,6 +260,9 @@ impl SessionDriver {
         Self {
             latch: LatchPolicy::new(hotkey),
             recording: false,
+            open: Vec::new(),
+            closed: Vec::new(),
+            next_session: 0,
         }
     }
 
@@ -200,6 +274,123 @@ impl SessionDriver {
     /// Whether the hands-free badge should be showing.
     pub fn latched(&self) -> bool {
         self.latch.is_latched()
+    }
+
+    /// The session currently being recorded, if any.
+    pub fn current_session(&self) -> Option<SessionId> {
+        self.open.last().map(|s| s.id)
+    }
+
+    /// The phase of `id`, or `None` if this driver never knew it.
+    pub fn phase_of(&self, id: SessionId) -> Option<SessionPhase> {
+        if let Some(record) = self.open.iter().find(|s| s.id == id) {
+            return Some(record.phase);
+        }
+        self.closed
+            .iter()
+            .rev()
+            .find(|(closed, _)| *closed == id)
+            .map(|(_, phase)| *phase)
+    }
+
+    /// Whether text belonging to `id` may still be typed, and if not, why.
+    ///
+    /// This is the boundary check, not a pre-flight one: it is asked *again*
+    /// immediately before injection, because the answer can change while a
+    /// result is being transcribed. `Recording` and `AwaitingResult` both accept
+    /// — the second is the ordinary case for the final chunk.
+    ///
+    /// One method rather than a predicate plus a reason, because the reason is
+    /// needed at exactly the one place the predicate is used, and a second
+    /// lookup could disagree with the first if the session changed in between.
+    pub fn accepts_result(&self, id: SessionId) -> Result<(), &'static str> {
+        match self.phase_of(id) {
+            Some(SessionPhase::Recording) | Some(SessionPhase::AwaitingResult) => Ok(()),
+            Some(SessionPhase::Completed) => Err("late result of a completed session"),
+            Some(SessionPhase::Cancelled) => Err("late result of a cancelled session"),
+            None => Err("unknown session"),
+        }
+    }
+
+    /// Hands out the next chunk id of `id`, or `None` if it cannot take one.
+    pub fn next_chunk(&mut self, id: SessionId) -> Option<ChunkId> {
+        let record = self.open.iter_mut().find(|s| s.id == id)?;
+        if !matches!(
+            record.phase,
+            SessionPhase::Recording | SessionPhase::AwaitingResult
+        ) {
+            return None;
+        }
+        let chunk = ChunkId(record.next_chunk);
+        record.next_chunk += 1;
+        Some(chunk)
+    }
+
+    /// Opens a session, or reports why one could not be opened.
+    ///
+    /// A microphone that failed to open gets **no** id: there is nothing to
+    /// transcribe, and an id that can never produce a result is a trap for
+    /// whoever answers the "which session?" question later.
+    pub fn open_session(&mut self, capture_open: bool) -> Option<SessionId> {
+        if !capture_open {
+            return None;
+        }
+        self.next_session += 1;
+        let id = SessionId(self.next_session);
+        let kind = if self.latch.is_latched() {
+            SessionKind::HandsFree
+        } else {
+            SessionKind::PushToTalk
+        };
+        self.open.push(SessionRecord {
+            id,
+            kind,
+            phase: SessionPhase::Recording,
+            next_chunk: 1,
+        });
+        self.recording = true;
+        Some(id)
+    }
+
+    /// The microphone stopped. The session is **not** closed: it is waiting for
+    /// the last result, which is what almost every dictation does.
+    pub fn recording_stopped(&mut self, id: SessionId) {
+        if let Some(record) = self.open.iter_mut().find(|s| s.id == id) {
+            record.phase = SessionPhase::AwaitingResult;
+        }
+        self.recording = false;
+        self.latch.reset();
+    }
+
+    /// The session's final result arrived.
+    pub fn result_arrived(&mut self, id: SessionId) {
+        self.close(id, SessionPhase::Completed);
+    }
+
+    /// The user abandoned the session.
+    pub fn cancelled(&mut self) {
+        if let Some(id) = self.open.last().map(|s| s.id) {
+            self.close(id, SessionPhase::Cancelled);
+        }
+        self.recording = false;
+        self.latch.reset();
+    }
+
+    fn close(&mut self, id: SessionId, phase: SessionPhase) {
+        let before = self.open.len();
+        self.open.retain(|s| s.id != id);
+        if self.open.len() != before {
+            self.closed.push((id, phase));
+            if self.closed.len() > REMEMBERED_CLOSURES {
+                let drop_to = self.closed.len() - REMEMBERED_CLOSURES;
+                self.closed.drain(..drop_to);
+            }
+        }
+    }
+
+    /// How a session was opened, for the report and for future policy.
+    pub fn kind_of(&self, id: SessionId) -> Option<SessionKind> {
+        self.open.iter().find(|s| s.id == id).map(|s| s.kind)
     }
 
     /// The record key went down.
@@ -243,8 +434,11 @@ impl SessionDriver {
     }
 
     /// The machine opened (or failed to open) the microphone.
-    pub fn began_recording(&mut self, capture_open: bool) {
-        self.recording = capture_open;
+    ///
+    /// Kept for callers that do not care about the identity; the id is returned
+    /// here so the machine can thread it through the whole utterance.
+    pub fn began_recording(&mut self, capture_open: bool) -> Option<SessionId> {
+        self.open_session(capture_open)
     }
 
     /// The session ended on a path of the machine's choosing.
@@ -252,17 +446,26 @@ impl SessionDriver {
     /// Clearing the latch here rather than trusting the next idle tick is what
     /// makes "no stale latch survives a finalise" structural: a press arriving
     /// in the 20 ms before that tick used to be swallowed.
-    pub fn ended_session(&mut self) {
-        self.recording = false;
-        self.latch.reset();
+    pub fn ended_session(&mut self, id: SessionId) {
+        self.recording_stopped(id);
     }
 
     /// The machine noticed the microphone is no longer live.
     ///
     /// Without this the session flag would lie after a capture device is closed
     /// mid-dictation, and the next press would find a "recording" already open.
+    ///
+    /// This is *not* a close: a device that died mid-dictation still ends with
+    /// an empty buffer and nothing to type, so the session moves to
+    /// [`SessionPhase::AwaitingResult`] like any other stop and its last result
+    /// — if any — stays valid.
     pub fn note_capture_live(&mut self, live: bool) {
         self.recording = live;
+        if !live {
+            if let Some(id) = self.current_session() {
+                self.recording_stopped(id);
+            }
+        }
     }
 
     /// Maps one latch decision onto the effects the loop performs.
@@ -278,11 +481,11 @@ impl SessionDriver {
             }
         };
         // `FinishAndRestart` closes and re-opens, so the re-open is folded last.
+        // These only move the *flags*; the id is handed out by
+        // `open_session`/`recording_stopped` once the machine reports what
+        // actually happened to the hardware.
         if effects.contains(&Effect::FinishSession) {
             self.recording = false;
-        }
-        if effects.contains(&Effect::BeginRecording) {
-            self.recording = true;
         }
         effects
     }
@@ -460,11 +663,164 @@ mod tests {
         HotkeySettings::default()
     }
 
+    /// Presses the record key and then reports that the microphone opened — what
+    /// the machine does for one `Effect::BeginRecording`.
+    ///
+    /// The two are deliberately separate: the flag mirrors *hardware*, so the
+    /// rules below that talk about "a recording is open" have to say so rather
+    /// than lean on the key press having happened.
+    fn press_and_open(d: &mut SessionDriver, at: Instant) -> SessionId {
+        d.on_record_down(at);
+        d.open_session(true).expect("the microphone opens")
+    }
+
     /// Asserts the session is idle and hands-free-free, the state every
     /// "nothing to do" branch must leave behind.
     fn assert_quiet(d: &SessionDriver) {
         assert!(!d.is_recording());
         assert!(!d.latched());
+    }
+
+    // ── identity and lifecycle (S1) ──────────────────────────────────────
+
+    /// The regression this whole section exists for. The final chunk's text
+    /// arrives *after* the key is released, so a session that closes when the
+    /// microphone stops rejects the normal result of every dictation. Both
+    /// halves are asserted: the stop must keep the result acceptable, and the
+    /// real close must not.
+    #[test]
+    fn stopping_the_microphone_does_not_close_the_session() {
+        let mut d = SessionDriver::new(&hotkey());
+        let id = d.open_session(true).expect("a session");
+        assert_eq!(d.phase_of(id), Some(SessionPhase::Recording));
+
+        d.next_chunk(id);
+        d.recording_stopped(id);
+
+        assert_eq!(
+            d.phase_of(id),
+            Some(SessionPhase::AwaitingResult),
+            "the last chunk is still coming; the session is not finished"
+        );
+        assert!(
+            d.accepts_result(id).is_ok(),
+            "a result arriving after the key was released is the ordinary case"
+        );
+
+        d.result_arrived(id);
+        assert_eq!(d.phase_of(id), Some(SessionPhase::Completed));
+        assert!(
+            d.accepts_result(id).is_err(),
+            "a completed session takes no more text"
+        );
+        assert_eq!(
+            d.accepts_result(id),
+            Err("late result of a completed session")
+        );
+    }
+
+    /// A cancelled session must stay silent even though its audio was real and
+    /// its transcription may already be in flight.
+    #[test]
+    fn a_cancelled_session_refuses_its_own_late_result() {
+        let mut d = SessionDriver::new(&hotkey());
+        let id = d.open_session(true).unwrap();
+        d.next_chunk(id);
+        d.cancelled();
+
+        assert_eq!(d.phase_of(id), Some(SessionPhase::Cancelled));
+        assert_eq!(
+            d.accepts_result(id),
+            Err("late result of a cancelled session")
+        );
+        assert_quiet(&d);
+    }
+
+    /// Pressing record again before the first result arrives must not throw the
+    /// first session away: the user spoke it.
+    #[test]
+    fn starting_a_new_session_keeps_the_previous_one_usable() {
+        let mut d = SessionDriver::new(&hotkey());
+        let first = d.open_session(true).unwrap();
+        d.next_chunk(first);
+        d.recording_stopped(first);
+
+        let second = d.open_session(true).unwrap();
+        assert_ne!(first, second, "ids are unique");
+        assert_eq!(d.current_session(), Some(second));
+        assert!(
+            d.accepts_result(first).is_ok(),
+            "the older session is waiting for its result, not cancelled"
+        );
+        assert_eq!(d.phase_of(first), Some(SessionPhase::AwaitingResult));
+    }
+
+    #[test]
+    fn chunk_ids_run_from_one_within_a_session_and_reset_in_the_next() {
+        let mut d = SessionDriver::new(&hotkey());
+        let first = d.open_session(true).unwrap();
+        assert_eq!(d.next_chunk(first), Some(ChunkId(1)));
+        assert_eq!(d.next_chunk(first), Some(ChunkId(2)));
+        assert_eq!(d.next_chunk(first), Some(ChunkId(3)));
+        d.result_arrived(first);
+
+        // A closed session cannot hand out more chunks.
+        assert_eq!(d.next_chunk(first), None);
+
+        let second = d.open_session(true).unwrap();
+        assert_eq!(d.next_chunk(second), Some(ChunkId(1)));
+    }
+
+    /// A microphone that never opened must not produce an id: there is nothing
+    /// to transcribe, and an id that can never answer is worse than none.
+    #[test]
+    fn a_failed_microphone_gets_no_identity() {
+        let mut d = SessionDriver::new(&hotkey());
+        assert_eq!(d.open_session(false), None);
+        assert_eq!(d.current_session(), None);
+        assert_eq!(d.phase_of(SessionId(1)), None);
+        assert_eq!(d.accepts_result(SessionId(1)), Err("unknown session"));
+    }
+
+    /// The remembered-closure list is bounded: it must not grow for the life of
+    /// the process, or a long-running app leaks a `Vec` entry per dictation.
+    #[test]
+    fn closed_sessions_are_remembered_only_recently() {
+        let mut d = SessionDriver::new(&hotkey());
+        let mut ids = Vec::new();
+        for _ in 0..(REMEMBERED_CLOSURES + 4) {
+            let id = d.open_session(true).unwrap();
+            d.result_arrived(id);
+            ids.push(id);
+        }
+        assert!(
+            d.closed.len() <= REMEMBERED_CLOSURES,
+            "kept {} closures",
+            d.closed.len()
+        );
+        assert!(
+            d.phase_of(ids[0]).is_none(),
+            "the oldest closure has aged out and must read as unknown"
+        );
+        let newest = *ids.last().unwrap();
+        assert_eq!(d.phase_of(newest), Some(SessionPhase::Completed));
+    }
+
+    #[test]
+    fn a_latched_session_records_how_it_was_opened() {
+        let mut d = SessionDriver::new(&hotkey());
+        let t0 = Instant::now();
+        // Two quick taps latch the recording hands-free. The first press has to
+        // have a live session for the release to count as a tap at all — the
+        // rules read the hardware flag, not "a key went down".
+        press_and_open(&mut d, t0);
+        assert_eq!(d.on_record_up(t0 + Duration::from_millis(30)), Vec::new());
+        let second_down = t0 + Duration::from_millis(80);
+        assert_eq!(d.on_record_down(second_down), Vec::new());
+        assert!(d.latched());
+
+        let id = d.open_session(true).unwrap();
+        assert_eq!(d.kind_of(id), Some(SessionKind::HandsFree));
     }
 
     // ── the driver's own rules ───────────────────────────────────────────
@@ -473,7 +829,7 @@ mod tests {
     fn a_first_press_opens_the_microphone_and_a_release_closes_the_session() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        assert_eq!(d.on_record_down(t0), vec![Effect::BeginRecording]);
+        let id = press_and_open(&mut d, t0);
         assert!(d.is_recording());
 
         // Hold-to-talk: the release ends the session.
@@ -481,6 +837,7 @@ mod tests {
             d.on_record_up(t0 + Duration::from_millis(900)),
             vec![Effect::FinishSession]
         );
+        d.ended_session(id);
         assert_quiet(&d);
     }
 
@@ -491,13 +848,14 @@ mod tests {
     fn a_press_right_after_a_finalise_still_opens_a_fresh_recording() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90)); // short tap
-        d.on_record_down(t0 + Duration::from_millis(200)); // second tap
+        let _ = press_and_open(&mut d, t0 + Duration::from_millis(200)); // second tap
         assert!(d.latched(), "double-tap must go hands-free");
 
         // The VAD endpoint ends the session — no key involved.
-        d.ended_session();
+        let id = d.open_session(true).unwrap();
+        d.ended_session(id);
         assert!(!d.is_recording());
         // No tick has run yet. The very next press must still start a recording.
         assert_eq!(
@@ -515,12 +873,16 @@ mod tests {
     fn a_late_second_tap_finalises_the_first_utterance_before_restarting() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90)); // short tap, window open
                                                         // 2 s later: far past the 600 ms double-tap window.
         let effects = d.on_record_down(t0 + Duration::from_millis(2_090));
         assert_eq!(effects, vec![Effect::FinishSession, Effect::BeginRecording]);
-        // The session is open again, and nothing is left latched.
+        // The restart is only a recording once the machine confirms the
+        // microphone opened — between the effect and that confirmation the flag
+        // is down, which is the honest answer.
+        assert!(!d.is_recording());
+        d.open_session(true);
         assert!(d.is_recording());
         assert!(!d.latched());
     }
@@ -531,7 +893,7 @@ mod tests {
     fn a_double_tap_schedules_no_effects_and_raises_the_badge() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90));
         assert_eq!(d.on_record_down(t0 + Duration::from_millis(290)), vec![]);
         assert!(d.is_recording());
@@ -543,10 +905,10 @@ mod tests {
     fn a_latched_session_ends_on_the_next_press() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90));
-        d.on_record_down(t0 + Duration::from_millis(290)); // latched
-                                                           // Releasing must not stop it, and the tick must not time it out.
+        let _ = press_and_open(&mut d, t0 + Duration::from_millis(290)); // latched
+                                                                         // Releasing must not stop it, and the tick must not time it out.
         assert_eq!(d.on_record_up(t0 + Duration::from_millis(380)), vec![]);
         assert_eq!(
             d.on_tick(t0 + Duration::from_secs(5)),
@@ -564,7 +926,7 @@ mod tests {
     fn a_press_while_a_recording_is_open_does_not_restart_it() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         assert_eq!(d.on_record_down(t0 + Duration::from_millis(400)), vec![]);
         assert!(d.is_recording());
     }
@@ -573,7 +935,7 @@ mod tests {
     fn a_held_session_keeps_pumping_audio_on_every_tick() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         for i in 1..=50 {
             assert_eq!(
                 d.on_tick(t0 + Duration::from_millis(20 * i)),
@@ -602,9 +964,9 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(d.on_cancel(), vec![]);
 
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90));
-        d.on_record_down(t0 + Duration::from_millis(200));
+        let _ = press_and_open(&mut d, t0 + Duration::from_millis(200));
         assert!(d.latched());
         assert_eq!(d.on_cancel(), vec![Effect::DiscardSession]);
         assert_quiet(&d);
@@ -616,7 +978,7 @@ mod tests {
     fn cancel_drops_a_pending_tap_so_no_tick_finalises_afterwards() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90)); // pending tap
         assert_eq!(d.on_cancel(), vec![Effect::DiscardSession]);
         for i in 1..=100 {
@@ -630,7 +992,7 @@ mod tests {
     fn a_capture_that_dies_mid_session_reopens_on_the_next_press() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
+        let _ = press_and_open(&mut d, t0);
         d.note_capture_live(false);
         assert!(!d.is_recording());
         assert_eq!(
@@ -643,9 +1005,12 @@ mod tests {
     fn a_failed_microphone_open_leaves_the_session_idle() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        d.on_record_down(t0);
-        assert!(d.is_recording());
-        d.began_recording(false);
+        assert_eq!(d.on_record_down(t0), vec![Effect::BeginRecording]);
+        assert!(!d.is_recording(), "a press alone is not a recording");
+        // The machine tried and the device refused: no id is handed out, so
+        // nothing can later ask "which session was this?" about a session that
+        // never existed.
+        assert_eq!(d.began_recording(false), None);
         assert_quiet(&d);
     }
 
