@@ -244,3 +244,36 @@ canary در `DashboardFlags::take` هم **نسوخت**: هیچ تستی `Overlay
 `HotkeyConfig::problems()` و `asr::plan::ActiveSelection::Missing` هر دو به
 [doctor.rs](../voice-ptt/src/doctor.rs) وصل شدند و گزارش در فایل نوشته می‌شود.
 جزئیات آزمون end-to-end در [MEASURED-FACTS.md](MEASURED-FACTS.md) بند ۱۳.
+
+---
+
+## فاز سوم — انجام شد
+
+`state/machine.rs` ۱٬۰۳۹ ⇒ **۶۷۷** خط. `run()` ۱۴۴ ⇒ **۴۸** خط و هیچ تصمیمی
+نمی‌گیرد. دو ماژول خالص تازه: [session.rs](../voice-ptt/src/state/session.rs)
+(تصمیم‌های جلسه) و [utterance.rs](../voice-ptt/src/state/utterance.rs) (ارزش یک
+رونویسی). تست `--lib` ۲۵۹ ⇒ **۲۹۲**، ۱۱ جهش از ۱۱ سوخته.
+
+گزارش: [PHASE-3-SESSION-LOOP.md](PHASE-3-SESSION-LOOP.md) · اعداد خام:
+[MEASURED-FACTS.md](MEASURED-FACTS.md) بند ۱۴.
+
+### چهار نقص که این فاز پیدا کرد
+
+۱. latch hands-free بعد از پایانِ غیرکیلدی می‌ماند ⇒ فشردن کلید در پنجرهٔ ۲۰ms بی‌صدا
+   بلعیده می‌شد.
+۲. `vad.chunk_size = 0` تیک را روی ۱۰۰٪ CPU قفل می‌کرد.
+۳. `cursor_advances_without_refeeding` حلقهٔ تولید را بازنویسی کرده بود ⇒ کپی را
+   می‌آزمود.
+۴. هارنس جهش خودش به‌خاطر mtime دروغ گفت.
+
+### قدم بعدی (انجام نشده): تزریق I/O
+
+بزرگ‌ترین پوششِ باقی‌مانده، خودِ `perform()` و `run()` است. راهش: `AppServices`
+امروز ۶ فیلد concret دارد (`Arc<AudioCapture>`، `Mutex<VadUnit>`، `AsrRouter`، …).
+اگر این‌ها پشت تریت‌های کوچک (`AudioSource` · `VadEngine` · `Transcriber` ·
+`Typist`) بروند، می‌شود یک جلسهٔ کامل را با یک ASR ساختگی و یک بافر ساختگی اجرا
+کرد و **خود حلقه** را تست کرد — نه فقط تصمیم‌هایش.
+
+هزینه‌اش را نباید دست‌کم گرفت: `AsrRouter` خودش fallback و چند موتور دارد و
+`AudioCapture` به WASAPI چسبیده. طرح کم‌ریسک‌تر: **فقط `perform()`** را پشت یک
+بتِ کوچک ببریم، چون ۵۵ خط و چهار بازو دارد و بیشترین سود را می‌دهد.

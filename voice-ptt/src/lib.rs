@@ -499,19 +499,14 @@ pub fn run() -> Result<()> {
     {
         let machine = machine.clone();
         rt.spawn(async move {
-            // A panic inside the machine must never die silently again:
-            // catch it, log it (the panic hook also writes crash.log).
-            let result = tokio::task::spawn(std::panic::AssertUnwindSafe(async move {
-                machine.run(events_rx).await
-            }))
-            .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::error!(error = %e, "state machine exited with error"),
-                Err(join_err) => tracing::error!(
-                    error = %join_err,
-                    "state machine task PANICKED — hotkeys/transcription are down until restart"
-                ),
+            // The panic guard is `state::machine_run::run_guarded`, and it is
+            // unit-tested: a panic in the machine now has a test, which the
+            // inline `match` this replaced never did.
+            let exit = state::machine_run::run_guarded(machine.run(events_rx)).await;
+            match exit.level() {
+                logging::Severity::Info => tracing::info!("{}", exit.message()),
+                logging::Severity::Warn => tracing::warn!("{}", exit.message()),
+                logging::Severity::Error => tracing::error!("{}", exit.message()),
             }
         });
     }

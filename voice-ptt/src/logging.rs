@@ -74,7 +74,10 @@ pub fn install_whisper_log_redirect() {
     // device info). Both signatures match the `ggml_log_callback` C type.
     // (`whisper_rs` re-exports the `whisper_rs_sys` crate.)
     unsafe {
-        whisper_rs::whisper_rs_sys::ggml_log_set(Some(whisper_log_trampoline), std::ptr::null_mut());
+        whisper_rs::whisper_rs_sys::ggml_log_set(
+            Some(whisper_log_trampoline),
+            std::ptr::null_mut(),
+        );
     }
 }
 
@@ -144,6 +147,24 @@ pub fn init(data_dir: &Path) {
 
     install_panic_hook();
     prune_old_logs(&logs_dir);
+}
+
+/// How loudly something should be reported.
+///
+/// Shared by the modules that classify an outcome (`asr::model_load`,
+/// `state::machine_run`) so "warn" means the same thing in both, and so a
+/// decision that has to be tested can be tested against the level it will
+/// actually be logged at rather than against the `tracing` macro it will end up
+/// inside. `tracing` has its own `Level`; this is deliberately not named that,
+/// because it is a coarser question — "did the user lose a feature, or not".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// The expected path was taken.
+    Info,
+    /// Something is wrong, but nothing the user depends on is gone.
+    Warn,
+    /// A capability the user asked for is unusable.
+    Error,
 }
 
 /// Writes the `=== session start ===` banner with app metadata.
