@@ -34,6 +34,8 @@
 ### موضوعی
 | فایل | چه چیزی |
 |---|---|
+| [PRODUCT-DEVELOPMENT-ROADMAP.md](PRODUCT-DEVELOPMENT-ROADMAP.md) | رودمپ توسعهٔ محصول: تثبیت فارسی و اُرب، حفظ مقصد تایپ، پیش‌نمایش، گوشهٔ انتظار، بازیابی، پروفایل‌ها و اصلاحات ساختاری؛ با وابستگی‌ها و معیار پذیرش. |
+| [AGENT-EXECUTION-PLAN.md](AGENT-EXECUTION-PLAN.md) | دسته‌بندی تمام مراحل، موج‌های موازی با سه ایجنت اجرایی و یک هماهنگ‌کننده، مالکیت فایل‌ها، وابستگی‌ها و پرامپت‌های اجرا و ادغام. |
 | **[GUI-WINDOW-ARTIFACT-REPORT.md](GUI-WINDOW-ARTIFACT-REPORT.md)** (۵۷۹+ خط) | گزارش اصلی آرتیفکت پنجره. بخش ۱–۱۵ تاریخچهٔ کامل، بخش ۱۶ وضعیت فعلی هالهٔ سفید. |
 | [GUI-BUGFIX-PLAN.md](GUI-BUGFIX-PLAN.md) | پلن‌های اصلاح GUI |
 | [HANDOFF.md](HANDOFF.md) | تحویل کار به نفر بعد |
@@ -41,12 +43,21 @@
 | [ui-audit-and-design-options.md](ui-audit-and-design-options.md) · [ui-overhaul-design.md](ui-overhaul-design.md) | طراحی رابط |
 | [light-theme-tuning.md](light-theme-tuning.md) | تنظیم تم روشن |
 | [Comprehensive-research-program-developing-roadmap.md](Comprehensive-research-program-developing-roadmap.md) · [proposal-0.1.md](proposal-0.1.md) | اسناد برنامهٔ تحقیق — از محدودهٔ فعلی خارج‌اند |
+| [PHASE-3-SESSION-LOOP.md](PHASE-3-SESSION-LOOP.md) | شکستن حلقهٔ ضبط به تصمیم‌های خالص (فاز ۳) |
 
 ### ابزار (کد اجرایی، نه متن)
 | مسیر | چه چیزی |
 |---|---|
 | `reaserch/gui/probes/` | پروب‌های PowerShell برای اندازه‌گیری زندهٔ پنجره. **پیش از استفاده بخش «کوری» فایل‌هایی که تازه ساخته شده‌اند را در [LESSONS-LEARNED.md](LESSONS-LEARNED.md) ببین.** |
+| [halo-selftest.py](reaserch/gui/probes/halo-selftest.py) · [halo-hunt.ps1](reaserch/gui/probes/halo-hunt.ps1) | شکار خودکار هالهٔ سفید. اول `halo-selftest.py` (۵ کنترل، دروازهٔ اجرا)، بعد `halo-hunt.ps1` (کشیدن اورب با تأیید هندسی، تحلیل مستطیل ترک‌شده، بازگردانی موقعیت). هر دو **تنها** اجرا شوند. |
+| [list-windows.ps1](reaserch/gui/probes/list-windows.ps1) · [arc-analyse.py](reaserch/gui/probes/arc-analyse.py) | فهرست پنجره‌های یک پروسه در طول زمان (ابزار کشف نقص DPI) · تحلیل‌گر کمان با خط `VERDICT: REPRODUCED\|NOT_AN_ARC\|CLEAN\|INCONCLUSIVE`. |
+| [canary-harness.sh](canary-harness.sh) | موتور مشترک کاناری جهشی — اسنپ‌شات پاک، `trap`، تفکیک `NOBUILD` از `MISSED` |
+| [mutation-check-session.sh](mutation-check-session.sh) | کاناری جهشی فاز ۳ — ۱۱ تصمیم، از `v-2/voice-ptt` اجرا شود |
+| [mutation-check-tray-warning.sh](mutation-check-tray-warning.sh) | کاناری جهشی نشان هشدار ترای — ۲۲ تصمیم |
+| [mutation-check-startup.sh](mutation-check-startup.sh) | کاناری جهشی بوت: دانلود مدل + گارد اجرای state machine — ۱۲ تصمیم |
 | `../third_party/egui-notify/` | کد وام‌گرفته‌شده، دست‌نخورده |
+
+> هر دو اسکریپت کاناری از [canary-harness.sh](canary-harness.sh) استفاده می‌کنند. این هارنس روی درخت قرمز `ABORT` می‌کند و از **یک اسنپ‌شات پاک** بازگردانی می‌کند، چون `.bak` چرخشی پشته است و یک اجرای قطع‌شده می‌تواند جهش‌هایش را ابدی کند (بندهای ۱۶–۱۹ [LESSONS-LEARNED.md](LESSONS-LEARNED.md)).
 
 ---
 
@@ -68,7 +79,7 @@
 |---|---|---|
 | ۱ | **هالهٔ سفید/روشن بالای اورب** | محرک شناسایی شده: **جابه‌جایی پنجره** (کلیک-کشیدن). نه به حالت ضبط ربطی دارد. درمان نشده. |
 | ۲ | **`--doctor`** | توافق شده، ساخته نشده. ریشه‌اش: [listener.rs](../voice-ptt/src/hotkey/listener.rs) در خطای parse *بی‌صدا* هات‌کی را به `CapsLock` برمی‌گرداند و فقط در فایل لاگ می‌نویسد. |
-| ۳ | **`state/machine.rs`** ۱۱۲۸ خط، یک `impl` ۵۷۹ خطی با ۱۹ متد | مرز واقعی اندازه‌گیری شد: ۸ متد اول (۷۰ خط) فقط `status_tx`/`status_rx`/`seam` را لمس می‌کنند ⇒ یک نگرانی جدا. |
+| ۳ | **`state/machine.rs`** | **انجام شد (فاز ۳).** ۱٬۰۳۹ ⇒ **۶۷۷** خط. `run()` ۱۴۴ ⇒ **۴۸** خط و هیچ تصمیمی نمی‌گیرد؛ تصمیم‌ها در [session.rs](../voice-ptt/src/state/session.rs) و [utterance.rs](../voice-ptt/src/state/utterance.rs) خالص شدند. ۱۱ جهش از ۱۱ سوخته. |
 | ۴ | **`lib.rs` — `run()` = ۴۹۲ خط، صفر تست** | **بدترین مشکل ساختاری کل پروژه.** ۱۵ فاز که خود کد با `// ----` اعلام کرده. طرح در [REFACTOR-PLAN.md](REFACTOR-PLAN.md) |
 | ۵ | **`asr/antigravity.rs`** ۱۱۴۲ خط | سه بخش با مرز روشن: discovery ۳۲۷ / codec ۱۲۳ (خالص) / engine ۴۱۶ |
 | ۶ | **`gui/orb.rs`** ۸۸۴ خط، `impl Orb` ۴۹۷ خط | کم‌اولویت: `impl` یک شیء واحد است و ۸ متدش هم‌بسته‌اند. |
@@ -120,7 +131,10 @@ src/
 │        discovery} · cloud · downloader · google
 │        progress · quota · router · whisper
 ├── audio/  capture · device · ring_buffer
-├── state/  machine.rs (ماشین حالت دیکته) · status.rs (StatusChannel)
+├── state/  machine.rs (ماشین: فقط اجرا) · session.rs (تصمیم‌های جلسه — خالص)
+│           utterance.rs (ارزش یک رونویسی — خالص) · status.rs (StatusChannel)
+│   پنجرهٔ اُرب: بوم از هندسهٔ واقعی رسم مشتق می‌شود (mod reach)؛ هم بوم و هم
+│   منطقهٔ کلیک از یک تابع ⇒ کوچک‌شدن یکی بدون دیگری ممکن نیست
 ├── vad/    mod · silero
 ├── config/settings.rs
 ├── hotkey/  binding (VK) · diagnostics (چرا هات‌کی عوض شد) · listener
