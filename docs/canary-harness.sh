@@ -30,12 +30,46 @@
 # 4. `NOBUILD` is reported separately from `MISSED`. A mutation that does not
 #    compile runs zero tests, so "no test noticed" and "nothing ran" produce the
 #    same empty output — and the naive verdict calls its own blindness a result.
+#
+# 5. One run at a time. Two runs share one snapshot directory: the older one
+#    restores from (and deletes) files the newer one is still using, so
+#    mutations survive the run and the *next* run snapshots them as its new
+#    baseline. That is not hypothetical — it left four mutated files and 22
+#    failing tests behind, and it reported "CAUGHT" for canaries whose verdict
+#    came from the other run's leftovers.
 
 CANARY_RED='\x1b[31m'
+CANARY_LOCK=".canary-lock"
+
+canary_unlock() {
+  rm -f "$CANARY_LOCK"
+}
+
+# Refuses to start while another run is alive. A lock file whose pid is gone is
+# stale and gets taken over: the common case is an interrupted run, and refusing
+# on that alone would make the harness unusable after any Ctrl-C.
+canary_lock() {
+  if [ -f "$CANARY_LOCK" ]; then
+    local old
+    old=$(cat "$CANARY_LOCK" 2>/dev/null || echo "")
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+      echo "ABORT: a canary run is already alive (pid $old)."
+      echo "       Two runs share one snapshot directory and corrupt each other."
+      echo "       Kill pid $old, or delete $CANARY_LOCK if you are sure it is dead."
+      exit 1
+    fi
+    echo "note: taking over $CANARY_LOCK from dead pid ${old:-?}"
+  fi
+  echo $$ > "$CANARY_LOCK"
+}
 
 canary_init() {
   CANARY_FILES=("$@")
   CANARY_SNAP=".canary-snapshot"
+
+  # Rule 5, before anything is created or deleted.
+  canary_lock
+
   rm -rf "$CANARY_SNAP"
   mkdir -p "$CANARY_SNAP"
 
@@ -50,14 +84,29 @@ canary_init() {
   # Rule 2: one pristine copy per file, before anything is touched.
   local i=0
   for f in "${CANARY_FILES[@]}"; do
-    cp "$f" "$CANARY_SNAP/$i"
+    cp "$f" "$CANARY_SNAP/$i" || {
+      echo "ABORT: could not snapshot $f — a run without a full snapshot restores nothing"
+      exit 1
+    }
     i=$((i + 1))
   done
-  trap canary_restore_all EXIT
+  trap 'canary_restore_all; canary_unlock' EXIT
 }
 
 # Restores every snapshotted file from the pristine copy.
 canary_restore_all() {
+  # `canary_finish` restores, proves and deletes the snapshot; after that the
+  # EXIT trap has nothing left to do and must not cry wolf about it.
+  if [ "${CANARY_RESTORE_DONE:-0}" = "1" ]; then
+    return 0
+  fi
+  # A missing snapshot means this run never took one (or another run deleted
+  # it). Restoring from a directory that is not there would leave every
+  # mutation in place, so say so loudly instead.
+  if [ ! -d "$CANARY_SNAP" ]; then
+    echo "!! $CANARY_SNAP is gone; files were NOT restored by the harness" >&2
+    return 1
+  fi
   local i=0
   for f in "${CANARY_FILES[@]}"; do
     if [ -f "$CANARY_SNAP/$i" ]; then
@@ -121,9 +170,11 @@ canary_finish() {
   echo
   echo "=== restoring and confirming the tree is green again ==="
   canary_restore_all
+  CANARY_RESTORE_DONE=1
   cargo test --lib 2>&1 | grep -E 'test result'
   if [ -d .canary-snapshot ]; then
     rm -rf .canary-snapshot
     echo "snapshot cleaned"
   fi
+  canary_unlock
 }

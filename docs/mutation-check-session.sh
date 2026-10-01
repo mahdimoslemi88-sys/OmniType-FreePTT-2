@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Canary check for the phase-three refactor: mutate one decision at a time and
-# record which tests notice. A mutation that leaves the suite green is a hole in
-# the tests, not a pass.
+# Canary check for the state refactor (S1) and the orb click target (O1): mutate
+# one decision at a time and record which tests notice. A mutation that leaves
+# the suite green is a hole in the tests, not a pass.
 #
 # Run from v-2/voice-ptt:  bash ../docs/mutation-check-session.sh
 set -u
@@ -12,8 +12,14 @@ source "$(dirname "$0")/canary-harness.sh"
 S=src/state/session.rs
 U=src/state/utterance.rs
 M=src/state/machine.rs
+O=src/gui/orb.rs
+A=src/gui/orb_animation.rs
+W=src/gui/window_shape.rs
+P=src/processing/mod.rs
+N=src/processing/normalizer.rs
+C=src/config/settings.rs
 
-canary_init "$S" "$U" "$M"
+canary_init "$S" "$U" "$M" "$O" "$A" "$W" "$P" "$N" "$C"
 
 echo "=== canaries: mutate one decision, expect red ==="
 
@@ -166,6 +172,74 @@ mutate "$M" \
   '        EmitOutcome::Typed { .. } | EmitOutcome::Skipped(_) => AppState::Idle,
         EmitOutcome::NotAttempted { .. } => AppState::Error("refused".to_string()),' \
   'C17 a refused result wears the error badge the user never asked for'
+
+# ── O1: the orb's click target ──────────────────────────────────────────
+#
+# The dead ring (B0 §6-1) existed because the pointer rectangle and the Win32
+# region were derived from two different numbers. These four mutations each put
+# a second, wrong derivation back, and each has to be caught by name.
+
+mutate "$O" \
+  '    painted_reach_pt(scale, with_shake)
+        .max(MIN_INTERACTION_RADIUS)
+        .min(Orb::max_canvas_points() * 0.5)' \
+  '    let _ = with_shake;
+    (BASE_DIAMETER * 0.5 * scale * 1.1).max(MIN_INTERACTION_RADIUS)' \
+  'C19 the click target goes back to guessing "radius * 1.1" (the dead ring)'
+
+mutate "$A" \
+  '    pub fn shakes(self) -> bool {
+        matches!(self, OrbMode::Error)
+    }' \
+  '    pub fn shakes(self) -> bool {
+        let _ = self;
+        true
+    }' \
+  'C20 every mode is charged for a shake only Error can perform'
+
+mutate "$W" \
+  '    cached == Some((hwnd, px)) && observed == expected_region_box(px, side_px, ppp)' \
+  '    let _ = (observed, side_px, ppp);
+    cached == Some((hwnd, px))' \
+  'C21 the click-region cache is trusted without asking the window (B0 §6-3)'
+
+mutate "$W" \
+  '            Some([cx - r, cy - r, cx + r + 1, cy + r + 1])' \
+  '            Some([cx - r, cy - r, cx + r, cy + r])' \
+  'C22 the region read-back is compared against a box GDI never produced'
+
+# ── T1: the text mode and the half-space rule ───────────────────────────
+#
+# T0 measured four healthy Persian words being broken by one suffix list
+# (T0-001…004). Each mutation below puts the old behaviour back.
+
+mutate "$N" \
+  'const HALF_SPACE_SUFFIXES: &[&str] = &["ها", "های", "هایی", "تر", "ترین"];' \
+  'const HALF_SPACE_SUFFIXES: &[&str] = &["ها", "های", "هایی", "تر", "ترین", "ام", "ات", "اش"];' \
+  'C23 the non-productive suffixes -ات/-ام are back (کلمات → کلم‌ات)'
+
+mutate "$P" \
+  '        TextMode::Conservative => dictionary.correct(&normalizer.normalize_conservative(text)),' \
+  '        TextMode::Conservative => dictionary.correct(&normalizer.normalize(text)),' \
+  'C24 conservative mode quietly runs the full normaliser again'
+
+mutate "$P" \
+  '        TextMode::Raw => text.to_string(),' \
+  '        TextMode::Raw => dictionary.correct(&normalizer.normalize(text)),' \
+  'C25 raw mode is no longer raw'
+
+mutate "$P" \
+  '            "raw" => TextMode::Raw,' \
+  '            "raw" => TextMode::Raw,
+            "nonsense" => TextMode::Raw,' \
+  'C26 an unknown mode name drops to raw, typing verbatim text into a document'
+
+# T1 changed `machine.rs` to ask the settings for the mode, but that call site
+# only runs with real audio and a live injection target, so no mutation of it
+# can be judged here either way. The *policy* it depends on is covered by C26
+# and by `the_text_mode_survives_a_round_trip_through_the_config_file`; what is
+# unverified is that the live path reads it at all. Recorded as a gap rather
+# than given a mutation that would have to report MISSED.
 
 # C18 (the insertion boundary in `machine::emit`) is deliberately NOT mutated
 # here: that check only runs with real audio and a live engine, so no automated

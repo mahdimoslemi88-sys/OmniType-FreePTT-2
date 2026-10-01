@@ -50,9 +50,10 @@
 |---|---|
 | `reaserch/gui/probes/` | پروب‌های PowerShell برای اندازه‌گیری زندهٔ پنجره. **پیش از استفاده بخش «کوری» فایل‌هایی که تازه ساخته شده‌اند را در [LESSONS-LEARNED.md](LESSONS-LEARNED.md) ببین.** |
 | [halo-selftest.py](reaserch/gui/probes/halo-selftest.py) · [halo-hunt.ps1](reaserch/gui/probes/halo-hunt.ps1) | شکار خودکار هالهٔ سفید. اول `halo-selftest.py` (۵ کنترل، دروازهٔ اجرا)، بعد `halo-hunt.ps1` (کشیدن اورب با تأیید هندسی، تحلیل مستطیل ترک‌شده، بازگردانی موقعیت). هر دو **تنها** اجرا شوند. |
+| [orb-click-target-probe.ps1](reaserch/gui/probes/orb-click-target-probe.ps1) | هدفِ کلیک اورب را از خودِ پنجره می‌خواند و کنار شعاع‌های پیش‌بینی‌شده می‌گذارد. **پنج کنترل کوری قبل از هر گزارشی**، و عمداً نامِ حالت را نمی‌گوید |
 | [list-windows.ps1](reaserch/gui/probes/list-windows.ps1) · [arc-analyse.py](reaserch/gui/probes/arc-analyse.py) | فهرست پنجره‌های یک پروسه در طول زمان (ابزار کشف نقص DPI) · تحلیل‌گر کمان با خط `VERDICT: REPRODUCED\|NOT_AN_ARC\|CLEAN\|INCONCLUSIVE`. |
-| [canary-harness.sh](canary-harness.sh) | موتور مشترک کاناری جهشی — اسنپ‌شات پاک، `trap`، تفکیک `NOBUILD` از `MISSED` |
-| [mutation-check-session.sh](mutation-check-session.sh) | کاناری جهشی فاز ۳ — ۱۱ تصمیم، از `v-2/voice-ptt` اجرا شود |
+| [canary-harness.sh](canary-harness.sh) | موتور مشترک کاناری جهشی — اسنپ‌شات پاک، `trap`، تفکیک `NOBUILD` از `MISSED`، و **قفلِ pid** که دو اجرای هم‌پوشان را رد می‌کند (درس ۲۸) |
+| [mutation-check-session.sh](mutation-check-session.sh) | کاناری جهشی موج ۱ — `S1` + `O1` + `T1`، ۲۵ تصمیم، از `v-2/voice-ptt` اجرا شود |
 | [mutation-check-tray-warning.sh](mutation-check-tray-warning.sh) | کاناری جهشی نشان هشدار ترای — ۲۲ تصمیم |
 | [mutation-check-startup.sh](mutation-check-startup.sh) | کاناری جهشی بوت: دانلود مدل + گارد اجرای state machine — ۱۲ تصمیم |
 | `../third_party/egui-notify/` | کد وام‌گرفته‌شده، دست‌نخورده |
@@ -65,7 +66,10 @@
 | [execution/B0-orb-baseline.md](execution/B0-orb-baseline.md) | خط مبنای اُرب: مسیر پنجره، چهار شعاع، ماتریس حالت‌ها، سه یافتهٔ باز، و معیارهای پذیرش `O1` |
 | [execution/T0-text-baseline.md](execution/T0-text-baseline.md) | خط مبنای متن: جدول ۱۷ نمونهٔ اجراشد��، سه کلمهٔ سالمِ خراب‌شده، و آنچه در کد اصلاً وجود ندارد |
 | [execution/S0-session-baseline.md](execution/S0-session-baseline.md) | خط مبنای جلسه: نمودار رویداد→اثر→emit، نبودِ شناسه و مقصد، لغوی که بی‌اثر است |
-| [../voice-ptt/tests/fixtures/text-baseline/](../voice-ptt/tests/fixtures/text-baseline/) | نمونه‌های ساختگی متن — فعلاً مستندکردن اجرایی، نه تست |
+| [../voice-ptt/tests/fixtures/text-baseline/](../voice-ptt/tests/fixtures/text-baseline/) | نمونه‌های متن. **از `T1` یک تست زنده‌اند**: هر `current` و هر مقدار زیر `modes` از یک اجرا آمده و `the_t0_fixture_still_describes_this_pipeline` آن را دوباره اجرا و مقایسه می‌کند |
+| [execution/S1-handoff.md](execution/S1-handoff.md) | تحویل `S1` — هر دیکته یک شناسه گرفت؛ «کلید رها شد» دیگر با «پایان یافت» یکی نیست |
+| [execution/O1-handoff.md](execution/O1-handoff.md) | تحویل `O1` — هدفِ کلیک و ناحیهٔ پنجره یک عدد شدند؛ حلقهٔ مردهٔ کلیک صفر pt |
+| [execution/T1-handoff.md](execution/T1-handoff.md) | تحویل `T1` — سه حالت متن، و قاعدهٔ نیم‌فاصله به‌جای فهرستِ استثنا |
 
 > هر دو اسکریپت کاناری از [canary-harness.sh](canary-harness.sh) استفاده می‌کنند. این هارنس روی درخت قرمز `ABORT` می‌کند و از **یک اسنپ‌شات پاک** بازگردانی می‌کند، چون `.bak` چرخشی پشته است و یک اجرای قطع‌شده می‌تواند جهش‌هایش را ابدی کند (بندهای ۱۶–۱۹ [LESSONS-LEARNED.md](LESSONS-LEARNED.md)).
 
