@@ -30,10 +30,23 @@ const ARABIC_TO_PERSIAN: &[(char, char)] = &[
     ('٩', '۹'),
 ];
 
-/// Suffixes that attach with ZWNJ.
-const HALF_SPACE_SUFFIXES: &[&str] = &[
-    "ها", "های", "هایی", "تر", "ترین", "ام", "ات", "اش",
-];
+/// Suffixes that attach with ZWNJ, and nothing else.
+///
+/// This used to be `ها های هایی تر ترین ام ات اش`, and three of those seven
+/// are **not** written with a half-space anywhere in standard Persian, which is
+/// why every `X` ending in them was silently broken:
+/// * `ات` — the plural is `ها`/`های`; `X‌ات` does not occur. `کلمات` became
+///   `کلم‌ات`, `ات` the letter, forever.
+/// * `ام` — the first-person copula is written separately (`می‌روم`, never
+///   `می‌روم‌ام`), so `X‌ام` is not an orthographic form at all. `تمام` became
+///   `تم‌ام` and `اتمام` became `اتم‌ام`.
+/// * `اش` — the third-person enclitic attaches directly: `گوشش`, `کتابش`.
+///
+/// Dropping them is a *rule*, not three more exceptions, and it is the whole of
+/// the fix for T0-001/002/004 (roadmap §4.1: an exception list must not stand
+/// in for a valid rule). What remains — `ها`/`های`/`هایی` and `تر`/`ترین` — is
+/// genuinely productive, so splitting on it is right by construction.
+const HALF_SPACE_SUFFIXES: &[&str] = &["ها", "های", "هایی", "تر", "ترین"];
 
 /// Punctuation that must attach to the *previous* word (no space before,
 /// one space after).
@@ -56,8 +69,30 @@ impl Normalizer {
         }
     }
 
-    /// Normalizes an ASR transcript.
+    /// Normalizes an ASR transcript, including the half-space rules.
+    ///
+    /// This is [`TextMode::Standard`](super::TextMode): the whole pipeline, and
+    /// what this app has always done. For the part of it that can still be
+    /// wrong on an unfamiliar word, see [`Self::normalize_conservative`].
     pub fn normalize(&self, input: &str) -> String {
+        self.fix_half_spaces(&self.normalize_conservative(input))
+            .trim()
+            .to_string()
+    }
+
+    /// Everything here is a change no reader could disagree with.
+    ///
+    /// Arabic codepoints the Persian layout cannot produce, runs of whitespace,
+    /// and punctuation attached to the word it belongs to. What it
+    /// deliberately does **not** do is infer half-spaces: that step reads
+    /// Persian morphology, and an unfamiliar word comes out of it altered
+    /// rather than untouched. It is the mode to choose when the engine's output
+    /// is already correct and a guess makes it worse.
+    pub fn normalize_conservative(&self, input: &str) -> String {
+        self.map_codepoints_and_punct(input).trim().to_string()
+    }
+
+    fn map_codepoints_and_punct(&self, input: &str) -> String {
         // Stage 1: codepoint mapping + whitespace collapse.
         let mapped: String = input
             .chars()
@@ -111,10 +146,9 @@ impl Normalizer {
             }
         }
 
-        // Stage 4: ZWNJ insertion for known prefix/suffix patterns.
-        self.fix_half_spaces(&punct_fixed)
-            .trim()
-            .to_string()
+        // Stage 4 is the half-space inference, and it lives in `normalize`, not
+        // here: `normalize_conservative` stops after stage 3 on purpose.
+        punct_fixed
     }
 
     /// Inserts ZWNJ in known compound patterns.
@@ -182,16 +216,30 @@ impl Normalizer {
     }
 }
 
-/// Small stop-list of real Persian words that would otherwise be mistaken for
-/// prefix/suffix boundaries by the heuristic.
+/// Real Persian words the half-space heuristic would otherwise split.
+///
+/// Only entries the heuristic can actually reach are kept, and it is worth
+/// being explicit about what that leaves, because the previous version was a
+/// list of nineteen words of which thirteen were unreachable (`بی` is not a
+/// prefix here, `اش`/`ات`/`ام` are no longer suffixes):
+/// * `می-`: `می` **is** productive, so `می‌روم`/`نمی‌کنم` must split — but
+///   `میز`/`میوه`/`میان` and loanwords like `میکروفون` are single lexical words.
+///   This is the one place where Persian orthography is genuinely lexical and
+///   no spelling rule can decide it, so the list stays — bounded, named, and
+///   bypassable with `TextMode::Conservative` (see `processing::TextMode`).
+/// * `-تر`: `بتر`/`ستر` end in `تر` without taking it as a suffix.
 fn is_standalone_word(word: &str) -> bool {
     const STANDALONE: &[&str] = &[
-        "میوه", "میان", "میلاد", "مینا", "میز", "میگ", // می-
-        "بید", "بین", "بیل", // بی-
-        "همنشین", // هم-
-        "چند", "یک",
-        "ستر", "بتر", "ختری", // -تر
-        "شام", "پیام", "سلام", "کتابخانم", // -ام guard
+        "میوه",
+        "میان",
+        "میلاد",
+        "مینا",
+        "میز",
+        "میگ",
+        "میلیون",
+        "میکروفون", // می-
+        "بتر",
+        "ستر", // -تر
     ];
     STANDALONE.contains(&word)
 }

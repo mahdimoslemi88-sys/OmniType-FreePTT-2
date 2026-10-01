@@ -31,7 +31,7 @@ use crate::config::Settings;
 use crate::hotkey::HotkeyEvent;
 use crate::output::{inject_backspaces, inject_text};
 use crate::processing::seam::{SeamMerge, SeamOptions, SeamStitcher};
-use crate::processing::{process_text, Dictionary, Normalizer};
+use crate::processing::{process_text_with, Dictionary, Normalizer};
 use crate::vad::{AnyVad, Endpoint, VadConfig};
 
 use super::session::{
@@ -566,7 +566,8 @@ impl StateMachine {
 
         let processed = {
             let dict = self.services.dictionary.read().unwrap();
-            process_text(&raw, &self.services.normalizer, &dict)
+            let options = self.services.settings.text.options();
+            process_text_with(&raw, &self.services.normalizer, &dict, options)
         };
         // Seam repair: the audio overlap that keeps the cut from clipping a word
         // also makes the recogniser repeat the previous chunk's tail — and a cut
@@ -700,7 +701,8 @@ impl StateMachine {
 
         let processed = {
             let dict = self.services.dictionary.read().unwrap();
-            process_text(&raw, &self.services.normalizer, &dict)
+            let options = self.services.settings.text.options();
+            process_text_with(&raw, &self.services.normalizer, &dict, options)
         };
         // The final chunk of a streamed session sits on the same seam as the
         // mid-session ones, so it is stitched the same way.

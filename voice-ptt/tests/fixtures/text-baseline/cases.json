@@ -2,73 +2,81 @@
   "meta": {
     "package": "T0",
     "measured_on": "2026-10-01",
-    "how_measured": "temporary integration test calling the public API (Normalizer::normalize, processing::process_text, SeamStitcher::stitch) with the strings below; the probe was deleted afterwards, nothing else changed",
-    "note": "ZWNJ is U+200C, written here as \\u200c so it is visible. `current` is what the code produced today; `expected` is what the roadmap says must hold; `verdict` is the gap between them.",
+    "updated_by": "T1 (2026-10-01): every `current` below was re-measured from a run after the suffix rule changed; none of it was read out of the code",
+    "how_measured": "temporary integration test calling the public API (Normalizer::normalize, processing::process_text_with, SeamStitcher::stitch) with the strings below; the probe was deleted afterwards, nothing else changed",
+    "note": "ZWNJ is U+200C, written here as \\u200c so it is visible. `current` is Standard mode (what the app did before T1 and still does); `modes` records the same input through all three modes. `expected` is what the roadmap says must hold; `verdict` is the gap that remains.",
     "encoding": "all strings are Persian unless stated"
   },
   "cases": [
     {
       "id": "T0-001",
       "stage": "normalize",
-      "note": "roadmap §4.1 names this word explicitly",
+      "note": "roadmap §4.1 names this word explicitly. FIXED by T1: -ات is not a productive suffix, so the rule no longer fires (it was کلم‌ات)",
       "input": "كلمات",
-      "current": "کلم\u200cات",
+      "current": "کلمات",
+      "modes": { "standard": "کلمات", "conservative": "کلمات", "raw": "كلمات" },
       "expected": "کلمات",
-      "verdict": "BREAKS"
+      "verdict": "OK"
     },
     {
       "id": "T0-002",
       "stage": "normalize",
-      "note": "roadmap §4.1 names this word explicitly",
+      "note": "roadmap §4.1 names this word explicitly. FIXED by T1: -ام is the first-person copula and is written separately (it was تم‌ام)",
       "input": "تمام",
-      "current": "تم\u200cام",
+      "current": "تمام",
+      "modes": { "standard": "تمام", "conservative": "تمام", "raw": "تمام" },
       "expected": "تمام",
-      "verdict": "BREAKS"
+      "verdict": "OK"
     },
     {
       "id": "T0-003",
       "stage": "normalize",
-      "note": "roadmap §4.1 names this word explicitly",
+      "note": "roadmap §4.1 names this word explicitly. FIXED by T1, but by an exception and not by a rule: می is genuinely productive, so میکروفون is lexical (it was می‌کروفون). Conservative mode exists precisely so this judgement can be declined.",
       "input": "ميكروفون",
-      "current": "می\u200cکروفون",
+      "current": "میکروفون",
+      "modes": { "standard": "میکروفون", "conservative": "میکروفون", "raw": "ميكروفون" },
       "expected": "میکروفون",
-      "verdict": "BREAKS"
+      "verdict": "OK"
     },
     {
       "id": "T0-004",
       "stage": "normalize",
-      "note": "same rule as 001, different stem",
+      "note": "same rule as 001, different suffix. FIXED by T1 (it was اتم‌ام)",
       "input": "اتمام",
-      "current": "اتم\u200cام",
+      "current": "اتمام",
+      "modes": { "standard": "اتمام", "conservative": "اتمام", "raw": "اتمام" },
       "expected": "اتمام",
-      "verdict": "BREAKS"
+      "verdict": "OK"
     },
     {
       "id": "T0-005",
       "stage": "normalize",
-      "note": "the -ها rule working as intended",
+      "note": "the -ها/-های rule working as intended, and the first case where the modes differ",
       "input": "كتابهاي",
-      "current": "کتاب\u200cهای",
+      "current": "کتاب‌های",
+      "modes": { "standard": "کتاب‌های", "conservative": "کتابهای", "raw": "كتابهاي" },
       "expected": "کتاب‌های",
       "verdict": "OK"
     },
     {
       "id": "T0-006",
       "stage": "normalize",
-      "note": "correct ZWNJ must survive untouched",
-      "input": "مي\u200cروم",
-      "current": "می\u200cروم",
+      "note": "correct ZWNJ must survive untouched — in every mode, including Raw",
+      "input": "مي‌روم",
+      "current": "می‌روم",
+      "modes": { "standard": "می‌روم", "conservative": "می‌روم", "raw": "مي‌روم" },
       "expected": "می‌روم",
       "verdict": "OK"
     },
     {
       "id": "T0-007",
       "stage": "normalize",
-      "note": "a mis-split prefix must not be invented when the engine already spaced it",
+      "note": "user decision 1: می روم with an explicit space keeps the space. The normalizer does not invent a merge across a space",
       "input": "مي روم",
       "current": "می روم",
-      "expected": "می روم (or می‌روم — the roadmap leaves this open; must be decided, not defaulted)",
-      "verdict": "UNDECIDED"
+      "modes": { "standard": "می روم", "conservative": "می روم", "raw": "مي روم" },
+      "expected": "می روم",
+      "verdict": "OK"
     },
     {
       "id": "T0-008",
@@ -76,33 +84,37 @@
       "note": "teh marbuta",
       "input": "كلمة",
       "current": "کلمه",
+      "modes": { "standard": "کلمه", "conservative": "کلمه", "raw": "كلمة" },
       "expected": "کلمه",
       "verdict": "OK"
     },
     {
       "id": "T0-009",
       "stage": "normalize",
-      "note": "hamza is deleted rather than mapped; information loss",
+      "note": "hamza is deleted rather than mapped; information loss. UNDECIDED — roadmap has no rule for bare hamza",
       "input": "مسأله",
       "current": "مساله",
+      "modes": { "standard": "مساله", "conservative": "مساله", "raw": "مسأله" },
       "expected": "UNDECIDED — roadmap has no rule for bare hamza",
       "verdict": "UNDECIDED"
     },
     {
       "id": "T0-010",
       "stage": "normalize",
-      "note": "trailing tanwin is left alone",
+      "note": "trailing tanwin is left alone. UNDECIDED — same as 009",
       "input": "مرحبا",
       "current": "مرحبا",
+      "modes": { "standard": "مرحبا", "conservative": "مرحبا", "raw": "مرحبا" },
       "expected": "UNDECIDED — same as 009",
       "verdict": "UNDECIDED"
     },
     {
       "id": "T0-011",
       "stage": "normalize",
-      "note": "punctuation attaches to the previous word, one space after",
+      "note": "punctuation attaches to the previous word, one space after. This stage is part of Conservative too",
       "input": "این یک جمله است . واقعاً ؟",
       "current": "این یک جمله است. واقعاً؟",
+      "modes": { "standard": "این یک جمله است. واقعاً؟", "conservative": "این یک جمله است. واقعاً؟", "raw": "این یک جمله است . واقعاً ؟" },
       "expected": "این یک جمله است. واقعاً؟",
       "verdict": "OK"
     },
@@ -112,25 +124,28 @@
       "note": "Arabic-Indic digits are mapped to Persian digits",
       "input": "شماره ١٢٣",
       "current": "شماره ۱۲۳",
+      "modes": { "standard": "شماره ۱۲۳", "conservative": "شماره ۱۲۳", "raw": "شماره ١٢٣" },
       "expected": "شماره ۱۲۳",
       "verdict": "OK"
     },
     {
       "id": "T0-013",
       "stage": "normalize",
-      "note": "ASCII digits are NOT touched — there is no number option in settings at all",
+      "note": "ASCII digits are NOT touched — still no number option in settings. User decision 3 keeps Latin digits and asks for an independent conversion option, which T1 deliberately did not build",
       "input": "۱۲۳abc 456",
       "current": "۱۲۳abc 456",
+      "modes": { "standard": "۱۲۳abc 456", "conservative": "۱۲۳abc 456", "raw": "۱۲۳abc 456" },
       "expected": "UNDECIDED — roadmap §4.1 wants an independent number option",
       "verdict": "MISSING"
     },
     {
       "id": "T0-014",
       "stage": "full",
-      "note": "dictionary correction on top of normalisation",
+      "note": "dictionary correction on top of normalisation; the modes differ only on the half-space",
       "input": "من با پاتون و لينوكس كار ميكنم",
-      "current": "من با پایتون و لینوکس کار می\u200cکنم",
-      "expected": "من با پایتون و لینوکس کار می\u200cکنم",
+      "current": "من با پایتون و لینوکس کار می‌کنم",
+      "modes": { "standard": "من با پایتون و لینوکس کار می‌کنم", "conservative": "من با پایتون و لینوکس کار میکنم", "raw": "من با پاتون و لينوكس كار ميكنم" },
+      "expected": "من با پایتون و لینوکس کار می‌کنم",
       "verdict": "OK"
     },
     {
@@ -155,17 +170,16 @@
       "id": "T0-017",
       "stage": "seam",
       "note": "a truncated word is kept as-is until the full word arrives; no backspace is invented",
-      "input": "می\u200cخوا (chunk 3)",
-      "current": "text = \"می\u200cخوا\", dropped 0, backspaces 0",
+      "input": "می‌خوا (chunk 3)",
+      "current": "text = \"می‌خوا\", dropped 0, backspaces 0",
       "expected": "same",
       "verdict": "OK"
     }
   ],
-  "missing_capabilities": [
-    "no raw / conservative / formal mode: process_text always normalises then corrects (processing/mod.rs:15)",
-    "no settings switch for the normaliser at all — [streaming] is the only text-related section (config/settings.rs:42)",
-    "no independent options for numbers, punctuation or ZWNJ (roadmap §4.1)",
+  "still_missing_after_T1": [
+    "no independent options for numbers or punctuation (roadmap §4.1); T1 added the mode switch, not the per-rule switches",
     "no punctuation/space policy at the injection boundary: inject_text types exactly the string it is given (output/injector.rs:23)",
-    "no target check: nothing between process_text and SendInput looks at which window is focused"
+    "no target check: nothing between process_text and SendInput looks at which window is focused",
+    "the می- prefix rule is still lexical, not orthographic: an unfamiliar word starting with می can still be split wrongly, and the only remedy is TextMode::Conservative"
   ]
 }

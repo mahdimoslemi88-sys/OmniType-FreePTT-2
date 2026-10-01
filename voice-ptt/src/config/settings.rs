@@ -40,6 +40,7 @@ pub struct Settings {
     pub asr: AsrSettings,
     pub vad: VadSettings,
     pub streaming: StreamingSettings,
+    pub text: TextSettings,
     pub hotkey: HotkeySettings,
     pub gui: GuiSettings,
     pub cloud: CloudConfig,
@@ -61,6 +62,7 @@ impl Default for Settings {
             asr: AsrSettings::default(),
             vad: VadSettings::default(),
             streaming: StreamingSettings::default(),
+            text: TextSettings::default(),
             hotkey: HotkeySettings::default(),
             gui: GuiSettings::default(),
             cloud: CloudConfig::default(),
@@ -70,6 +72,50 @@ impl Default for Settings {
             custom_providers: Vec::new(),
             updates: UpdateSettings::default(),
         }
+    }
+}
+
+/// What the typed text is allowed to go through on its way out of the
+/// recogniser.
+///
+/// Kept as its own `[text]` section rather than a key inside `[streaming]`,
+/// because chunking is about *when* a session is cut and this is about *what
+/// survives the cut* — the two were never the same decision and lumping them
+/// together is why T0 could not find a switch to turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TextSettings {
+    /// `standard` (default), `conservative`, or `raw`.
+    ///
+    /// A string rather than the enum itself so an unknown value can fall back
+    /// to the historical behaviour instead of failing to load the whole file:
+    /// see [`TextSettings::mode`].
+    pub mode: String,
+}
+
+impl Default for TextSettings {
+    fn default() -> Self {
+        Self {
+            mode: "standard".into(),
+        }
+    }
+}
+
+impl TextSettings {
+    /// The mode to run, resolved.
+    ///
+    /// Anything unrecognised — including a typo — becomes
+    /// [`TextMode::Standard`](crate::processing::TextMode::Standard), because
+    /// the failure mode matters more than the setting: silently dropping to
+    /// `raw` would be discovered by reading the text of a document somebody
+    /// else is going to read.
+    pub fn mode(&self) -> crate::processing::TextMode {
+        crate::processing::TextMode::parse(&self.mode)
+    }
+
+    /// The pipeline options this section describes.
+    pub fn options(&self) -> crate::processing::ProcessingOptions {
+        crate::processing::ProcessingOptions::new(self.mode())
     }
 }
 
@@ -456,7 +502,11 @@ impl Settings {
 
     /// Adds or updates a custom provider in settings.
     pub fn add_or_update_provider(&mut self, provider: CustomProvider) {
-        if let Some(existing) = self.custom_providers.iter_mut().find(|p| p.id == provider.id) {
+        if let Some(existing) = self
+            .custom_providers
+            .iter_mut()
+            .find(|p| p.id == provider.id)
+        {
             *existing = provider;
         } else {
             self.custom_providers.push(provider);
@@ -558,5 +608,45 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, "[audio\nbroken").unwrap();
         assert!(Settings::load_or_create(&path).is_err());
+    }
+
+    /// The default has to be the behaviour that shipped, or a config file with
+    /// no `[text]` section quietly becomes a policy change nobody chose.
+    #[test]
+    fn the_text_mode_defaults_to_the_historical_behaviour() {
+        let s = Settings::default();
+        assert_eq!(s.text.mode, "standard");
+        assert_eq!(s.text.options().mode, crate::processing::TextMode::Standard);
+    }
+
+    /// End to end through the file format: this is the only path a user's
+    /// setting actually travels, so a rename of the section or the key would
+    /// otherwise be invisible here and visible only as "my option does
+    /// nothing".
+    #[test]
+    fn the_text_mode_survives_a_round_trip_through_the_config_file() {
+        let dir = std::env::temp_dir().join("omnitype-text-mode-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        for (written, expected) in [
+            ("raw", crate::processing::TextMode::Raw),
+            ("conservative", crate::processing::TextMode::Conservative),
+            ("standard", crate::processing::TextMode::Standard),
+            // A typo must not silently become "type everything verbatim".
+            ("nonsense", crate::processing::TextMode::Standard),
+        ] {
+            std::fs::write(&path, format!("[text]\nmode = \"{written}\"\n")).unwrap();
+            let s = Settings::load_or_create(&path).expect("a [text] section loads");
+            assert_eq!(s.text.mode(), expected, "config.toml said {written:?}");
+        }
+
+        // No section at all is the same as saying nothing.
+        std::fs::write(&path, "[audio]\nsample_rate = 16000\n").unwrap();
+        let s = Settings::load_or_create(&path).expect("loads");
+        assert_eq!(s.text.mode(), crate::processing::TextMode::Standard);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
