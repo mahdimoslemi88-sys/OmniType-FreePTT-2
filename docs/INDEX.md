@@ -70,6 +70,7 @@
 | [execution/S1-handoff.md](execution/S1-handoff.md) | تحویل `S1` — هر دیکته یک شناسه گرفت؛ «کلید رها شد» دیگر با «پایان یافت» یکی نیست |
 | [execution/O1-handoff.md](execution/O1-handoff.md) | تحویل `O1` — هدفِ کلیک و ناحیهٔ پنجره یک عدد شدند؛ حلقهٔ مردهٔ کلیک صفر pt |
 | [execution/T1-handoff.md](execution/T1-handoff.md) | تحویل `T1` — سه حالت متن، و قاعدهٔ نیم‌فاصله به‌جای فهرستِ استثنا |
+| [execution/T2-handoff.md](execution/T2-handoff.md) | تحویل `T2` — مقصدِ متن کجا می‌رود، و چه وقتی اصلاً نمی‌رود (در حال اجرا) |
 
 > هر دو اسکریپت کاناری از [canary-harness.sh](canary-harness.sh) استفاده می‌کنند. این هارنس روی درخت قرمز `ABORT` می‌کند و از **یک اسنپ‌شات پاک** بازگردانی می‌کند، چون `.bak` چرخشی پشته است و یک اجرای قطع‌شده می‌تواند جهش‌هایش را ابدی کند (بندهای ۱۶–۱۹ [LESSONS-LEARNED.md](LESSONS-LEARNED.md)).
 
