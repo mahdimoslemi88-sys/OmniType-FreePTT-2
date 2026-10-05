@@ -108,6 +108,8 @@ pub struct SeamStitcher {
     opts: SeamOptions,
     /// Last words of the text injected for this session, in order.
     tail: Vec<String>,
+    /// Trailing characters of the previous chunk after its last word (spaces, tabs, newlines, or empty).
+    prev_trailing: Option<String>,
 }
 
 /// Upper bound on the retained tail: the dedupe cap plus a small margin so the
@@ -123,8 +125,8 @@ const MIN_FRAGMENT: usize = 4;
 /// never be deleted as a "truncated fragment": the chance that the speaker simply
 /// used the short word is far too high for the payoff.
 const NEVER_FRAGMENTS: &[&str] = &[
-    "است", "باشد", "همین", "طور", "مورد", "وقت", "دست", "کار", "روز", "سال", "ماه",
-    "باز", "بار", "زبان", "کتاب", "بیا", "بگو", "بچه", "مثل", "حتی", "ولی", "هرگز",
+    "است", "باشد", "همین", "طور", "مورد", "وقت", "دست", "کار", "روز", "سال", "ماه", "باز", "بار",
+    "زبان", "کتاب", "بیا", "بگو", "بچه", "مثل", "حتی", "ولی", "هرگز",
 ];
 
 impl SeamStitcher {
@@ -132,12 +134,14 @@ impl SeamStitcher {
         Self {
             opts,
             tail: Vec::new(),
+            prev_trailing: None,
         }
     }
 
     /// Forgets the previous chunk (new recording session).
     pub fn reset(&mut self) {
         self.tail.clear();
+        self.prev_trailing = None;
     }
 
     /// Words remembered from the previous chunks of this session.
@@ -172,9 +176,89 @@ impl SeamStitcher {
         }
 
         let injected: Vec<String> = head[start..].to_vec();
-        merge.text = injected.join(" ");
+        // Preserve raw text formatting (multiple spaces, tabs, newlines) for the
+        // un-dropped remainder rather than collapsing them with `join(" ")`.
+        // Delimiters (spaces, newlines, tabs) between the last dropped word and the
+        // un-dropped remainder are preserved.
+        // If all words are dropped as duplicate overlap (start >= head.len()), merge.text is empty.
+        merge.text = if start >= head.len() {
+            String::new()
+        } else if start == 0 {
+            text.to_string()
+        } else {
+            Self::find_word_remainder_after_drop(text, start)
+                .unwrap_or("")
+                .to_string()
+        };
         self.remember(&injected);
+        if start < head.len() {
+            self.prev_trailing = Self::extract_trailing(text);
+        }
         merge
+    }
+
+    /// Extracts characters following the last non-whitespace word in `text`.
+    /// Returns `None` if `text` contains no non-whitespace characters.
+    fn extract_trailing(text: &str) -> Option<String> {
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(text[trimmed.len()..].to_string())
+        }
+    }
+
+    /// Finds the slice of `text` starting after the last dropped word (`drop_count - 1`).
+    ///
+    /// Preserves delimiters separating the last dropped word from the remainder of the text
+    /// (especially newlines, tabs, and multiple spaces).
+    /// If the delimiter is just a single normal space, returns the slice starting at the next word.
+    fn find_word_remainder_after_drop(text: &str, drop_count: usize) -> Option<&str> {
+        if drop_count == 0 {
+            return Some(text);
+        }
+        let mut words_seen = 0;
+        let mut in_word = false;
+        let mut last_dropped_word_end = None;
+        let mut next_word_start = None;
+
+        for (idx, ch) in text.char_indices() {
+            if ch.is_whitespace() {
+                if in_word {
+                    in_word = false;
+                    words_seen += 1;
+                    if words_seen == drop_count {
+                        last_dropped_word_end = Some(idx);
+                    }
+                }
+            } else if !in_word {
+                in_word = true;
+                if words_seen == drop_count {
+                    next_word_start = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        if in_word && words_seen + 1 == drop_count {
+            last_dropped_word_end = Some(text.len());
+        }
+
+        let end = last_dropped_word_end?;
+        let next_start = next_word_start.unwrap_or(text.len());
+        let delimiter = &text[end..next_start];
+
+        // Preserve delimiters especially with newlines, tabs, or multiple spaces.
+        // A single ordinary space yields the slice starting at next_word_start.
+        if delimiter.contains('\n')
+            || delimiter.contains('\r')
+            || delimiter.contains('\t')
+            || delimiter.chars().count() > 1
+        {
+            Some(&text[end..])
+        } else {
+            Some(&text[next_start..])
+        }
     }
 
     /// Largest `k` such that the last `k` remembered words equal the first `k`
@@ -217,6 +301,14 @@ impl SeamStitcher {
     fn truncated_tail_word(&self, head: &[String]) -> usize {
         if !self.opts.backspace {
             return 0;
+        }
+        // If after the candidate incomplete word there is whitespace (space, newline, tab),
+        // disable Backspace repair: the word was not truncated mid-word by the chunk seam.
+        // Speculative deletion of completed words is explicitly prevented.
+        if let Some(trailing) = &self.prev_trailing {
+            if trailing.chars().any(char::is_whitespace) {
+                return 0;
+            }
         }
         let (Some(tail_word), Some(head_word)) = (self.tail.last(), head.first()) else {
             return 0;
@@ -369,7 +461,14 @@ mod tests {
             }
             merges.push(merge);
         }
-        (typed.join(" ").split_whitespace().collect::<Vec<_>>().join(" "), merges)
+        (
+            typed
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            merges,
+        )
     }
 
     fn split_words(s: &str) -> Vec<String> {
@@ -378,10 +477,8 @@ mod tests {
 
     #[test]
     fn repeated_overlap_words_are_dropped() {
-        let (typed, merges) = run_session(&[
-            "سلام این یک تست طولانی است",
-            "تست طولانی است اما ادامه دارد",
-        ]);
+        let (typed, merges) =
+            run_session(&["سلام این یک تست طولانی است", "تست طولانی است اما ادامه دارد"]);
         assert_eq!(typed, "سلام این یک تست طولانی است اما ادامه دارد");
         assert_eq!(merges[1].dropped_words, 3);
         assert_eq!(merges[1].backspaces, 0);
@@ -580,5 +677,88 @@ mod tests {
         assert!(!same_word("خوب", "بد", true));
         // Not prefix-shaped: a longer form is a different word here.
         assert!(!same_word("کار", "کارخانه", true));
+    }
+
+    #[test]
+    fn seam_preserves_multiple_spaces_and_newlines_in_raw_mode() {
+        let mut s = stitcher();
+        let chunk1 = "خط اول   فاصله زیاد\nخط دوم";
+        let m1 = s.stitch(chunk1);
+        assert_eq!(
+            m1.text, chunk1,
+            "first chunk must retain original raw whitespace"
+        );
+        assert_eq!(m1.dropped_words, 0);
+
+        // Chunk 2 repeats "فاصله زیاد\nخط دوم" and adds "و خط سوم   چهار"
+        let chunk2 = "فاصله زیاد\nخط دوم و خط سوم   چهار";
+        let m2 = s.stitch(chunk2);
+        assert_eq!(m2.dropped_words, 4);
+        assert_eq!(
+            m2.text, "و خط سوم   چهار",
+            "overlapping head dropped while preserving internal whitespace of remainder"
+        );
+    }
+
+    #[test]
+    fn seam_trailing_whitespace_prevents_speculative_backspace_repair() {
+        let mut s = stitcher();
+        let m1 = s.stitch("می‌خوا  ");
+        assert_eq!(m1.dropped_words, 0);
+        assert_eq!(m1.backspaces, 0);
+
+        let m2 = s.stitch("می‌خواهم");
+        assert_eq!(
+            m2.backspaces, 0,
+            "trailing spaces on previous chunk prove word was not cut mid-word; zero backspaces"
+        );
+        assert_eq!(m2.dropped_words, 0);
+        assert_eq!(m2.text, "می‌خواهم");
+    }
+
+    #[test]
+    fn seam_overlap_preserves_newline_separator() {
+        let mut s = stitcher();
+        let m1 = s.stitch("سلام دنیا");
+        assert_eq!(m1.dropped_words, 0);
+
+        // Chunk 2 overlaps "دنیا" and continues after newline:
+        let m2 = s.stitch("دنیا\nخط دوم ادامه");
+        assert_eq!(m2.dropped_words, 1);
+        assert_eq!(
+            m2.text, "\nخط دوم ادامه",
+            "newline following dropped word must be preserved"
+        );
+    }
+
+    #[test]
+    fn seam_overlap_preserves_tab_and_multiple_spaces_separator() {
+        let mut s = stitcher();
+        let m1 = s.stitch("سلام دنیا");
+        assert_eq!(m1.dropped_words, 0);
+
+        // Chunk 2 overlaps "دنیا" and continues after tab and spaces:
+        let m2 = s.stitch("دنیا\t   بخش جدید");
+        assert_eq!(m2.dropped_words, 1);
+        assert_eq!(
+            m2.text, "\t   بخش جدید",
+            "tab and multiple spaces following dropped word must be preserved"
+        );
+    }
+
+    #[test]
+    fn seam_complete_duplicate_chunk_produces_empty_text_and_zero_backspaces() {
+        let mut s = stitcher();
+        let m1 = s.stitch("سلام دنیا");
+        assert_eq!(m1.dropped_words, 0);
+
+        // Exact duplicate
+        let m2 = s.stitch("سلام دنیا");
+        assert_eq!(m2.dropped_words, 2);
+        assert_eq!(m2.backspaces, 0);
+        assert_eq!(
+            m2.text, "",
+            "complete duplicate chunk must yield empty text"
+        );
     }
 }

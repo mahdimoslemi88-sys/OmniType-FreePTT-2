@@ -91,12 +91,12 @@
     {
       "id": "T0-009",
       "stage": "normalize",
-      "note": "hamza is deleted rather than mapped; information loss. UNDECIDED — roadmap has no rule for bare hamza",
+      "note": "hamza is preserved in both Conservative and Standard modes (decision: preserve bare hamza like مسأله)",
       "input": "مسأله",
-      "current": "مساله",
-      "modes": { "standard": "مساله", "conservative": "مساله", "raw": "مسأله" },
-      "expected": "UNDECIDED — roadmap has no rule for bare hamza",
-      "verdict": "UNDECIDED"
+      "current": "مسأله",
+      "modes": { "standard": "مسأله", "conservative": "مسأله", "raw": "مسأله" },
+      "expected": "مسأله",
+      "verdict": "OK"
     },
     {
       "id": "T0-010",

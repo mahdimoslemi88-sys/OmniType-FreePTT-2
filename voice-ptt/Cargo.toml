@@ -1,6 +1,6 @@
 [package]
 name = "voice-ptt"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "High-performance Push-to-Talk voice typing for Windows (Persian-first)"
 license = "MIT"
@@ -68,6 +68,8 @@ windows = { version = "0.58", features = [
     # HRGN, needed by the DWM_BLURBEHIND struct (see
     # window_shape::disable_winit_blur_behind).
     "Win32_Graphics_Gdi",
+    # Credential Manager: where the service API key lives instead of config.toml
+    "Win32_Security_Credentials",
 ] }
 
 # Raw platform window handle: lets the overlay ask eframe for the *real* main
@@ -104,6 +106,11 @@ winres = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"
+# The heartbeat's schedule is verified against a clock the test moves by hand
+# (`tokio::time::freeze` / `advance`), so the assertions are about *which*
+# deadline a beat lands on rather than about how fast this machine is. Dev-only:
+# the app's dependency on tokio is untouched.
+tokio = { version = "1", features = ["test-util"] }
 
 [[bench]]
 name = "audio_benchmark"

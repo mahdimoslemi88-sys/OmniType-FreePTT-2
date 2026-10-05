@@ -388,6 +388,165 @@ pub struct GuiSettings {
     pub orb_position_x: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orb_position_y: Option<i32>,
+    /// Whether the orb walks back to its corner after a spell of inactivity.
+    ///
+    /// Defaults to **on**, because the feature exists to solve a complaint
+    /// (the orb parking itself wherever the last dictation left it). An existing
+    /// `config.toml` has no key for it, and `serde(default)` gives it the same
+    /// on-state a fresh install gets rather than silently opting every current
+    /// user out of the thing they were missing.
+    #[serde(default = "default_true")]
+    pub orb_return_enabled: bool,
+    /// Seconds of inactivity before the orb returns. Zero means "use the
+    /// product default" rather than "return immediately", because a `0` here
+    /// would otherwise be a valid config file that returns the orb the moment
+    /// the user lets go of the mouse.
+    #[serde(default)]
+    pub orb_return_after_idle_secs: u64,
+    /// Pin the orb where it was put: suppress the automatic return. An explicit
+    /// "take it back to my spot" is still honoured.
+    #[serde(default)]
+    pub orb_pinned: bool,
+    /// Which corner the orb returns to. A **string**, not an enum, because this
+    /// is a user-facing config value and a typo must degrade to the default
+    /// rather than fail the whole file's load.
+    ///
+    /// The corner used to be hardcoded to top-right, which is why the orb always
+    /// jumped *up* regardless of where the user had put it: on a screen whose
+    /// taskbar is at the bottom, the bottom-right corner is the one out of the
+    /// way, and there was no way to say so.
+    #[serde(default = "default_return_corner")]
+    pub orb_return_corner: String,
+    /// How large the orb is drawn and how large a click it answers, as a
+    /// percentage of the built-in size. `100` is the size this build ships.
+    ///
+    /// Clamped on read by [`Self::orb_scale_percent`]: a hand-edited `0` or
+    /// `5000` would otherwise produce an orb that cannot be clicked at all, or
+    /// one that covers the screen.
+    #[serde(default = "default_orb_scale")]
+    pub orb_scale_percent: u32,
+    /// Type the result progressively, in small groups, instead of delivering a
+    /// whole dictation in one burst.
+    ///
+    /// Off by default, and that is a decision rather than an omission: the
+    /// burst form has a real advantage, which is that a dictation that the
+    /// platform refuses part-way has failed *visibly and early*. Pacing trades
+    /// that for looking nicer, so it is the user's call.
+    #[serde(default)]
+    pub type_progressively: bool,
+    /// Characters typed per step when `type_progressively` is on, and the gap
+    /// between steps in milliseconds. Both are clamped on read.
+    #[serde(default = "default_type_step_chars")]
+    pub type_step_chars: u32,
+    #[serde(default = "default_type_step_ms")]
+    pub type_step_ms: u32,
+    /// Show the finished text before it is typed, and let the user edit, insert,
+    /// copy or drop it.
+    ///
+    /// Off by default. Direct typing is what this app has always done and it is
+    /// what makes a dictation feel like talking rather than filling in a form;
+    /// review is for the cases where a typo is cheaper to catch than to undo.
+    ///
+    /// Note this does **not** govern recovery: text that failed to insert is
+    /// always offered, because there the text is in nobody's document and this
+    /// setting cannot make losing it acceptable.
+    #[serde(default)]
+    pub review_before_insert: bool,
+    /// Seconds a held text stays on offer. Zero means "use the product
+    /// default" rather than "expire immediately".
+    #[serde(default)]
+    pub draft_ttl_secs: u64,
+}
+
+impl GuiSettings {
+    /// The return corner as a value, defaulting on an unrecognised string.
+    ///
+    /// `default_return_corner` keeps the happy path total; this keeps the
+    /// unhappy path total too. A config written by hand, or by a future version
+    /// that renames a corner, must not make the orb unreturnable.
+    pub fn orb_return_corner_value(&self) -> crate::gui::orb_idle_policy::Corner {
+        use crate::gui::orb_idle_policy::Corner;
+        match self.orb_return_corner.trim().to_ascii_lowercase().as_str() {
+            "top_left" | "topleft" | "top-left" => Corner::TopLeft,
+            "bottom_left" | "bottomleft" | "bottom-left" => Corner::BottomLeft,
+            "bottom_right" | "bottomright" | "bottom-right" => Corner::BottomRight,
+            _ => Corner::TopRight,
+        }
+    }
+
+    /// The configured orb scale, as a multiplier, clamped to a usable range.
+    ///
+    /// The floor is not cosmetic: the click region is derived from the painted
+    /// circle, so too small an orb means too small a target, and a target below
+    /// a usable click size is a feature that cannot be operated. The ceiling is
+    /// the window this orb can be drawn into.
+    pub fn orb_scale(&self) -> f32 {
+        const MIN_PERCENT: u32 = 60;
+        const MAX_PERCENT: u32 = 200;
+        let pct = self.orb_scale_percent.clamp(MIN_PERCENT, MAX_PERCENT);
+        pct as f32 / 100.0
+    }
+
+    /// Characters per paced step, clamped so a hand-edited `0` cannot stall
+    /// typing forever and a huge value cannot turn pacing back into a burst.
+    pub fn type_step(&self) -> (usize, std::time::Duration) {
+        const MIN_CHARS: u32 = 1;
+        const MAX_CHARS: u32 = 32;
+        const MIN_MS: u32 = 0;
+        const MAX_MS: u32 = 250;
+        (
+            self.type_step_chars.clamp(MIN_CHARS, MAX_CHARS) as usize,
+            std::time::Duration::from_millis(self.type_step_ms.clamp(MIN_MS, MAX_MS) as u64),
+        )
+    }
+
+    /// How long held text stays on offer, with `0` meaning the product default.
+    ///
+    /// Clamped at both ends. A `0` would otherwise be a valid config that expires
+    /// every draft before the window can even open, and an enormous one would be
+    /// text that follows the user around for hours.
+    pub fn draft_ttl_secs(&self) -> u64 {
+        const MIN_SECS: u64 = 15;
+        const MAX_SECS: u64 = 3_600;
+        if self.draft_ttl_secs == 0 {
+            return crate::state::review::DEFAULT_DRAFT_TTL.as_secs();
+        }
+        self.draft_ttl_secs.clamp(MIN_SECS, MAX_SECS)
+    }
+}
+
+/// `true`, for `#[serde(default = ...)]` on an opt-out boolean.
+///
+/// A named function because `default = "true"` is a stringly-typed hook into
+/// the standard library's private impl, and a typo in it is a compile error
+/// only if the path is checked — it is, but the message is unhelpful.
+const fn default_true() -> bool {
+    true
+}
+
+/// The corner the orb returns to when the config does not say.
+///
+/// Top-right, because that is what every existing install has been getting
+/// without asking. Changing it would move the orb under people who never chose
+/// a corner, so the default is the *observed* behaviour, not the preferred one.
+fn default_return_corner() -> String {
+    "top_right".to_string()
+}
+
+/// The shipped orb size, as a percentage.
+fn default_orb_scale() -> u32 {
+    100
+}
+
+/// Characters per step when typing progressively.
+fn default_type_step_chars() -> u32 {
+    2
+}
+
+/// Gap between steps, in milliseconds. Long enough to read as typing, short
+/// enough that a paragraph does not take a minute to arrive.
+fn default_type_step_ms() -> u32 {
+    18
 }
 
 impl Default for AudioSettings {
@@ -449,6 +608,16 @@ impl Default for GuiSettings {
             show_transcript_bubble: true,
             orb_position_x: None,
             orb_position_y: None,
+            orb_return_enabled: default_true(),
+            orb_return_after_idle_secs: 0,
+            orb_pinned: false,
+            orb_return_corner: default_return_corner(),
+            orb_scale_percent: default_orb_scale(),
+            type_progressively: false,
+            type_step_chars: default_type_step_chars(),
+            type_step_ms: default_type_step_ms(),
+            review_before_insert: false,
+            draft_ttl_secs: 0,
         }
     }
 }
@@ -539,6 +708,89 @@ pub fn dirs_or_cwd() -> PathBuf {
 mod tests {
     use super::*;
 
+    // ── the orb preferences added with the user-facing controls ──────────
+
+    /// An existing `config.toml` has none of these keys, and it must come out
+    /// of the load with the shipped values rather than failing to parse or
+    /// starting from something arbitrary.
+    #[test]
+    fn a_config_without_the_new_orb_keys_still_loads_with_sane_values() {
+        let dir = std::env::temp_dir().join(format!("voiceptt-orb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[gui]\nshow_overlay = true\n").unwrap();
+
+        let loaded = Settings::load_or_create(&path).expect("an older config must still load");
+        assert_eq!(loaded.gui.orb_return_corner, "top_right");
+        assert_eq!(loaded.gui.orb_scale_percent, 100);
+        assert!(
+            !loaded.gui.type_progressively,
+            "progressive typing is opt-in, so an old config must not turn it on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_return_corner_round_trips_and_an_unknown_one_falls_back() {
+        use crate::gui::orb_idle_policy::Corner;
+        let mut s = Settings::default();
+        for (text, expected) in [
+            ("top_left", Corner::TopLeft),
+            ("top_right", Corner::TopRight),
+            ("bottom_left", Corner::BottomLeft),
+            ("bottom_right", Corner::BottomRight),
+        ] {
+            s.gui.orb_return_corner = text.to_string();
+            assert_eq!(
+                s.gui.orb_return_corner_value(),
+                expected,
+                "{text} must select its own corner"
+            );
+        }
+        // A hand-edited or future value must not make the orb unreturnable.
+        s.gui.orb_return_corner = "diagonal".to_string();
+        assert_eq!(s.gui.orb_return_corner_value(), Corner::TopRight);
+    }
+
+    /// The bottom corners exist because the sensible corner depends on where the
+    /// taskbar is. Before this was a setting the orb always went up, which on a
+    /// bottom-taskbar machine is the corner that is *not* out of the way.
+    #[test]
+    fn the_bottom_corners_are_selectable() {
+        use crate::gui::orb_idle_policy::Corner;
+        let mut s = Settings::default();
+        s.gui.orb_return_corner = "bottom_right".into();
+        assert_eq!(s.gui.orb_return_corner_value(), Corner::BottomRight);
+        s.gui.orb_return_corner = "bottom_left".into();
+        assert_eq!(s.gui.orb_return_corner_value(), Corner::BottomLeft);
+    }
+
+    /// A nonsense size must be clamped rather than obeyed: `0` would make the
+    /// orb unclickable and `5000` would cover the screen.
+    #[test]
+    fn the_orb_size_is_clamped_to_a_usable_range() {
+        let mut s = Settings::default();
+        s.gui.orb_scale_percent = 100;
+        assert!((s.gui.orb_scale() - 1.0).abs() < 0.001);
+        s.gui.orb_scale_percent = 0;
+        assert!(s.gui.orb_scale() >= 0.6, "too small to click must be raised");
+        s.gui.orb_scale_percent = 5000;
+        assert!(s.gui.orb_scale() <= 2.0, "a screen-filling orb must be refused");
+    }
+
+    /// The typing step is likewise clamped: a `0` characters per step would make
+    /// the paced path emit nothing, and a huge gap would be indistinguishable
+    /// from a hang.
+    #[test]
+    fn the_typing_step_is_clamped() {
+        let mut s = Settings::default();
+        s.gui.type_step_chars = 0;
+        s.gui.type_step_ms = 100_000;
+        let (chars, gap) = s.gui.type_step();
+        assert!(chars >= 1, "a zero step would emit nothing at all");
+        assert!(gap.as_millis() <= 250, "a huge gap reads as a hang");
+    }
+
     #[test]
     fn defaults_match_spec() {
         let s = Settings::default();
@@ -568,6 +820,63 @@ mod tests {
         assert_eq!(s.google.language, "fa-IR");
         assert!(s.updates.check_on_startup);
         assert_eq!(s.updates.auto_check_interval_hours, 6);
+        // The idle return is on by default: the feature exists to fix the orb
+        // parking itself wherever the last dictation left it, so a fresh install
+        // that did not get it would be the install most likely to want it.
+        assert!(s.gui.orb_return_enabled);
+        assert!(!s.gui.orb_pinned);
+        // Zero is the "never chosen" storage value, not a zero timeout. The
+        // policy turns it into its proposed default; storing the default
+        // itself would make an untouched file indistinguishable from a chosen
+        // one and would silently overwrite the default when it changes.
+        assert_eq!(s.gui.orb_return_after_idle_secs, 0);
+    }
+
+    /// An existing `config.toml` written before these keys existed must still
+    /// load, and must get the same idle-return state a fresh install gets.
+    ///
+    /// This is the migration that matters: the fields are opt-out, so an old
+    /// file without the key has to land on `true` or every current user would
+    /// be quietly opted out of a feature they were missing.
+    #[test]
+    fn an_older_config_without_the_orb_keys_still_gets_them() {
+        let dir = std::env::temp_dir().join("voice-ptt-cfg-legacy-gui");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // A `[gui]` section with only the keys that existed before, plus one
+        // unrelated section, so an unknown-key failure would have something to
+        // trip over if `deny_unknown_fields` were ever added.
+        std::fs::write(
+            &path,
+            "[gui]\nshow_overlay = true\ntheme = \"dark\"\n\n[vad]\nthreshold = 0.5\n",
+        )
+        .unwrap();
+
+        let loaded = Settings::load_or_create(&path).unwrap();
+        assert!(loaded.gui.orb_return_enabled, "legacy file must not opt out");
+        assert!(!loaded.gui.orb_pinned);
+        assert_eq!(loaded.gui.orb_return_after_idle_secs, 0);
+        assert_eq!(loaded.vad.threshold, 0.5, "the rest still loads");
+    }
+
+    /// The orb keys must survive a save/load cycle, or a user's choice to pin
+    /// the orb would quietly reset on the next restart.
+    #[test]
+    fn the_orb_keys_round_trip_through_toml() {
+        let dir = std::env::temp_dir().join("voice-ptt-cfg-orb-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let mut s = Settings::load_or_create(&path).unwrap();
+        s.gui.orb_return_enabled = false;
+        s.gui.orb_pinned = true;
+        s.gui.orb_return_after_idle_secs = 45;
+        s.save(&path).unwrap();
+
+        let loaded = Settings::load_or_create(&path).unwrap();
+        assert!(!loaded.gui.orb_return_enabled);
+        assert!(loaded.gui.orb_pinned);
+        assert_eq!(loaded.gui.orb_return_after_idle_secs, 45);
     }
 
     #[test]

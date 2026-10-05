@@ -10,14 +10,19 @@
 //! stage fixes *how it is written*.
 
 /// Characters normalized from Arabic to Persian codepoints.
+///
+/// Hamza preservation (Requirement 1):
+/// 'أ' (Alef with hamza above, U+0623), 'إ' (Alef with hamza below, U+0625), and
+/// 'ؤ' (Waw with hamza above, U+0624) are legitimate Persian orthographic characters
+/// (e.g. مسأله, تأیید, رأی, مؤمن, مؤثر). Deleting them causes irreversible loss
+/// of orthographic information. Removing the three hamza-deleting mappings preserves
+/// hamza in Conservative and Standard modes while still normalizing yeh, kaf, teh marbuta,
+/// and digits.
 const ARABIC_TO_PERSIAN: &[(char, char)] = &[
     ('ي', 'ی'), // Arabic yeh → Persian yeh
     ('ك', 'ک'), // Arabic kaf → Persian kaf
     ('ة', 'ه'), // Teh marbuta → Heh
-    ('ؤ', 'و'), // Waw with hamza (common ASR artifact)
-    ('ٱ', 'ا'), // Alef with wasla
-    ('أ', 'ا'), // Alef with hamza above
-    ('إ', 'ا'), // Alef with hamza below
+    ('ٱ', 'ا'), // Alef with wasla → Bare alef
     ('٠', '۰'), // Arabic-Indic digits → Extended (Persian)
     ('١', '۱'),
     ('٢', '۲'),
@@ -30,23 +35,271 @@ const ARABIC_TO_PERSIAN: &[(char, char)] = &[
     ('٩', '۹'),
 ];
 
-/// Suffixes that attach with ZWNJ, and nothing else.
+/// Known Persian noun stems that take plural suffixes `-ها`, `-های`, and `-هایی`.
 ///
-/// This used to be `ها های هایی تر ترین ام ات اش`, and three of those seven
-/// are **not** written with a half-space anywhere in standard Persian, which is
-/// why every `X` ending in them was silently broken:
-/// * `ات` — the plural is `ها`/`های`; `X‌ات` does not occur. `کلمات` became
-///   `کلم‌ات`, `ات` the letter, forever.
-/// * `ام` — the first-person copula is written separately (`می‌روم`, never
-///   `می‌روم‌ام`), so `X‌ام` is not an orthographic form at all. `تمام` became
-///   `تم‌ام` and `اتمام` became `اتم‌ام`.
-/// * `اش` — the third-person enclitic attaches directly: `گوشش`, `کتابش`.
+/// In standard Persian morphology, naive suffix splitting on "ها" corrupts single-morpheme
+/// words naturally ending in "ها" (e.g. «اژدها», «تنها», «اشتها», «انتها», «ابتدا»).
+/// In accordance with Rule 3 (positive evidence only; no negative blacklists), plural suffix
+/// insertion is strictly restricted to positive evidence of known noun stems.
+const NOUN_STEMS_FOR_HA: &[&str] = &[
+    "کتاب",
+    "دست",
+    "پا",
+    "سر",
+    "چشم",
+    "دل",
+    "جان",
+    "رو",
+    "مو",
+    "روز",
+    "شب",
+    "سال",
+    "ماه",
+    "هفته",
+    "ساعت",
+    "لحظه",
+    "زمان",
+    "وقت",
+    "کار",
+    "راه",
+    "بار",
+    "نام",
+    "پیام",
+    "نامه",
+    "صفحه",
+    "خط",
+    "کلمه",
+    "خانه",
+    "اتاق",
+    "در",
+    "دیوار",
+    "شهر",
+    "کوه",
+    "دریا",
+    "رود",
+    "باغ",
+    "گل",
+    "درخت",
+    "برگ",
+    "سنگ",
+    "آب",
+    "باد",
+    "خاک",
+    "هوا",
+    "زمین",
+    "ستاره",
+    "ابر",
+    "انسان",
+    "زن",
+    "مرد",
+    "پسر",
+    "دختر",
+    "بچه",
+    "کودک",
+    "دوست",
+    "یار",
+    "همراه",
+    "مادر",
+    "پدر",
+    "برادر",
+    "خواهر",
+    "استاد",
+    "شاگرد",
+    "معلم",
+    "دانشجو",
+    "کارمند",
+    "فیلم",
+    "عکس",
+    "صدا",
+    "تصویر",
+    "ساز",
+    "آهنگ",
+    "قلم",
+    "دفتر",
+    "بخش",
+    "درس",
+    "فصل",
+    "نکته",
+    "مورد",
+    "چیز",
+    "گروه",
+    "تیم",
+    "دسته",
+    "رنگ",
+    "لباس",
+    "ماشین",
+    "خودرو",
+    "ابزار",
+    "قطعه",
+    "برنامه",
+    "سامانه",
+    "سیستم",
+    "پروژه",
+    "سایت",
+    "کاربر",
+    "مدیر",
+    "داده",
+    "روش",
+    "راهکار",
+    "سوال",
+    "سؤال",
+    "پاسخ",
+    "جواب",
+    "خبر",
+    "اتفاق",
+    "حادثه",
+    "مشکل",
+    "مسأله",
+    "مساله",
+    "بازی",
+    "هدف",
+    "داستان",
+    "شعر",
+    "قصه",
+    "نقشه",
+    "طرح",
+];
+
+/// Known Persian verbal present stems (بن مضارع) conjugated with `می-` and `نمی-`.
+const PRESENT_VERB_STEMS: &[&str] = &[
+    "رو", "گو", "بین", "خور", "زن", "کن", "نویس", "خوان", "خر", "فروش", "دان", "توان", "رس",
+    "خواه", "باش", "شو", "آی", "آور", "دار", "گیر", "ده", "ساز", "سوز", "کش", "بر", "بند", "شنو",
+    "پرس", "پوش", "نشین", "خواب", "افت", "ریز", "پر", "پز", "شناس", "بخش", "تاب", "ترس", "چش",
+    "چرخ", "خند", "گرد", "طلب", "سنج", "چسب", "گذار", "گذر", "مان", "فهم",
+];
+
+/// Known Persian verbal past stems (بن ماضی) conjugated with `می-` and `نمی-`.
+const PAST_VERB_STEMS: &[&str] = &[
+    "رفت",
+    "گفت",
+    "دید",
+    "خورد",
+    "زد",
+    "کرد",
+    "نوشت",
+    "خواند",
+    "خرید",
+    "فروخت",
+    "دانست",
+    "توانست",
+    "رسید",
+    "خواست",
+    "بود",
+    "شد",
+    "آمد",
+    "آورد",
+    "داشت",
+    "گرفت",
+    "داد",
+    "ساخت",
+    "سوخت",
+    "کشید",
+    "برد",
+    "بست",
+    "شنید",
+    "پرسید",
+    "پوشید",
+    "نشست",
+    "خوابید",
+    "افتاد",
+    "ریخت",
+    "پرید",
+    "پخت",
+    "شناخت",
+    "بخشید",
+    "تابید",
+    "ترسید",
+    "چشید",
+    "چرخید",
+    "خندید",
+    "گریست",
+    "گردید",
+    "طلبید",
+    "سنجید",
+    "چسبید",
+    "گذاشت",
+    "گذشت",
+    "ماند",
+    "فهمید",
+];
+
+/// Checks whether `rest` represents a valid Persian verb form after `می` or `نمی`.
 ///
-/// Dropping them is a *rule*, not three more exceptions, and it is the whole of
-/// the fix for T0-001/002/004 (roadmap §4.1: an exception list must not stand
-/// in for a valid rule). What remains — `ها`/`های`/`هایی` and `تر`/`ترین` — is
-/// genuinely productive, so splitting on it is right by construction.
-const HALF_SPACE_SUFFIXES: &[&str] = &["ها", "های", "هایی", "تر", "ترین"];
+/// Requirement 2: Exact stem + valid finite personal ending. Rejects unknown middle segments.
+/// A candidate like "میرونام" (starts with root "رو" and ends with personal ending "م", but with
+/// unknown middle segment "نا") is strictly rejected.
+fn is_persian_verb_after_mi(rest: &str) -> bool {
+    // 1. Exact match with present stems + finite endings (م, ی, د, یم, ید, ند):
+    for &stem in PRESENT_VERB_STEMS {
+        if let Some(suffix) = rest.strip_prefix(stem) {
+            if matches!(suffix, "م" | "ی" | "د" | "یم" | "ید" | "ند") {
+                return true;
+            }
+        }
+    }
+
+    // 2. Exact match with past stems + past endings (empty for 3rd-sg, م, ی, یم, ید, ند):
+    for &stem in PAST_VERB_STEMS {
+        if let Some(suffix) = rest.strip_prefix(stem) {
+            if matches!(suffix, "" | "م" | "ی" | "یم" | "ید" | "ند") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Known Persian adjective stems that take comparative/superlative suffixes `-تر` and `-ترین`.
+///
+/// In Persian, `-تر` is exclusively an adjective suffix (صفت تفضیلی).
+/// Many common Persian nouns naturally end in "تر" (e.g. کبوتر, دختر, دفتر, انگشتر, دکتر, اختر).
+/// Naive suffix splitting based purely on string endings corrupts these nouns into "کبو‌تر",
+/// "دخ‌تر", etc. Suffix insertion for `-تر` and `-ترین` is strictly restricted to positive
+/// evidence of known adjective stems. In ambiguous cases, the word is preserved as-is.
+const ADJECTIVE_STEMS: &[&str] = &[
+    "بزرگ",
+    "کوچک",
+    "سخت",
+    "آسان",
+    "خوب",
+    "بد",
+    "بلند",
+    "کوتاه",
+    "بیش",
+    "کم",
+    "روشن",
+    "تاریک",
+    "زیبا",
+    "قوی",
+    "ضعیف",
+    "ساده",
+    "جدید",
+    "قدیم",
+    "پهن",
+    "تنگ",
+    "گرم",
+    "سرد",
+    "پیر",
+    "جوان",
+    "نو",
+    "کهنه",
+    "تیز",
+    "تند",
+    "کند",
+    "دور",
+    "نزدیک",
+    "پاک",
+    "نرم",
+    "تلخ",
+    "شیرین",
+    "مهم",
+    "عالی",
+    "مناسب",
+    "مفید",
+    "سریع",
+    "آرام",
+];
 
 /// Punctuation that must attach to the *previous* word (no space before,
 /// one space after).
@@ -151,6 +404,45 @@ impl Normalizer {
         punct_fixed
     }
 
+    /// Checks if a character is punctuation that may enclose or attach to words.
+    fn is_punctuation_char(c: char) -> bool {
+        c.is_ascii_punctuation()
+            || matches!(
+                c,
+                '«' | '»' | '،' | '؛' | '؟' | '…' | '“' | '”' | '‘' | '’' | '‹' | '›' | 'ـ'
+            )
+    }
+
+    /// Separates leading and trailing punctuation from the token so the core word can be
+    /// analyzed and fixed without punctuation interfering, while preserving all punctuation intact.
+    fn split_enclosing_punct(token: &str) -> (&str, &str, &str) {
+        let mut chars = token.char_indices().peekable();
+        let mut start_idx = token.len();
+        while let Some(&(i, c)) = chars.peek() {
+            if !Self::is_punctuation_char(c) {
+                start_idx = i;
+                break;
+            }
+            chars.next();
+        }
+
+        if start_idx == token.len() {
+            return (token, "", "");
+        }
+
+        let end_idx = token
+            .char_indices()
+            .rfind(|(_, c)| !Self::is_punctuation_char(*c))
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(token.len());
+
+        (
+            &token[..start_idx],
+            &token[start_idx..end_idx],
+            &token[end_idx..],
+        )
+    }
+
     /// Inserts ZWNJ in known compound patterns.
     fn fix_half_spaces(&self, text: &str) -> String {
         let mut out: Vec<String> = Vec::new();
@@ -160,52 +452,84 @@ impl Normalizer {
         out.join(" ")
     }
 
-    fn fix_word(&self, word: &str) -> String {
-        // If the word already contains ZWNJ, trust it.
-        if word.contains(self.zwnj) {
-            return word.to_string();
-        }
-        // Whole-word stop-list: real words that merely *end or start* with a
-        // prefix/suffix look-alike (سلام, میوه, میز, …) must never be split.
-        if is_standalone_word(word) {
-            return word.to_string();
+    fn fix_word(&self, token: &str) -> String {
+        if token.is_empty() {
+            return String::new();
         }
 
-        // prefix + suffix compounds like "میرفتها" → "می‌رفت‌ها"
-        // (handled by two passes: strip known prefix, then known suffix)
-        let mut w = word.to_string();
+        // Requirement 3: Separate leading and trailing punctuation from the core word so that
+        // punctuation does not interfere with morphological analysis, and is preserved intact.
+        let (leading_punct, core, trailing_punct) = Self::split_enclosing_punct(token);
+        if core.is_empty() {
+            return token.to_string();
+        }
 
-        // Prefix: "می" / "نمی" + rest (rest must be at least 2 chars of letters)
+        let fixed_core = self.fix_core_word(core);
+        if fixed_core == core {
+            token.to_string()
+        } else {
+            format!("{leading_punct}{fixed_core}{trailing_punct}")
+        }
+    }
+
+    fn fix_core_word(&self, core: &str) -> String {
+        // If the core already contains ZWNJ, trust it.
+        if core.contains(self.zwnj) {
+            return core.to_string();
+        }
+
+        let mut w = core.to_string();
+
+        // 1. Prefix pass: "نمی" / "می" + verified verb stem + exact finite suffix.
+        // Requires positive morphological evidence: exact stem + valid personal suffix.
+        // Rejects any unknown middle segment (e.g. synthetic "میرونام" is rejected).
+        // Non-verbs starting with "می" (e.g. میکروفون, میوه, میز, میلیون) remain intact.
         for prefix in ["نمی", "می"] {
             if w.starts_with(prefix) && w.chars().count() > prefix.chars().count() + 1 {
                 let rest = &w[prefix.len()..];
-                // Heuristic guard: rest must not itself be a known standalone
-                // word that merely starts with these letters (e.g. "میوه").
-                if !is_standalone_word(rest) {
+                if is_persian_verb_after_mi(rest) {
                     w = format!("{prefix}{}{rest}", self.zwnj);
                     break;
                 }
             }
         }
 
-        // Suffix pass: "کتابها" → "کتاب‌ها" (skip if ZWNJ already inserted above).
-        for suffix in HALF_SPACE_SUFFIXES {
+        // 2. Suffix pass for plural -ها, -های, -هایی:
+        // Restricted to positive morphological evidence of known noun stems (NOUN_STEMS_FOR_HA).
+        // Single-morpheme words ending in "ها" (e.g. اژدها, تنها, اشتها, انتها, ابتدا)
+        // have no noun stem evidence and remain intact without needing any negative blacklist.
+        for suffix in ["هایی", "های", "ها"] {
             if w.ends_with(suffix) && w.chars().count() > suffix.chars().count() + 1 {
                 let stem = &w[..w.len() - suffix.len()];
-                // Do not split words where the "suffix" is intrinsic
-                // (e.g. "ستر" is a word, not "ست"+"تر").
-                if !is_standalone_word(stem) && stem.chars().any(|c| !c.is_whitespace()) {
+                if NOUN_STEMS_FOR_HA.contains(&stem) {
                     let has_zwnj = w.contains(self.zwnj);
                     let base = if has_zwnj {
                         w.trim_end_matches(suffix).to_string()
                     } else {
                         stem.to_string()
                     };
-                    let sep: String = if has_zwnj {
-                        String::new()
+                    let sep = if has_zwnj { "" } else { "\u{200c}" };
+                    w = format!("{base}{sep}{suffix}");
+                    break;
+                }
+            }
+        }
+
+        // 3. Suffix pass for adjective comparative/superlative -ترین and -تر:
+        // Restricted to positive evidence of known adjective stems (ADJECTIVE_STEMS).
+        // Common Persian nouns naturally ending in "تر" (e.g. کبوتر, دختر, دفتر, انگشتر, دکتر, اختر)
+        // lack adjective evidence and are preserved as-is. In ambiguous cases, the word is preserved.
+        for suffix in ["ترین", "تر"] {
+            if w.ends_with(suffix) && w.chars().count() > suffix.chars().count() + 1 {
+                let stem = &w[..w.len() - suffix.len()];
+                if ADJECTIVE_STEMS.contains(&stem) {
+                    let has_zwnj = w.contains(self.zwnj);
+                    let base = if has_zwnj {
+                        w.trim_end_matches(suffix).to_string()
                     } else {
-                        self.zwnj.to_string()
+                        stem.to_string()
                     };
+                    let sep = if has_zwnj { "" } else { "\u{200c}" };
                     w = format!("{base}{sep}{suffix}");
                     break;
                 }
@@ -214,34 +538,6 @@ impl Normalizer {
 
         w
     }
-}
-
-/// Real Persian words the half-space heuristic would otherwise split.
-///
-/// Only entries the heuristic can actually reach are kept, and it is worth
-/// being explicit about what that leaves, because the previous version was a
-/// list of nineteen words of which thirteen were unreachable (`بی` is not a
-/// prefix here, `اش`/`ات`/`ام` are no longer suffixes):
-/// * `می-`: `می` **is** productive, so `می‌روم`/`نمی‌کنم` must split — but
-///   `میز`/`میوه`/`میان` and loanwords like `میکروفون` are single lexical words.
-///   This is the one place where Persian orthography is genuinely lexical and
-///   no spelling rule can decide it, so the list stays — bounded, named, and
-///   bypassable with `TextMode::Conservative` (see `processing::TextMode`).
-/// * `-تر`: `بتر`/`ستر` end in `تر` without taking it as a suffix.
-fn is_standalone_word(word: &str) -> bool {
-    const STANDALONE: &[&str] = &[
-        "میوه",
-        "میان",
-        "میلاد",
-        "مینا",
-        "میز",
-        "میگ",
-        "میلیون",
-        "میکروفون", // می-
-        "بتر",
-        "ستر", // -تر
-    ];
-    STANDALONE.contains(&word)
 }
 
 #[cfg(test)]
@@ -309,5 +605,137 @@ mod tests {
         let n = Normalizer::new();
         assert_eq!(n.normalize(""), "");
         assert_eq!(n.normalize("   "), "");
+    }
+
+    #[test]
+    fn hamza_is_preserved_in_conservative_and_standard() {
+        let n = Normalizer::new();
+        // Hamza on alef (أ), waw (ؤ), and bare hamza:
+        for word in ["مسأله", "مؤمن", "تأیید", "رأی", "مؤثر", "سؤال", "مأخذ"]
+        {
+            assert_eq!(
+                n.normalize_conservative(word),
+                word,
+                "conservative mode must preserve hamza in {word}"
+            );
+            assert_eq!(
+                n.normalize(word),
+                word,
+                "standard mode must preserve hamza in {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_words_are_preserved_without_corruption() {
+        let n = Normalizer::new();
+        // Words specified by requirement 2 that must not be broken:
+        for word in [
+            "کلمات",
+            "تمام",
+            "اتمام",
+            "میکروفون",
+            "کبوتر",
+            "اژدها",
+            "دختر",
+            "دفتر",
+            "انگشتر",
+            "تنها",
+            "میوه",
+            "میز",
+            "میلاد",
+            "میلیون",
+        ] {
+            assert_eq!(
+                n.normalize(word),
+                word,
+                "healthy word must survive untouched without being broken: {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_compounds_get_zwnj_with_positive_evidence() {
+        let n = Normalizer::new();
+        // Verbs with verified stems:
+        assert_eq!(n.normalize("میروم"), "می‌روم");
+        assert_eq!(n.normalize("نمیخواهم"), "نمی‌خواهم");
+        assert_eq!(n.normalize("میکنم"), "می‌کنم");
+        assert_eq!(n.normalize("میشود"), "می‌شود");
+
+        // Plurals:
+        assert_eq!(n.normalize("کتابها"), "کتاب‌ها");
+        assert_eq!(n.normalize("کتابهای"), "کتاب‌های");
+        assert_eq!(n.normalize("کتابهایی"), "کتاب‌هایی");
+
+        // Adjectives with verified stems:
+        assert_eq!(n.normalize("بزرگترین"), "بزرگ‌ترین");
+        assert_eq!(n.normalize("سختتر"), "سخت‌تر");
+    }
+
+    #[test]
+    fn explicit_space_in_mi_rom_is_preserved() {
+        let n = Normalizer::new();
+        // Explicit space between "می" and "روم" must not be converted to ZWNJ:
+        assert_eq!(n.normalize("می روم"), "می روم");
+        assert_eq!(n.normalize_conservative("می روم"), "می روم");
+    }
+
+    #[test]
+    fn latin_digits_are_preserved() {
+        let n = Normalizer::new();
+        assert_eq!(n.normalize("123"), "123");
+        assert_eq!(n.normalize("کد 456 تست"), "کد 456 تست");
+        assert_eq!(n.normalize_conservative("123"), "123");
+    }
+
+    #[test]
+    fn test_synthetic_verb_with_unknown_middle_is_rejected() {
+        let n = Normalizer::new();
+        // "میرونام": starts with "می", contains root "رو" and ends with "م",
+        // but has unknown middle segment "نا" -> must NOT be broken or altered!
+        assert_eq!(n.normalize("میرونام"), "میرونام");
+        assert_eq!(n.normalize("میروشم"), "میروشم");
+    }
+
+    #[test]
+    fn test_punctuation_around_words_is_preserved_during_compound_fixing() {
+        let n = Normalizer::new();
+        // Leading and trailing punctuation must not prevent compound fixing,
+        // and must remain intact in place:
+        assert_eq!(n.normalize("«کتابها»"), "«کتاب‌ها»");
+        assert_eq!(n.normalize("(میروم)"), "(می‌روم)");
+        assert_eq!(n.normalize("«میروم»!"), "«می‌روم»!");
+        assert_eq!(n.normalize("[کتابها]،"), "[کتاب‌ها]،");
+    }
+
+    #[test]
+    fn test_ha_plural_uses_positive_stems_without_negative_blacklist() {
+        let n = Normalizer::new();
+        // Valid plurals based on positive noun stems:
+        assert_eq!(n.normalize("کتابها"), "کتاب‌ها");
+        assert_eq!(n.normalize("کتابهای"), "کتاب‌های");
+        assert_eq!(n.normalize("کتابهایی"), "کتاب‌هایی");
+        assert_eq!(n.normalize("دستها"), "دست‌ها");
+        assert_eq!(n.normalize("روزها"), "روز‌ها");
+
+        // Words ending in ها/های that lack noun stems must survive without any negative blacklist:
+        for word in [
+            "اژدها",
+            "تنها",
+            "اشتها",
+            "انتها",
+            "ابتدا",
+            "ادعا",
+            "انشا",
+            "امضا",
+            "رها",
+        ] {
+            assert_eq!(
+                n.normalize(word),
+                word,
+                "single morpheme word ending in ها must be preserved without blacklist: {word}"
+            );
+        }
     }
 }

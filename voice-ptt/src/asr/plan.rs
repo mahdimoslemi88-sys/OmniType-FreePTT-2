@@ -114,13 +114,17 @@ impl EnginePlan {
 /// endpoints, then Antigravity, then local whisper. Antigravity sits below the
 /// cloud engines on purpose — it must never win an `auto` race, it has to be
 /// selected explicitly.
-pub fn engine_plan(settings: &Settings, cloud_key_in_env: bool) -> EnginePlan {
+pub fn engine_plan(settings: &Settings, cloud_key_in_env: bool, cloud_key_in_store: bool) -> EnginePlan {
     let cloud = &settings.cloud;
     let mut engines = Vec::new();
 
-    // `is_configured` is `enabled && (api_key set || env key set)`; the env half
-    // is passed in so this stays testable.
-    let cloud_ready = cloud.enabled && (!cloud.api_key.trim().is_empty() || cloud_key_in_env);
+    // `is_configured` is `enabled && (a key exists somewhere)`. The two
+    // out-of-file sources are **passed in** rather than read from the resolver's
+    // process-global: a planner that consulted a global would be untestable in
+    // the one way that matters here, which is "does a key in the store make the
+    // cloud engine available".
+    let cloud_ready =
+        cloud.enabled && (!cloud.api_key.trim().is_empty() || cloud_key_in_env || cloud_key_in_store);
     if cloud_ready {
         engines.push(EngineKind::Cloud {
             id: cloud.provider.clone(),
@@ -212,7 +216,7 @@ mod tests {
 
     #[test]
     fn whisper_is_always_last_and_always_present() {
-        let plan = engine_plan(&bare(), false);
+        let plan = engine_plan(&bare(), false, false);
         assert_eq!(plan.engines, vec![EngineKind::Whisper]);
     }
 
@@ -220,7 +224,7 @@ mod tests {
     /// then fail every request. It must not enter the plan at all.
     #[test]
     fn an_enabled_but_keyless_cloud_engine_is_not_registered() {
-        let plan = engine_plan(&with_cloud(""), false);
+        let plan = engine_plan(&with_cloud(""), false, false);
         assert_eq!(plan.engines, vec![EngineKind::Whisper]);
     }
 
@@ -228,7 +232,7 @@ mod tests {
     /// the plan has to honour that without the test process having a key set.
     #[test]
     fn the_environment_key_alone_is_enough() {
-        let plan = engine_plan(&with_cloud(""), true);
+        let plan = engine_plan(&with_cloud(""), true, false);
         assert_eq!(
             plan.engines,
             vec![EngineKind::Cloud { id: "groq".into() }, EngineKind::Whisper]
@@ -244,7 +248,7 @@ mod tests {
         s.antigravity.enabled = true;
         s.custom_providers = vec![custom("my-local")];
 
-        let plan = engine_plan(&s, false);
+        let plan = engine_plan(&s, false, false);
         assert_eq!(
             plan.engines,
             vec![
@@ -266,7 +270,7 @@ mod tests {
     fn antigravity_never_outranks_a_working_cloud_engine() {
         let mut s = with_cloud("sk-test");
         s.antigravity.enabled = true;
-        let plan = engine_plan(&s, false);
+        let plan = engine_plan(&s, false, false);
         let ag = plan
             .engines
             .iter()
@@ -284,7 +288,7 @@ mod tests {
         let mut s = bare();
         s.google.enabled = true;
         s.active_engine = "google".into();
-        assert_eq!(engine_plan(&s, false).selection, ActiveSelection::Resolved);
+        assert_eq!(engine_plan(&s, false, false).selection, ActiveSelection::Resolved);
     }
 
     /// The silent-dictation-failure case: the user selects Google, then turns
@@ -295,7 +299,7 @@ mod tests {
         let mut s = bare();
         s.google.enabled = false;
         s.active_engine = "google".into();
-        assert_eq!(engine_plan(&s, false).selection, ActiveSelection::Missing);
+        assert_eq!(engine_plan(&s, false, false).selection, ActiveSelection::Missing);
     }
 
     /// Same trap through a custom provider: its id is in the config but the
@@ -304,14 +308,14 @@ mod tests {
     fn a_deleted_custom_provider_is_reported_as_missing() {
         let mut s = bare();
         s.active_engine = "my-local".into();
-        assert_eq!(engine_plan(&s, false).selection, ActiveSelection::Missing);
+        assert_eq!(engine_plan(&s, false, false).selection, ActiveSelection::Missing);
     }
 
     #[test]
     fn auto_is_never_missing() {
         let mut s = bare();
         s.active_engine = "auto".into();
-        assert_eq!(engine_plan(&s, false).selection, ActiveSelection::Auto);
+        assert_eq!(engine_plan(&s, false, false).selection, ActiveSelection::Auto);
     }
 
     /// A disabled cloud engine does not count as "the engine you picked", even
@@ -320,7 +324,7 @@ mod tests {
     fn a_keyless_selected_cloud_engine_is_missing() {
         let mut s = with_cloud("");
         s.active_engine = "groq".into();
-        assert_eq!(engine_plan(&s, false).selection, ActiveSelection::Missing);
+        assert_eq!(engine_plan(&s, false, false).selection, ActiveSelection::Missing);
     }
 
     /// The measured fix for the discovery churn: the long pause requires *both*
@@ -339,7 +343,7 @@ mod tests {
         let mut s = with_cloud("sk-test");
         s.custom_providers = vec![custom("a"), custom("b")];
         s.antigravity.enabled = true;
-        let plan = engine_plan(&s, false);
+        let plan = engine_plan(&s, false, false);
         assert_eq!(plan.cloud_provider(), Some("groq"));
         assert_eq!(plan.custom_ids(), vec!["a", "b"]);
         assert!(plan.wants_antigravity_probe());
@@ -350,7 +354,7 @@ mod tests {
     /// subprocess churn comes back for users who never installed it.
     #[test]
     fn a_disabled_antigravity_wants_no_probe() {
-        assert!(!engine_plan(&bare(), false).wants_antigravity_probe());
+        assert!(!engine_plan(&bare(), false, false).wants_antigravity_probe());
     }
 
     fn selected_and_available() -> bool {

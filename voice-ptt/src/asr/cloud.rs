@@ -36,13 +36,31 @@ pub struct CloudEngine {
 }
 
 impl CloudEngine {
-    /// Builds the engine. The `VOICE_PTT_CLOUD_KEY` env var takes precedence
-    /// over `config.api_key` so the key never has to touch disk.
+    /// Builds the engine. Precedence, highest first: the
+    /// `VOICE_PTT_CLOUD_KEY` env var, then the credential store, then
+    /// `config.api_key`.
+    ///
+    /// The env var is the per-launch override and the escape hatch for a
+    /// machine with no Credential Manager; the store is where the key lives
+    /// after [`crate::credentials_resolver`] has migrated it out of the settings
+    /// file; `config.api_key` is read **last** and only as a fallback, so a
+    /// machine whose migration failed keeps working from the old place instead
+    /// of losing its key.
+    ///
+    /// `config.api_key` is deliberately not overwritten with the resolved key.
+    /// `CloudConfig` is built from `Settings`, and `Settings::save` is called by
+    /// several unrelated code paths — putting the resolved key back into it would
+    /// write the plaintext straight back to `config.toml` on the next save.
     /// `usage_path` persists the daily request counter across restarts.
     pub fn new(mut config: CloudConfig, usage_path: PathBuf) -> Self {
         if let Ok(key) = std::env::var("VOICE_PTT_CLOUD_KEY") {
             if !key.trim().is_empty() {
                 config.api_key = key;
+            }
+        }
+        if config.api_key.trim().is_empty() {
+            if let Some(stored) = crate::credentials_resolver::cloud_key() {
+                config.api_key = stored.expose_secret().to_string();
             }
         }
         let resolved_key = config.api_key.trim().to_string();

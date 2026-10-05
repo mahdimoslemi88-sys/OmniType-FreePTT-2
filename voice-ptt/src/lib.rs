@@ -9,6 +9,8 @@
 pub mod asr;
 pub mod audio;
 pub mod config;
+pub mod credentials;
+pub mod credentials_resolver;
 pub mod doctor;
 pub mod gui;
 pub mod hotkey;
@@ -134,7 +136,19 @@ pub fn run_doctor() -> std::path::PathBuf {
     let config_path = paths::resolve_config_path();
     let settings = Settings::load_or_create(&config_path).unwrap_or_default();
     let hotkeys = HotkeyListener::config_from_settings(&settings.hotkey);
-    let diagnosis = doctor::diagnose(&settings, &hotkeys, cloud_key_in_env(), &config_path);
+    let env_key = cloud_key_in_env();
+    // The doctor must not *perform* the migration — it runs to explain a
+    // broken install, and rewriting the user's key file as a side effect of
+    // asking what is wrong is exactly the wrong time. It only needs to know
+    // whether a key is already in the store, which is a plain read.
+    let store_has_key = credentials_resolver::store_holds_cloud_key();
+    let diagnosis = doctor::diagnose(
+        &settings,
+        &hotkeys,
+        env_key,
+        store_has_key,
+        &config_path,
+    );
     doctor::write_default(&diagnosis)
 }
 
@@ -171,6 +185,30 @@ pub fn run() -> Result<()> {
         "settings",
         &format!("config path: {}", config_path.display()),
     );
+
+    // ---- credential migration (A1) ----------------------------------------
+    // Before anything reads the cloud key. A plaintext key in `config.toml`
+    // is copied into the Windows Credential Manager and only then removed from
+    // the file, with a read-back verification in between — so an interrupted
+    // run leaves the key in both places rather than in neither. The resolved
+    // key lands in the resolver's process slot, which is what the engine
+    // planner and `asr::cloud` read from.
+    let migration = credentials_resolver::migrate_on_startup(&config_path, &settings.cloud.api_key);
+    if migration.migrated || migration.conflict.is_some() || migration.store_failed.is_some() {
+        tracing::info!(summary = %migration.summary(), "credential migration");
+        logging::stage("credentials", &migration.summary());
+    }
+    // A migrated key must also disappear from the in-memory copy, or the rest
+    // of this process would keep logging and re-saving the plaintext we just
+    // removed from disk.
+    if migration.migrated {
+        settings_rwlock
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .cloud
+            .api_key
+            .clear();
+    }
 
     // ---- models (the only network access in the app) ----------------------
     // The model NAME is resolved up front, but the (possibly very large)
@@ -209,10 +247,17 @@ pub fn run() -> Result<()> {
     // right away; the big model streams in behind the UI.
     let (hk_tx, hk_rx) = std::sync::mpsc::channel::<HotkeyEvent>();
     let hotkey_config = HotkeyListener::config_from_settings(&settings.hotkey);
+    let env_key = cloud_key_in_env();
     // A hotkey the settings could not supply is replaced by the built-in
     // default so push-to-talk still works, but the user gets a working app on
     // the wrong key. Written to a readable file, not just a log nobody opens.
-    let diagnosis = doctor::diagnose(&settings, &hotkey_config, cloud_key_in_env(), &config_path);
+    let diagnosis = doctor::diagnose(
+        &settings,
+        &hotkey_config,
+        env_key,
+        credentials_resolver::cloud_key_is_stored_or_env(env_key),
+        &config_path,
+    );
     let report_path = doctor::write_default(&diagnosis);
     let tray_warning = gui::tray_warning::TrayWarning::new(&diagnosis, report_path.clone());
     if diagnosis.verdict != doctor::Verdict::Clean {
@@ -332,7 +377,11 @@ pub fn run() -> Result<()> {
     // lines of interleaved logging and `push` that nothing could check. The
     // environment read it needs happens here, at the one place that may touch
     // the environment.
-    let plan = asr::plan::engine_plan(&settings, cloud_key_in_env());
+    let plan = asr::plan::engine_plan(
+        &settings,
+        cloud_key_in_env(),
+        credentials_resolver::cloud_key_is_stored_or_env(cloud_key_in_env()),
+    );
     let want_cloud = plan.cloud_provider().is_some();
     let want_custom: Vec<String> = plan.custom_ids().iter().map(|s| s.to_string()).collect();
     let want_antigravity = plan.wants_antigravity_probe();
@@ -512,11 +561,18 @@ pub fn run() -> Result<()> {
     // ---- run the state machine ------------------------------------------------
     {
         let machine = machine.clone();
+        let exit_flags = flags.clone();
         rt.spawn(async move {
             // The panic guard is `state::machine_run::run_guarded`, and it is
             // unit-tested: a panic in the machine now has a test, which the
             // inline `match` this replaced never did.
             let exit = state::machine_run::run_guarded(machine.run(events_rx)).await;
+            // Whatever ended it, the window has to hear about it from here. The
+            // GUI holds its own sender, so a dead machine is invisible to it:
+            // sends keep succeeding into a channel with no reader, and the orb
+            // goes on accepting clicks that do nothing. Saying so explicitly is
+            // what turns "the app is quietly broken" into "the app closed".
+            exit_flags.mark_machine_dead();
             match exit.level() {
                 logging::Severity::Info => tracing::info!("{}", exit.message()),
                 logging::Severity::Warn => tracing::warn!("{}", exit.message()),
@@ -526,6 +582,17 @@ pub fn run() -> Result<()> {
     }
 
     logging::stage("gui", "entering GUI event loop");
+
+    // The microphone gate, built while `machine` is still borrowed. Taken here
+    // because the machine owns the status channel the gate answers from; the
+    // dashboard gets this instance rather than making its own.
+    let mic_gate = machine.mic_gate();
+
+    // The review/recovery wire, from the same place and for the same reason: the
+    // window that asks about text and the loop that types it must share one
+    // store, or each can say "nothing is waiting" while the other holds a
+    // dictation.
+    let review = machine.review_channel();
 
     // ---- GUI (main thread) ------------------------------------------------------
     // Window geometry, fonts and visuals live in `gui::bootstrap` so they can
@@ -543,9 +610,15 @@ pub fn run() -> Result<()> {
         boot_warning: tray_warning.clone(),
         dictionary: dictionary.clone(),
         router: router.clone(),
+        mic_gate: mic_gate.clone(),
+        review: review.clone(),
     })?;
 
     // GUI closed → clean shutdown.
+    // The gate is told first: a test that starts during teardown would grab a
+    // device the runtime is about to take away, and the resulting failure would
+    // look like a microphone fault rather than a shutdown race.
+    mic_gate.mark_shutting_down();
     listener.stop();
     let _ = events_tx.send(HotkeyEvent::Quit);
     rt.shutdown_timeout(std::time::Duration::from_secs(2));

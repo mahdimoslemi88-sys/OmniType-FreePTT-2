@@ -163,7 +163,13 @@ pub(crate) enum Effect {
     /// Stop capture, transcribe and type, and end the session.
     FinishSession,
     /// Throw the buffer away and end the session *without* transcribing.
-    DiscardSession,
+    ///
+    /// The id is carried rather than looked up when the effect is performed,
+    /// because "the newest open session" is the wrong thing to close by then: a
+    /// new dictation can start while the old one is still being transcribed, and
+    /// the cancel belongs to the session the user was looking at when they
+    /// pressed Escape.
+    DiscardSession(Option<SessionId>),
     /// Pull newly buffered audio and run the VAD over it.
     ///
     /// The one effect whose outcome is not known when it is emitted: it may end
@@ -368,12 +374,24 @@ impl SessionDriver {
     }
 
     /// The user abandoned the session.
-    pub fn cancelled(&mut self) {
-        if let Some(id) = self.open.last().map(|s| s.id) {
-            self.close(id, SessionPhase::Cancelled);
+    pub fn cancelled(&mut self, id: Option<SessionId>) {
+        let Some(id) = id else {
+            return;
+        };
+        // Only the session that was actually recording may take the recording
+        // flag and the hands-free badge down with it. A cancel aimed at a
+        // session that is merely waiting for its result must leave both alone:
+        // a newer dictation may be recording right now, and clearing the flag
+        // would silently stop it.
+        let was_recording = self
+            .open
+            .iter()
+            .any(|s| s.id == id && matches!(s.phase, SessionPhase::Recording));
+        self.close(id, SessionPhase::Cancelled);
+        if was_recording {
+            self.recording = false;
+            self.latch.reset();
         }
-        self.recording = false;
-        self.latch.reset();
     }
 
     fn close(&mut self, id: SessionId, phase: SessionPhase) {
@@ -407,12 +425,18 @@ impl SessionDriver {
 
     /// The user asked to abandon the utterance (Escape / tray).
     pub fn on_cancel(&mut self) -> Vec<Effect> {
-        if !self.recording {
+        // Cancel has to reach a session that has already stopped recording and is
+        // waiting for its last result. That is the ordinary case for the moment a
+        // user reaches for Escape: the app is busy *because* it is converting. A
+        // rule that only fires while the microphone is open answers nothing they
+        // asked for, and then the late result lands anyway.
+        let target = self.open.last().map(|s| s.id);
+        if target.is_none() {
             return Vec::new();
         }
         self.recording = false;
         self.latch.reset();
-        vec![Effect::DiscardSession]
+        vec![Effect::DiscardSession(target)]
     }
 
     /// The 20 ms tick.
@@ -726,7 +750,7 @@ mod tests {
         let mut d = SessionDriver::new(&hotkey());
         let id = d.open_session(true).unwrap();
         d.next_chunk(id);
-        d.cancelled();
+        d.cancelled(Some(id));
 
         assert_eq!(d.phase_of(id), Some(SessionPhase::Cancelled));
         assert_eq!(
@@ -966,9 +990,9 @@ mod tests {
 
         let _ = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90));
-        let _ = press_and_open(&mut d, t0 + Duration::from_millis(200));
+        let live = press_and_open(&mut d, t0 + Duration::from_millis(200));
         assert!(d.latched());
-        assert_eq!(d.on_cancel(), vec![Effect::DiscardSession]);
+        assert_eq!(d.on_cancel(), vec![Effect::DiscardSession(Some(live))]);
         assert_quiet(&d);
     }
 
@@ -978,12 +1002,90 @@ mod tests {
     fn cancel_drops_a_pending_tap_so_no_tick_finalises_afterwards() {
         let mut d = SessionDriver::new(&hotkey());
         let t0 = Instant::now();
-        let _ = press_and_open(&mut d, t0);
+        let tap = press_and_open(&mut d, t0);
         d.on_record_up(t0 + Duration::from_millis(90)); // pending tap
-        assert_eq!(d.on_cancel(), vec![Effect::DiscardSession]);
+        assert_eq!(d.on_cancel(), vec![Effect::DiscardSession(Some(tap))]);
         for i in 1..=100 {
             assert_eq!(d.on_tick(t0 + Duration::from_millis(20 * i)), vec![]);
         }
+    }
+
+    /// The gap this stage exists for: **Escape pressed while the last result is
+    /// still being converted.** Before this, `on_cancel` only fired while the
+    /// microphone was open, so the one moment a user reaches for Escape — the
+    /// app visibly busy — was the one moment it did nothing, and the text they
+    /// were trying to abandon arrived anyway.
+    #[test]
+    fn cancel_reaches_a_session_that_is_waiting_for_its_result() {
+        let mut d = SessionDriver::new(&hotkey());
+        let t0 = Instant::now();
+        let id = press_and_open(&mut d, t0);
+        d.on_record_up(t0 + Duration::from_millis(90));
+        // The machine closes the recording half when it ends the session; the
+        // driver is told, not asked, so the test has to say it too.
+        d.ended_session(id);
+        assert_eq!(d.phase_of(id), Some(SessionPhase::AwaitingResult));
+        assert!(
+            d.accepts_result(id).is_ok(),
+            "the ordinary final chunk is still wanted"
+        );
+
+        assert_eq!(d.on_cancel(), vec![Effect::DiscardSession(Some(id))]);
+        d.cancelled(Some(id));
+
+        assert_eq!(d.phase_of(id), Some(SessionPhase::Cancelled));
+        assert_eq!(
+            d.accepts_result(id),
+            Err("late result of a cancelled session")
+        );
+    }
+
+    /// A cancel must land on the session that was current when it was pressed.
+    /// The effect carries that id, because by the time it is performed a newer
+    /// dictation may already be open and "the newest session" would be the wrong
+    /// one to close.
+    #[test]
+    fn a_cancel_names_its_target_rather_than_the_newest_session() {
+        let mut d = SessionDriver::new(&hotkey());
+        let t0 = Instant::now();
+        let first = press_and_open(&mut d, t0);
+        d.on_record_up(t0 + Duration::from_millis(90));
+        d.ended_session(first);
+        assert_eq!(d.phase_of(first), Some(SessionPhase::AwaitingResult));
+
+        // A second dictation starts while the first is still converting.
+        let second = press_and_open(&mut d, t0 + Duration::from_millis(200));
+        assert_eq!(d.current_session(), Some(second));
+
+        // The cancel still names the session the user was looking at.
+        let effects = d.on_cancel();
+        assert_eq!(effects, vec![Effect::DiscardSession(Some(second))]);
+    }
+
+    /// Cancelling an *old* session must not disturb a newer one: the recording
+    /// flag and the hands-free badge belong to the session that has them, not to
+    /// whichever one a cancel happens to name.
+    #[test]
+    fn cancelling_an_old_session_leaves_a_new_recording_alone() {
+        let mut d = SessionDriver::new(&hotkey());
+        let t0 = Instant::now();
+        let old = press_and_open(&mut d, t0);
+        d.on_record_up(t0 + Duration::from_millis(90));
+        d.ended_session(old);
+        let new = press_and_open(&mut d, t0 + Duration::from_millis(200));
+
+        d.cancelled(Some(old));
+
+        assert_eq!(d.phase_of(old), Some(SessionPhase::Cancelled));
+        assert_eq!(
+            d.phase_of(new),
+            Some(SessionPhase::Recording),
+            "the newer dictation must not be dragged backwards"
+        );
+        assert!(
+            d.is_recording(),
+            "the recording flag belongs to the live session, not the cancelled one"
+        );
     }
 
     /// A capture device that disappears mid-dictation must not leave the

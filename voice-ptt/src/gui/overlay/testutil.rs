@@ -46,6 +46,10 @@ pub(crate) fn app() -> OverlayApp {
         crate::updates::new_shared_state(),
         None,
         None,
+        Arc::new(crate::audio::gate::LiveMicGate::new(Arc::new(
+            crate::state::StatusChannel::new("silero"),
+        ))),
+        crate::state::ReviewChannel::new(),
     )
 }
 

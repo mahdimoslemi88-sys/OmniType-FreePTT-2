@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use crate::output::Injection;
 use crate::processing::seam::SeamMerge;
 
 use super::status::AppState;
@@ -100,6 +101,65 @@ pub(crate) fn plan_typing(raw: &str, merge: &SeamMerge) -> TypePlan {
         text: merge.text.clone(),
         backspaces: merge.backspaces,
     }
+}
+
+/// What one insert achieved, in the only terms that can honestly be known.
+///
+/// Four cases, and the three that are *not* `Complete` are the point. A send
+/// that the platform only partly took is never called a success, and it is
+/// never repeated: the accepted half is already in the document, so asking
+/// again would type the whole text a second time.
+///
+/// The count is in **keystroke pairs**, deliberately not in characters that
+/// "landed". `SendInput` reports the input records the system accepted, which
+/// is the last honest step before the document, and a reader who sees
+/// `Complete { accepted_pairs: 12 }` should not conclude that twelve letters
+/// are sitting in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InjectOutcome {
+    /// Every down/up pair the platform was asked for was accepted.
+    Complete { accepted_pairs: usize },
+    /// Some pairs went out and delivery then stopped. The torn remainder's fate
+    /// is unknown, so this is reported and never re-sent.
+    Partial { accepted_pairs: usize },
+    /// The platform accepted nothing at all.
+    Failed,
+    /// Nothing was asked: the destination refused, or there was no text.
+    NotAttempted,
+}
+
+impl InjectOutcome {
+    /// Whether the document can be believed to hold what was sent.
+    ///
+    /// Only `Complete` can. Everything else leaves the tail of the text unknown,
+    /// and anything built on that tail — the seam memory above all — has to be
+    /// thrown away rather than believed.
+    pub(crate) fn is_whole(self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+}
+
+/// Folds the sends of one insert — the seam erase, then the text — into the
+/// single verdict the loop may report.
+///
+/// `steps` is what the platform actually said, in the order it was asked, so an
+/// empty list is a destination that refused before the first key. The fold is
+/// cumulative on purpose: an erase that went out whole followed by a text that
+/// did not is `Partial`, not `Failed`, because "a word was erased" and "nothing
+/// happened" are different states of the user's document and only the second one
+/// is safe to treat as a clean slate.
+pub(crate) fn judge_insert(steps: &[Injection]) -> InjectOutcome {
+    if steps.is_empty() {
+        return InjectOutcome::NotAttempted;
+    }
+    let accepted_pairs: usize = steps.iter().map(|step| step.pairs()).sum();
+    if steps.iter().all(|step| step.whole_pairs()) {
+        return InjectOutcome::Complete { accepted_pairs };
+    }
+    if accepted_pairs == 0 {
+        return InjectOutcome::Failed;
+    }
+    InjectOutcome::Partial { accepted_pairs }
 }
 
 /// Whether the visible state is a failure that must clear itself.
@@ -252,5 +312,82 @@ mod tests {
         let l = AudioLevels::measure(&samples);
         assert!((l.peak - 1.0).abs() < 1e-6);
         assert!(l.rms < 0.2, "rms {}", l.rms);
+    }
+
+    // ── the insert verdict ────────────────────────────────────────────────
+
+    /// A send the platform took whole: `pairs`, never "characters typed".
+    fn whole(pairs: usize) -> Injection {
+        Injection {
+            total_events: pairs * 2,
+            attempted: pairs * 2,
+            accepted: pairs * 2,
+            stopped: None,
+        }
+    }
+
+    /// A send that stopped after `took` events out of the `wanted` it needed.
+    fn short(took: usize, wanted: usize) -> Injection {
+        Injection {
+            total_events: wanted,
+            attempted: wanted,
+            accepted: took,
+            stopped: Some(format!("took {took} of {wanted}")),
+        }
+    }
+
+    /// The whole table, as one test on purpose: the four verdicts differ only
+    /// in the shape of what the platform reported, and a table that is read in
+    /// four places is a table where two rows can start disagreeing.
+    #[test]
+    fn the_insert_verdict_follows_the_reports_and_nothing_else() {
+        // Nothing was asked, so nothing can be claimed.
+        assert_eq!(judge_insert(&[]), InjectOutcome::NotAttempted);
+
+        // Both sends whole.
+        assert_eq!(
+            judge_insert(&[whole(5), whole(9)]),
+            InjectOutcome::Complete { accepted_pairs: 14 }
+        );
+
+        // The erase went out, the text did not: partial, and the accepted half
+        // is still named so the caller does not have to guess what is in there.
+        assert_eq!(
+            judge_insert(&[whole(5), short(0, 18)]),
+            InjectOutcome::Partial { accepted_pairs: 5 }
+        );
+
+        // Neither went out.
+        assert_eq!(
+            judge_insert(&[short(0, 10), short(0, 18)]),
+            InjectOutcome::Failed
+        );
+
+        // A torn pair is not a success, and its remainder is not counted.
+        assert_eq!(
+            judge_insert(&[Injection {
+                total_events: 3,
+                attempted: 3,
+                accepted: 3,
+                stopped: None
+            }]),
+            InjectOutcome::Partial { accepted_pairs: 1 }
+        );
+
+        // An erase alone, stopped halfway.
+        assert_eq!(
+            judge_insert(&[short(3, 10)]),
+            InjectOutcome::Partial { accepted_pairs: 1 }
+        );
+    }
+
+    /// The default of an unused option must not read as a success. `None` in the
+    /// seam's words is the neutral value, and mapping it onto "delivered" is the
+    /// same mistake as mapping an uncaptured destination onto "allowed".
+    #[test]
+    fn a_default_report_is_a_whole_send_of_nothing() {
+        let report = Injection::default();
+        assert!(report.whole_pairs());
+        assert_eq!(report.pairs(), 0);
     }
 }

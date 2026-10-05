@@ -81,6 +81,28 @@ impl SettingsPanelState {
 /// The dependencies are the ones the tab genuinely does not own: the live
 /// settings (the draft is a copy), the running hotkey listener it re-binds,
 /// where `config.toml` lives, and the shared update state it reports on.
+/// The three orb controls the settings card edits, plus one command button.
+///
+/// A plain struct rather than a callback per field: the panel edits values, and
+/// the overlay decides what a changed value means. Keeping them in one place is
+/// what stops the panel from reaching into the orb — the whole reason
+/// [`crate::gui::orb_idle_policy`] is a separate decision-making type.
+#[derive(Debug, Clone)]
+pub struct OrbControls {
+    pub return_enabled: bool,
+    pub return_after_idle_secs: u64,
+    pub pinned: bool,
+    /// Which corner the orb walks back to. The user's, because the sensible
+    /// corner depends on where their taskbar is — a bottom-right corner is the
+    /// out-of-the-way one on a machine whose taskbar is at the bottom.
+    pub return_corner: String,
+    /// Size as a percentage of the shipped size.
+    pub scale_percent: u32,
+    /// Set by the button, read and cleared by the overlay. A flag rather than a
+    /// closure so the panel never needs a handle on the app.
+    pub return_to_manual: bool,
+}
+
 pub(crate) fn render(
     ui: &mut egui::Ui,
     state: &mut SettingsPanelState,
@@ -88,6 +110,7 @@ pub(crate) fn render(
     hotkey: Option<&HotkeyControl>,
     config_path: &Path,
     update_state: &SharedUpdateState,
+    orb_controls: Option<&mut OrbControls>,
 ) {
     // Hotkey capture: if a field is armed, the next chord the user presses
     // becomes the new binding. The chord is read by the *global* keyboard
@@ -412,6 +435,24 @@ pub(crate) fn render(
                                 &mut state.draft.gui.show_overlay,
                                 format_persian_display("نمایش کپسول شناور"),
                             );
+                            ui.add_space(4.0);
+                            // Off by default, and the tooltip says why: the burst
+                            // form fails *visibly and early* when the platform
+                            // refuses input, which pacing trades away.
+                            ui.checkbox(
+                                &mut state.draft.gui.type_progressively,
+                                format_persian_display("تایپ تدریجی متن"),
+                            )
+                            .on_hover_text(
+                                "type each dictation word by word instead of all at once.\nOff by default: one burst fails visibly if the platform refuses input,\nwhich pacing gives up.",
+                            );
+                            ui.checkbox(
+                                &mut state.draft.gui.review_before_insert,
+                                format_persian_display("بازبینی متن پیش از درج"),
+                            )
+                            .on_hover_text(
+                                "show the finished text before it is typed, so it can be edited, inserted, copied or dropped.\nOff by default: direct typing is what makes a dictation feel like talking.\nThis does not affect recovery — text whose insert failed is always offered.",
+                            );
                         });
 
                         ui.add_space(8.0);
@@ -628,6 +669,136 @@ pub(crate) fn render(
                                     .suffix(" s"),
                                 );
                             });
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            // ── Orb return (بازگشت اورب) ──
+                            // Three controls and no more. Each one exists
+                            // because the roadmap asks for it; anything beyond
+                            // these (a corner picker, a monitor picker) would
+                            // be a second place to configure the same policy,
+                            // and two places to configure one thing means one
+                            // of them is wrong.
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    format_persian_display("بازگشت اورب به گوشه"),
+                                    ic::ARROW_BEND_DOWN_RIGHT
+                                ))
+                                .size(12.0)
+                                .strong()
+                                .color(palette::TEXT_SECTION),
+                            );
+                            ui.add_space(6.0);
+
+                            match orb_controls {
+                                // No controls (a test without a real orb): say
+                                // so rather than drawing rows that do nothing.
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new(format_persian_display(
+                                            "کنترل اورب در این نشست فعال نیست.",
+                                        ))
+                                        .size(10.5)
+                                        .color(palette::TEXT_FAINT),
+                                    );
+                                }
+                                Some(controls) => {
+                                    let orb_label_w = 105.0;
+                                    rtl_form_row(
+                                        ui,
+                                        "بازگشت خودکار:",
+                                        orb_label_w,
+                                        |ui| {
+                                            ui.checkbox(
+                                                &mut controls.return_enabled,
+                                                format_persian_display("پس از بی‌کاری به گوشه برگردد"),
+                                            );
+                                        },
+                                    );
+                                    ui.add_space(4.0);
+                                    rtl_form_row(ui, "زمان بی‌کاری:", orb_label_w, |ui| {
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut controls.return_after_idle_secs,
+                                                10..=600,
+                                            )
+                                            .suffix(" s")
+                                            .fixed_decimals(0),
+                                        )
+                                        .on_hover_text(
+                                            "how long the orb waits before going back to its corner",
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    rtl_form_row(ui, "ثابت کردن:", orb_label_w, |ui| {
+                                        ui.checkbox(
+                                            &mut controls.pinned,
+                                            format_persian_display(
+                                                "اورب همان‌جا که کاربر گذاشت بماند",
+                                            ),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    // The corner used to be fixed to top-right, so
+                                    // the orb always walked *up* no matter where
+                                    // the user had put it. On a machine whose
+                                    // taskbar is at the bottom, bottom-right is the
+                                    // corner that is actually out of the way.
+                                    rtl_form_row(ui, "گوشهٔ بازگشت:", orb_label_w, |ui| {
+                                        let labels = [
+                                            ("top_right", "بالا-راست"),
+                                            ("top_left", "بالا-چپ"),
+                                            ("bottom_right", "پایین-راست"),
+                                            ("bottom_left", "پایین-چپ"),
+                                        ];
+                                        let selected = labels
+                                            .iter()
+                            .find(|(value, _)| *value == controls.return_corner)
+                            .map(|(_, label)| *label)
+                            .unwrap_or(labels[0].1);
+                        egui::ComboBox::from_id_source("orb_return_corner")
+                            .selected_text(format_persian_display(selected))
+                            .show_ui(ui, |ui| {
+                                for (value, label) in labels {
+                                    if ui
+                                        .selectable_label(
+                                            controls.return_corner == value,
+                                            format_persian_display(label),
+                                        )
+                                        .clicked()
+                                    {
+                                        controls.return_corner = value.to_string();
+                                    }
+                                }
+                            });
+                    });
+                    ui.add_space(4.0);
+                    // One number for the whole orb: drawing, click target and
+                    // window margin together, because a drawing whose click
+                    // target stayed the old size is an orb you cannot reliably
+                    // click.
+                    rtl_form_row(ui, "اندازهٔ اورب:", orb_label_w, |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut controls.scale_percent, 60..=200)
+                                .suffix(" %")
+                                .fixed_decimals(0),
+                        )
+                        .on_hover_text("how large the orb is drawn and how large a click it answers");
+                    });
+                    ui.add_space(6.0);
+                                    if ui
+                                        .button(egui::RichText::new(format_persian_display(
+                                            "بازگرداندن به محل قبلی",
+                                        )))
+                                        .clicked()
+                                    {
+                                        controls.return_to_manual = true;
+                                    }
+                                }
+                            }
                         });
 
                         ui.add_space(8.0);

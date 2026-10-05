@@ -94,6 +94,16 @@ pub fn classify(expected: &TargetIdentity, observed: Observation) -> TargetValid
 }
 
 /// Records the window currently in front, to be re-checked before every insert.
+///
+/// **One dictation at a time, and the loop does not use it.** A single tracker
+/// holds one destination, so a second recording would overwrite the first one's
+/// — and an older answer can land after a newer dictation has started. The
+/// loop keeps one destination *per session id* instead
+/// ([`crate::state::coordinator`]), and captures through [`capture_target`] and
+/// re-checks with [`validate_target`]. What stays here is the decision table and
+/// this type, which is still the right shape for a single dictation — a tray
+/// action or a script, say — and is left alone so it cannot be mistaken for the
+/// loop's own bookkeeping.
 #[derive(Debug, Default)]
 pub struct TargetTracker {
     current: Option<TargetIdentity>,

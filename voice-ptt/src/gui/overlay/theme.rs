@@ -325,10 +325,15 @@ pub(crate) fn success_banner(ui: &mut egui::Ui, msg: &str) {
 
 /// Callout severity. Maps to a palette surface/stroke pair and a phosphor
 /// glyph, so the three variants stay visually distinct in both themes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CalloutKind {
     Info,
     Warning,
+    /// A measurement that came out well. Added for the mic test, where "no
+    /// action needed" is a real answer and deserves the same visual weight as
+    /// the two unhappy ones — otherwise every good result has to be spelled
+    /// out in the body text to avoid being mistaken for a warning.
+    Success,
 }
 
 impl CalloutKind {
@@ -336,6 +341,7 @@ impl CalloutKind {
         match self {
             Self::Info => ic::INFO,
             Self::Warning => ic::WARNING,
+            Self::Success => ic::CHECK_CIRCLE,
         }
     }
 
@@ -350,6 +356,11 @@ impl CalloutKind {
                 palette::CALLOUT_WARN_BG,
                 palette::CALLOUT_WARN_STROKE,
                 palette::WARNING,
+            ),
+            Self::Success => (
+                palette::CALLOUT_INFO_BG,
+                palette::CALLOUT_INFO_STROKE,
+                palette::SUCCESS,
             ),
         }
     }

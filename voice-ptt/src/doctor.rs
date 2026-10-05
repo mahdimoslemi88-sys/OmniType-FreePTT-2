@@ -130,14 +130,17 @@ pub struct Diagnosis {
     /// made `Broken` mean "no cloud API key" the tray would quietly send a
     /// cloud-key user to a page that cannot fix it. The fact outlives the label.
     pub active_engine_missing: bool,
-    /// Whether the API key came from the environment rather than the file. The
-    /// report deliberately does not print either value.
+    /// Whether the API key came from the credential store, the environment, or
+    /// the plaintext config file. The report deliberately does not print the
+    /// value itself, only where it lives.
     pub cloud_key_source: KeySource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     ConfigFile,
+    /// The Windows Credential Manager, which is where a migrated key lives.
+    CredentialStore,
     Environment,
     Missing,
 }
@@ -145,7 +148,8 @@ pub enum KeySource {
 impl KeySource {
     fn label(self) -> &'static str {
         match self {
-            KeySource::ConfigFile => "config.toml",
+            KeySource::ConfigFile => "config.toml (plaintext — consider migrating it)",
+            KeySource::CredentialStore => "Windows Credential Manager",
             KeySource::Environment => "VOICE_PTT_CLOUD_KEY environment variable",
             KeySource::Missing => "nowhere",
         }
@@ -157,9 +161,10 @@ pub fn diagnose(
     settings: &Settings,
     hotkeys: &HotkeyConfig,
     cloud_key_in_env: bool,
+    cloud_key_in_store: bool,
     config_path: &Path,
 ) -> Diagnosis {
-    let plan = engine_plan(settings, cloud_key_in_env);
+    let plan = engine_plan(settings, cloud_key_in_env, cloud_key_in_store);
     let mut problems: Vec<String> = hotkeys.problems().iter().map(|p| p.message()).collect();
 
     if plan.selection == ActiveSelection::Missing {
@@ -169,7 +174,9 @@ pub fn diagnose(
             settings.active_engine
         ));
     }
-    if settings.cloud.enabled && key_source(settings, cloud_key_in_env) == KeySource::Missing {
+    if settings.cloud.enabled
+        && key_source(settings, cloud_key_in_env, cloud_key_in_store) == KeySource::Missing
+    {
         problems.push(
             "The cloud ASR engine is enabled but has no API key in config.toml and none in \
              VOICE_PTT_CLOUD_KEY, so it is not registered."
@@ -209,14 +216,23 @@ pub fn diagnose(
             ),
             HotkeyLine::new(HotkeyRole::Quit, &settings.hotkey.quit, hotkeys.problems()),
         ],
-        cloud_key_source: key_source(settings, cloud_key_in_env),
+        cloud_key_source: key_source(settings, cloud_key_in_env, cloud_key_in_store),
     }
 }
 
 /// Where the cloud key comes from — never its value.
-fn key_source(settings: &Settings, cloud_key_in_env: bool) -> KeySource {
+fn key_source(
+    settings: &Settings,
+    cloud_key_in_env: bool,
+    cloud_key_in_store: bool,
+) -> KeySource {
     if !settings.cloud.api_key.trim().is_empty() {
         KeySource::ConfigFile
+    } else if cloud_key_in_store {
+        // Checked before the environment on purpose: the store is the durable
+        // home for the key, and a stray env var should not make the report
+        // claim the durable copy is gone.
+        KeySource::CredentialStore
     } else if cloud_key_in_env {
         KeySource::Environment
     } else {
@@ -311,7 +327,7 @@ mod tests {
     }
 
     fn diag(settings: &Settings, hotkeys: &HotkeyConfig, env: bool) -> Diagnosis {
-        diagnose(settings, hotkeys, env, Path::new("C:/x/config.toml"))
+        diagnose(settings, hotkeys, env, false, Path::new("C:/x/config.toml"))
     }
 
     /// The report must say which key the app is *actually* listening for. The

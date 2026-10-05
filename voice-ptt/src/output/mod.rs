@@ -3,5 +3,11 @@
 pub mod injector;
 pub mod target;
 
-pub use injector::{inject_backspaces, inject_text, press_enter};
-pub use target::{TargetIdentity, TargetTracker, TargetValidity};
+pub use injector::{
+    inject_backspaces, inject_backspaces_with, inject_text, inject_text_paced,
+    inject_text_paced_with, inject_text_with, press_enter, Injection,
+};
+pub use target::{
+    capture_target, classify, validate_target, Observation, TargetIdentity, TargetTracker,
+    TargetValidity,
+};

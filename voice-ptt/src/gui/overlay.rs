@@ -23,6 +23,8 @@
 mod dict_panel;
 mod engine_panel;
 mod history_panel;
+mod mic_test_panel;
+mod review_panel;
 mod settings_panel;
 #[cfg(test)]
 mod tests;
@@ -47,6 +49,8 @@ pub use text::format_persian_display;
 use crate::asr::router::AsrRouter;
 use crate::config::settings::Settings;
 use crate::gui::flags::{DashboardFlags, Toggle};
+use crate::gui::orb_idle_adapter;
+use crate::gui::orb_idle_policy;
 use crate::gui::orb::{Orb, OrbMode};
 use crate::gui::preview_window;
 use crate::gui::window_shape::{
@@ -57,8 +61,36 @@ use crate::hotkey::{HotkeyControl, HotkeyEvent};
 use crate::processing::Dictionary;
 use crate::state::{AppState, AppStatus};
 
-impl From<&AppState> for OrbMode {
-    fn from(state: &AppState) -> Self {
+/// Reads the idle-return settings out of the persisted config.
+///
+/// `0` is treated as "not chosen" and falls back to the policy's proposed
+/// default rather than becoming a zero-length timeout. The two are different
+/// things — a user who has never touched the setting and a user who set "return
+/// instantly" are not the same request, and only the latter has no sensible
+/// meaning, so it gets the default rather than a value that fights the pointer
+/// every frame.
+pub(crate) fn idle_settings_from(gui: &crate::config::settings::GuiSettings) -> orb_idle_policy::IdleReturnSettings {
+    orb_idle_policy::IdleReturnSettings {
+        enabled: gui.orb_return_enabled,
+        timeout: Duration::from_secs(match gui.orb_return_after_idle_secs {
+            0 => orb_idle_policy::PROPOSED_TIMEOUT.as_secs(),
+            secs => secs,
+        }),
+        // The retry gap is not a user setting: it exists to avoid hammering a
+        // move that just failed, and a user-visible knob for it would only
+        // offer them a way to make the orb give up sooner.
+        retry_delay: orb_idle_policy::IdleReturnSettings::default().retry_delay,
+        pinned: gui.orb_pinned,
+        // The corner is the user's, not ours. It used to be hardcoded to
+        // top-right, so on a machine whose taskbar is at the bottom the orb
+        // always travelled *up* to a corner that is not the out-of-the-way one
+        // — and there was no setting to say otherwise.
+        corner: gui.orb_return_corner_value(),
+        monitor: orb_idle_policy::MonitorChoice::FollowOrb,
+    }
+}
+
+impl From<&AppState> for OrbMode {    fn from(state: &AppState) -> Self {
         match state {
             AppState::Idle => OrbMode::Idle,
             AppState::Recording => OrbMode::Recording,
@@ -141,6 +173,12 @@ pub enum DashboardTab {
     Dictionary,
     History,
     Settings,
+    /// The gated microphone test. Its own tab rather than a corner of
+    /// Settings, because it *acts* (it opens the device) where the rest of
+    /// Settings only edits values — and a button that measures mixed in with
+    /// fields that merely persist invites the wrong assumption about which is
+    /// which.
+    MicTest,
 }
 
 impl DashboardTab {
@@ -151,6 +189,7 @@ impl DashboardTab {
             Self::Dictionary => "دیکشنری",
             Self::History => "تاریخچه",
             Self::Settings => "تنظیمات",
+            Self::MicTest => "میکروفون",
         }
     }
 
@@ -161,6 +200,7 @@ impl DashboardTab {
             Self::Dictionary => ic::BOOK_OPEN,
             Self::History => ic::CLOCK_COUNTER_CLOCKWISE,
             Self::Settings => ic::GEAR,
+            Self::MicTest => ic::MICROPHONE,
         }
     }
 }
@@ -223,6 +263,18 @@ pub struct OverlayApp {
     dict: dict_panel::DictPanelState,
     /// Settings tab: the unvalidated draft plus its UI state.
     settings_tab: settings_panel::SettingsPanelState,
+    /// Microphone test tab: the gated short capture and its measurement.
+    ///
+    /// The gate is shared with the state machine on purpose: a panel that
+    /// opened its own gate would be answering "is a dictation live?" from a
+    /// second channel, and could disagree with the orb.
+    mic_test: mic_test_panel::MicTestPanelState,
+    mic_gate: Arc<crate::audio::gate::LiveMicGate>,
+    /// The review/recovery window's state: the editable box and the draft it is
+    /// showing.
+    review_panel: review_panel::ReviewPanelState,
+    /// The wire shared with the loop, so drafts raised there are visible here.
+    review: Arc<crate::state::ReviewChannel>,
     /// True until the user picks an engine or downloads a local model.
     first_run_pending: bool,
     /// Cloud-consent gate: audio must not leave the machine until opt-in.
@@ -248,6 +300,14 @@ pub struct OverlayApp {
     /// cannot miss — and only if they look at the notification area.
     boot_warning: Option<crate::gui::tray_warning::TrayWarning>,
     pub orb: Orb,
+    /// Whether the orb should walk back to its corner after a spell of
+    /// inactivity, and how long that spell is. Pure decision-making: this holds
+    /// no window handle and moves nothing by itself.
+    idle_return: orb_idle_policy::IdlePolicy,
+    /// `pixels_per_point` as of the last rendered frame, so a command issued
+    /// outside the frame loop converts points to pixels with the *current*
+    /// scale rather than a stale one.
+    last_ppp: f32,
 }
 
 impl OverlayApp {
@@ -276,6 +336,8 @@ impl OverlayApp {
         update_state: crate::updates::SharedUpdateState,
         hotkey: Option<HotkeyControl>,
         boot_warning: Option<crate::gui::tray_warning::TrayWarning>,
+        mic_gate: Arc<crate::audio::gate::LiveMicGate>,
+        review: Arc<crate::state::ReviewChannel>,
     ) -> Self {
         let initial_visible = settings.read().map(|s| s.gui.show_overlay).unwrap_or(true);
 
@@ -284,6 +346,15 @@ impl OverlayApp {
             .ok()
             .and_then(|s| s.gui.orb_position_x.zip(s.gui.orb_position_y));
         let orb = Orb::new("OmniType", saved_orb_center);
+        let orb = {
+            let mut orb = orb;
+            // The user's size preference, applied before the first frame so the
+            // very first painted orb is already the size they chose.
+            if let Ok(s) = settings.read() {
+                orb.set_user_scale(s.gui.orb_scale());
+            }
+            orb
+        };
 
         Self {
             status,
@@ -319,6 +390,10 @@ impl OverlayApp {
             settings_tab: settings_panel::SettingsPanelState::from_settings(
                 &settings.read().map(|s| s.clone()).unwrap_or_default(),
             ),
+            mic_test: mic_test_panel::MicTestPanelState::new(),
+            mic_gate,
+            review_panel: review_panel::ReviewPanelState::default(),
+            review,
             first_run_pending: false,
             cloud_consent_given: false,
             show_consent_window: false,
@@ -328,6 +403,12 @@ impl OverlayApp {
             hotkey,
             boot_warning,
             orb,
+            idle_return: orb_idle_policy::IdlePolicy::new(
+                idle_settings_from(&settings.read().map(|s| s.gui.clone()).unwrap_or_default()),
+                Instant::now(),
+            ),
+            
+            last_ppp: 1.0,
         }
     }
 
@@ -398,6 +479,30 @@ impl OverlayApp {
     /// state around it. The four borrows are disjoint fields of `self`,
     /// which is what keeps the tab a free function.
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
+        // The controls are seeded from the policy, then written back after the
+        // panel has had them. Doing it in that order means the policy is the
+        // single source of truth for what the checkbox shows, and the panel
+        // never has to know whether a value was rejected by the policy.
+        let mut controls = settings_panel::OrbControls {
+            return_enabled: self.idle_return_enabled(),
+            return_after_idle_secs: self.idle_return.settings().timeout.as_secs(),
+            pinned: self.orb_is_pinned(),
+            // Seeded from the saved settings rather than from a default, so the
+            // panel opens showing what is actually in force. A control that
+            // opens on a value other than the live one overwrites it the moment
+            // the panel is drawn.
+            return_corner: self
+                .settings
+                .read()
+                .map(|s| s.gui.orb_return_corner.clone())
+                .unwrap_or_else(|_| "top_right".to_string()),
+            scale_percent: self
+                .settings
+                .read()
+                .map(|s| s.gui.orb_scale_percent)
+                .unwrap_or(100),
+            return_to_manual: false,
+        };
         settings_panel::render(
             ui,
             &mut self.settings_tab,
@@ -405,7 +510,262 @@ impl OverlayApp {
             self.hotkey.as_ref(),
             &self.config_path,
             &self.update_state,
+            Some(&mut controls),
         );
+        if controls.return_enabled != self.idle_return_enabled() {
+            self.set_idle_return_enabled(controls.return_enabled);
+        }
+        if controls.pinned != self.orb_is_pinned() {
+            self.set_orb_pinned(controls.pinned);
+        }
+        if controls.return_after_idle_secs != self.idle_return.settings().timeout.as_secs() {
+            self.set_idle_return_after_idle_secs(controls.return_after_idle_secs);
+        }
+        if std::mem::take(&mut controls.return_to_manual) {
+            self.return_orb_to_manual_spot();
+        }
+        // Corner and size go through the same settings-and-save path as the rest,
+        // so they survive a restart like every other preference.
+        if controls.return_corner != self.settings.read().map(|s| s.gui.orb_return_corner.clone()).unwrap_or_default() {
+            let corner = controls.return_corner.clone();
+            self.update_gui_settings(|gui| gui.orb_return_corner = corner.clone());
+            // Into the live policy too, not only on disk: the corner decides
+            // where the *next* idle return goes, and the policy holds its own
+            // copy of the settings.
+            let mut s = *self.idle_return.settings();
+            s.corner = self
+                .settings
+                .read()
+                .map(|g| g.gui.orb_return_corner_value())
+                .unwrap_or(orb_idle_policy::Corner::TopRight);
+            self.idle_return.set_settings(s);
+        }
+        if controls.scale_percent != self.settings.read().map(|s| s.gui.orb_scale_percent).unwrap_or(100) {
+            let pct = controls.scale_percent;
+            self.update_gui_settings(|gui| gui.orb_scale_percent = pct);
+            // Applied to the live orb as well as the saved value: a size the user
+            // has to restart to see is not a setting, it is a surprise.
+            if let Ok(s) = self.settings.read() {
+                self.orb.set_user_scale(s.gui.orb_scale());
+            }
+        }
+    }
+
+    /// Changes how long the orb waits before returning.
+    ///
+    /// A zero from the slider cannot reach here: the slider's range starts at
+    /// ten seconds. The guard is kept anyway because `0` is the *stored*
+    /// "not chosen" value and reading the slider back must never be able to
+    /// write it.
+    pub fn set_idle_return_after_idle_secs(&mut self, secs: u64) {
+        if secs == 0 {
+            return;
+        }
+        let mut settings = *self.idle_return.settings();
+        settings.timeout = Duration::from_secs(secs);
+        self.idle_return.set_settings(settings);
+        self.save_idle_return_settings(settings);
+    }
+
+    /// Delegates to [`mic_test_panel`], handing it the two fields it may touch
+    /// and a read-only clone of the settings it reads the device from. The
+    /// clone is deliberate: a test that could *write* `[audio]` would let a
+    /// diagnostic silently reconfigure the recorder.
+    fn render_mic_test_body(&mut self, ui: &mut egui::Ui) {
+        let settings = match self.settings.read() {
+            Ok(s) => s.clone(),
+            // A poisoned settings lock must not take the dashboard down with
+            // it; the tab simply says it cannot read the configuration.
+            Err(_) => {
+                callout(
+                    ui,
+                    CalloutKind::Warning,
+                    "تنظیمات قابل خواندن نیست؛ آزمون میکروفون اجرا نشد.",
+                );
+                return;
+            }
+        };
+        mic_test_panel::render(ui, &mut self.mic_test, &settings, self.mic_gate.clone());
+    }
+
+    /// Releases the microphone when the dashboard closes.
+    ///
+    /// Called from the dashboard's own hide path rather than relying on `Drop`:
+    /// a panel left holding a device is invisible to the user and only
+    /// discoverable when their next dictation fails to start.
+    pub fn release_mic_if_held(&mut self) {
+        let gate = self.mic_gate.clone();
+        self.mic_test.on_hidden(&gate);
+    }
+
+    /// Asks the idle-return policy whether the orb should go back to its corner,
+    /// and carries out a "yes".
+    ///
+    /// The split is deliberate: [`orb_idle_policy::IdlePolicy`] decides *whether*
+    /// and produces a request carrying an id, and this method is the only thing
+    /// that turns a request into a `SetWindowPos`. A move that cannot be
+    /// carried out is reported back as an outcome, because a policy that never
+    /// hears how its requests went would keep retrying the same impossible move
+    /// forever.
+    fn tick_idle_return(&mut self, ctx: &egui::Context, status: &AppStatus) {
+        let ppp = ctx.pixels_per_point();
+        let center = self.orb.home_position();
+        let orb_center = egui::Pos2::new(center.0 as f32, center.1 as f32);
+        let target = orb_idle_adapter::waiting_spot(self.idle_return.settings(), orb_center, ppp);
+
+        let activity = orb_idle_policy::Activity {
+            recording: matches!(status.state, AppState::Recording),
+            processing: matches!(status.state, AppState::Processing),
+            inserting: matches!(status.state, AppState::Typing),
+            dragging: self.orb.is_dragging(),
+            // Text the user still has to act on blocks the return: moving the orb
+            // away while a decision is pending hides the thing that needs it.
+            //
+            // Read from the shared store rather than a separate flag. There was
+            // an atomic here that nothing ever wrote — the recovery UI did not
+            // exist to write it — so this used to be permanently `false` and the
+            // blocker below was decorative. Answering it from the drafts
+            // themselves means the orb can never walk away from a pending text
+            // it does not know about, because there is only one place that
+            // decides what is pending.
+            pending_text: !self.review.snapshot().is_empty(),
+            // The dashboard being open is interaction by another name, and the
+            // orb is not even drawn then.
+            interacting: self.show_dashboard || self.is_hovered,
+        };
+
+        let now = Instant::now();
+        let decision = self.idle_return.evaluate(now, activity, target.as_ref());
+        let orb_idle_policy::Decision::Move(request) = decision else {
+            return;
+        };
+
+        // A **glide**, not a jump. `move_home_to` puts the orb at its
+        // destination inside one frame, which from the user's side is the orb
+        // vanishing and reappearing somewhere else — it reads as a glitch, not
+        // as the app tidying up. The spring that already carries the orb's hover
+        // and scale excursion carries this too, so there is no second animation
+        // that could drift out of sync with the first.
+        let reached = self
+            .orb
+            .glide_home_to(egui::Pos2::new(request.to.x as f32, request.to.y as f32), ppp);
+        // Keep painting until it arrives. Without this the loop can go idle after
+        // the frame that started the glide, leaving the orb a few pixels short of
+        // the corner rather than landing on it.
+        if self.orb.is_gliding() {
+            ctx.request_repaint();
+        }
+        let outcome = if reached {
+            orb_idle_policy::MoveOutcome::Success
+        } else {
+            orb_idle_policy::MoveOutcome::Failure
+        };
+        let ack = self.idle_return.report_move_result(now, request.id, outcome);
+        tracing::info!(
+            kind = ?request.kind,
+            to = ?request.to,
+            reached,
+            ack = ?ack,
+            "orb idle return"
+        );
+    }
+
+    /// "Take the orb back to where I put it", on demand.
+    ///
+    /// Separate from the automatic timeout on purpose: it is an explicit user
+    /// command, so it runs even when the feature is switched off or the spot is
+    /// pinned. Without a remembered spot there is nothing to go back to, and the
+    /// policy says so rather than falling back to the corner.
+    pub fn return_orb_to_manual_spot(&mut self) -> bool {
+        let decision = self.idle_return.ask_return_to_manual(Instant::now());
+        let orb_idle_policy::Decision::Move(request) = decision else {
+            tracing::info!("orb: asked to return to its manual spot, but there is none");
+            return false;
+        };
+        let ppp = self.last_ppp;
+        let reached = self
+            .orb
+            .move_home_to(egui::Pos2::new(request.to.x as f32, request.to.y as f32), ppp);
+        let outcome = if reached {
+            orb_idle_policy::MoveOutcome::Success
+        } else {
+            orb_idle_policy::MoveOutcome::Failure
+        };
+        self.idle_return
+            .report_move_result(Instant::now(), request.id, outcome);
+        reached
+    }
+
+    /// Whether the automatic idle return is switched on, for the UI.
+    pub fn idle_return_enabled(&self) -> bool {
+        self.idle_return.settings().enabled
+    }
+
+    /// Turns the automatic idle return on or off.
+    ///
+    /// Applied through the policy rather than by poking the orb, so an
+    /// in-flight request stays in flight and only *future* decisions use the
+    /// new setting.
+    pub fn set_idle_return_enabled(&mut self, enabled: bool) {
+        let mut settings = *self.idle_return.settings();
+        settings.enabled = enabled;
+        self.idle_return.set_settings(settings);
+        self.save_idle_return_settings(settings);
+    }
+
+    /// Whether the orb is pinned where the user put it, for the UI.
+    pub fn orb_is_pinned(&self) -> bool {
+        self.idle_return.settings().pinned
+    }
+
+    /// Pins or unpins the orb. An explicit "return to my spot" is still
+    /// allowed while pinned — pinning suppresses the *automatic* move, not the
+    /// user's own command.
+    pub fn set_orb_pinned(&mut self, pinned: bool) {
+        let mut settings = *self.idle_return.settings();
+        settings.pinned = pinned;
+        self.idle_return.set_settings(settings);
+        self.save_idle_return_settings(settings);
+    }
+
+    fn save_idle_return_settings(&self, settings: orb_idle_policy::IdleReturnSettings) {
+        let snapshot = match self.settings.write() {
+            Ok(mut s) => {
+                s.gui.orb_return_after_idle_secs = settings.timeout.as_secs();
+                s.gui.orb_return_enabled = settings.enabled;
+                s.gui.orb_pinned = settings.pinned;
+                s.clone()
+            }
+            Err(_) => return,
+        };
+        let config_path = self.config_path.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = snapshot.save(&config_path) {
+                tracing::error!("[orb] failed to save idle-return settings: {e:?}");
+            }
+        });
+    }
+
+    /// Applies one change to the `gui` section and persists it off-thread.
+    ///
+    /// One place for "change it and save it", because the save is the half that
+    /// is easy to forget: a preference that is applied to the live object but
+    /// never written to disk is a preference that quietly reverts on the next
+    /// launch, and the user has no way to tell that from a bug.
+    fn update_gui_settings(&self, f: impl FnOnce(&mut crate::config::settings::GuiSettings)) {
+        let snapshot = match self.settings.write() {
+            Ok(mut s) => {
+                f(&mut s.gui);
+                s.clone()
+            }
+            Err(_) => return,
+        };
+        let config_path = self.config_path.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = snapshot.save(&config_path) {
+                tracing::error!("[gui] failed to save settings: {e:?}");
+            }
+        });
     }
 
     /// Renders the one-time cloud-consent prompt: audio must not leave the
@@ -456,6 +816,10 @@ impl OverlayApp {
                         hotkey.cancel_capture();
                     }
                     self.settings_tab.capturing_hotkey = [false; 3];
+                    // Same reason as the hotkey capture: a test that outlived
+                    // its window would hold the microphone with nothing on
+                    // screen to explain why the next dictation cannot start.
+                    self.release_mic_if_held();
                 }
                 apply_theme_visuals(dash_ctx);
 
@@ -519,6 +883,7 @@ impl OverlayApp {
                                 DashboardTab::Dictionary,
                                 DashboardTab::History,
                                 DashboardTab::Settings,
+                                DashboardTab::MicTest,
                             ] {
                                 let selected = self.dashboard_tab == tab;
                                 let btn = ui.add(
@@ -617,6 +982,7 @@ impl OverlayApp {
                                 DashboardTab::Dictionary => self.render_dict_body(ui),
                                 DashboardTab::History => self.render_history_body(ui, ctx),
                                 DashboardTab::Settings => self.render_settings_body(ui),
+                                DashboardTab::MicTest => self.render_mic_test_body(ui),
                             });
 
                         ui.add_space(6.0);
@@ -796,6 +1162,12 @@ impl OverlayApp {
             // scroll): it must not freeze after the last mouse move.
             || self.show_dashboard
             || self.show_consent_window
+            // A pending draft is a live, interactive window the user has to be
+            // able to click into and edit — and, crucially, one whose appearance
+            // is driven by the loop's thread. Without this the review window
+            // would only appear on the next frame something else happened to
+            // repaint, which could be never.
+            || !self.review.snapshot().is_empty()
             // Viewports still settling their OS window shape.
             || self.dashboard_needs_shape
     }
@@ -914,7 +1286,21 @@ impl eframe::App for OverlayApp {
         // `take` clears the flag where the old code used `load`. For Quit the
         // difference is unobservable — the window closes in this same frame —
         // and clearing is the safer of the two if the close is ever refused.
-        if self.flags.take(Toggle::Quit) {
+        //
+        // The second condition is the important one. A state machine that ended
+        // on its own — a panic, or an error out of its run loop — leaves this
+        // window open with nothing behind it: the orb still paints, still takes
+        // clicks, and the record key does nothing, because every send is going
+        // into a channel whose reader is gone. `send` does not report that,
+        // because the GUI is holding the other end. So the window checks the
+        // one fact that is actually true and closes, rather than sitting there
+        // looking alive and swallowing the user's dictations.
+        if self.flags.take(Toggle::Quit) || !self.flags.machine_is_alive() {
+            if !self.flags.machine_is_alive() {
+                tracing::error!(
+                    "closing window: the state machine is no longer running, so the record key would do nothing"
+                );
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -972,6 +1358,10 @@ impl eframe::App for OverlayApp {
         self.render_dashboard(ctx);
         self.render_consent_window(ctx);
         self.render_preview_toast_window(ctx);
+        // The review window reads the shared store rather than a flag, so it can
+        // appear and disappear on the loop's schedule without the GUI having to
+        // poll a boolean that could be a frame stale.
+        review_panel::render(ctx, &self.review, &mut self.review_panel);
 
         // Repaint loop. A continuous 30 fps loop was applied unconditionally
         // here (a fresh shape/allocation pass every frame), which kept the GPU
@@ -1113,15 +1503,33 @@ impl eframe::App for OverlayApp {
             }
 
             let orb_out = self.orb.show(ctx, OrbMode::from(&status.state));
+            self.last_ppp = ctx.pixels_per_point();
             if let Some((x, y)) = orb_out.moved_to {
                 self.persist_orb_position(x, y);
+                // Only a *user* drag moves the remembered spot. An automatic
+                // return must never rewrite it, or the orb would ping-pong
+                // between the corner and wherever it had been parked.
+                self.idle_return
+                    .note_manual_move(orb_idle_policy::PhysicalPoint { x, y });
             }
+            self.tick_idle_return(ctx, &status);
             if orb_out.clicked {
-                if matches!(status.state, AppState::Recording) {
+                // The other half of the orb's pointer log: the orb knows
+                // *where* the click landed, this is the only place that knows
+                // *what was done about it*. Without both lines, "the window
+                // took the click" and "the app ignored it" look the same.
+                let action = if matches!(status.state, AppState::Recording) {
                     let _ = self.events_tx.send(HotkeyEvent::RecordUp);
+                    "record_up"
                 } else {
                     let _ = self.events_tx.send(HotkeyEvent::RecordDown);
-                }
+                    "record_down"
+                };
+                tracing::info!(
+                    state = ?status.state,
+                    action,
+                    "orb click handled",
+                );
             }
         }
     }

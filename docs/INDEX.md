@@ -52,8 +52,10 @@
 | [halo-selftest.py](reaserch/gui/probes/halo-selftest.py) · [halo-hunt.ps1](reaserch/gui/probes/halo-hunt.ps1) | شکار خودکار هالهٔ سفید. اول `halo-selftest.py` (۵ کنترل، دروازهٔ اجرا)، بعد `halo-hunt.ps1` (کشیدن اورب با تأیید هندسی، تحلیل مستطیل ترک‌شده، بازگردانی موقعیت). هر دو **تنها** اجرا شوند. |
 | [orb-click-target-probe.ps1](reaserch/gui/probes/orb-click-target-probe.ps1) | هدفِ کلیک اورب را از خودِ پنجره می‌خواند و کنار شعاع‌های پیش‌بینی‌شده می‌گذارد. **پنج کنترل کوری قبل از هر گزارشی**، و عمداً نامِ حالت را نمی‌گوید |
 | [list-windows.ps1](reaserch/gui/probes/list-windows.ps1) · [arc-analyse.py](reaserch/gui/probes/arc-analyse.py) | فهرست پنجره‌های یک پروسه در طول زمان (ابزار کشف نقص DPI) · تحلیل‌گر کمان با خط `VERDICT: REPRODUCED\|NOT_AN_ARC\|CLEAN\|INCONCLUSIVE`. |
-| [canary-harness.sh](canary-harness.sh) | موتور مشترک کاناری جهشی — اسنپ‌شات پاک، `trap`، تفکیک `NOBUILD` از `MISSED`، و **قفلِ pid** که دو اجرای هم‌پوشان را رد می‌کند (درس ۲۸) |
-| [mutation-check-session.sh](mutation-check-session.sh) | کاناری جهشی موج ۱ — `S1` + `O1` + `T1`، ۲۵ تصمیم، از `v-2/voice-ptt` اجرا شود |
+| [canary-harness.sh](canary-harness.sh) | موتور مشترک کاناری جهشی — اسنپ‌شات پاک، `trap`، تفکیک `NOBUILD` از `MISSED`، حفظ CRLF، و **قفلِ pid** که دو اجرای هم‌پوشان را رد می‌کند (درس ۲۸، قاعدهٔ ۶) |
+| [canary-anchor-check.py](canary-anchor-check.py) | **پیش از باور کردن نتیجهٔ کاناری**: لنگرهای یک اسکریپت را با کدِ امروز می‌سنجد. کاناری‌ای که لنگرش کهنه شده `SKIP` می‌دهد و از `MISSED` تفکیک‌ناپذیر است |
+| [mutation-check-session.sh](mutation-check-session.sh) | کاناری جهشی موج ۱ — `S1` + `O1` + `T1`، از `v-2/voice-ptt` اجرا شود |
+| [mutation-check-coordinator.sh](mutation-check-coordinator.sh) | کاناری جهشی موج ۲ — `T2` هماهنگ‌کننده، لغو، مقصد و نتیجهٔ درج (C27–C53، **۲۶ از ۲۶ CAUGHT**). همان هارنس؛ `CANARY_SETS="C46 C47"` دسته‌ها را جدا می‌کند چون کلِ دسته از بودجهٔ یک اجرای ابزار بیشتر است، و هر جهشِ بیرونِ دسته با شناسه‌اش `SKIP` گزارش می‌شود |
 | [mutation-check-tray-warning.sh](mutation-check-tray-warning.sh) | کاناری جهشی نشان هشدار ترای — ۲۲ تصمیم |
 | [mutation-check-startup.sh](mutation-check-startup.sh) | کاناری جهشی بوت: دانلود مدل + گارد اجرای state machine — ۱۲ تصمیم |
 | `../third_party/egui-notify/` | کد وام‌گرفته‌شده، دست‌نخورده |
@@ -70,7 +72,8 @@
 | [execution/S1-handoff.md](execution/S1-handoff.md) | تحویل `S1` — هر دیکته یک شناسه گرفت؛ «کلید رها شد» دیگر با «پایان یافت» یکی نیست |
 | [execution/O1-handoff.md](execution/O1-handoff.md) | تحویل `O1` — هدفِ کلیک و ناحیهٔ پنجره یک عدد شدند؛ حلقهٔ مردهٔ کلیک صفر pt |
 | [execution/T1-handoff.md](execution/T1-handoff.md) | تحویل `T1` — سه حالت متن، و قاعدهٔ نیم‌فاصله به‌جای فهرستِ استثنا |
-| [execution/T2-handoff.md](execution/T2-handoff.md) | تحویل `T2` — مقصدِ متن کجا می‌رود، و چه وقتی اصلاً نمی‌رود (در حال اجرا) |
+| [execution/T2-handoff.md](execution/T2-handoff.md) | تحویل `T2` — مقصدِ متن کجا می‌رود، و چه وقتی اصلاً نمی‌رود. **قطعهٔ ۲ (هماهنگ‌کننده و لغو) تمام**؛ ۱، ۳ و ۴ نوشته نشده |
+| [execution/COORDINATOR-BRIEF-2026-10-02.md](execution/COORDINATOR-BRIEF-2026-10-02.md) | گزارش به هماهنگ‌کننده — ۲۰۲۶-۱۰-۰۲: چه تأیید شد، چه نشد، و چه تصمیمی لازم است |
 
 > هر دو اسکریپت کاناری از [canary-harness.sh](canary-harness.sh) استفاده می‌کنند. این هارنس روی درخت قرمز `ABORT` می‌کند و از **یک اسنپ‌شات پاک** بازگردانی می‌کند، چون `.bak` چرخشی پشته است و یک اجرای قطع‌شده می‌تواند جهش‌هایش را ابدی کند (بندهای ۱۶–۱۹ [LESSONS-LEARNED.md](LESSONS-LEARNED.md)).
 
@@ -146,7 +149,9 @@ src/
 │        discovery} · cloud · downloader · google
 │        progress · quota · router · whisper
 ├── audio/  capture · device · ring_buffer
-├── state/  machine.rs (ماشین: فقط اجرا) · session.rs (تصمیم‌های جلسه — خالص)
+├── state/  coordinator.rs (**تنها حلقه**: رویداد و نتیجه، و تنها جای اثر)
+│           machine.rs (نیمهٔ سخت‌افزار: میکروفون + VAD به‌صورت دادهٔ خام)
+│           session.rs (تصمیم‌های جلسه — خالص)
 │           utterance.rs (ارزش یک رونویسی — خالص) · status.rs (StatusChannel)
 │   پنجرهٔ اُرب: بوم از هندسهٔ واقعی رسم مشتق می‌شود (mod reach)؛ هم بوم و هم
 │   منطقهٔ کلیک از یک تابع ⇒ کوچک‌شدن یکی بدون دیگری ممکن نیست

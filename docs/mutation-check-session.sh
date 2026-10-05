@@ -40,22 +40,21 @@ mutate "$S" \
     }' \
   'C1 stopping the microphone closes the session (the final chunk is dropped)'
 
-mutate "$S" \
-  '            Some(SessionPhase::Recording) | Some(SessionPhase::AwaitingResult) => Ok(()),' \
-  '            Some(SessionPhase::Recording) => Ok(()),
-            Some(SessionPhase::AwaitingResult) => Err("late result of a cancelled session"),' \
-  'C12 a result arriving after the key was released is refused'
+# C12 ("a result arriving after the key was released is refused") and C13 ("a
+# cancelled session is treated as a finished one") used to live here. The cancel
+# work reshaped `accepts_result` and `cancelled`, and both decisions are now
+# mutated as C31 and C32 in `mutation-check-coordinator.sh` — one copy of a
+# judge, one place to look.
 
+# C7 used to mutate `on_cancel`'s half-open-tap guard. That guard is gone too;
+# the rule it protected is now the `latch.reset()` line below.
 mutate "$S" \
-  '    pub fn cancelled(&mut self) {
-        if let Some(id) = self.open.last().map(|s| s.id) {
-            self.close(id, SessionPhase::Cancelled);
-        }' \
-  '    pub fn cancelled(&mut self) {
-        if let Some(id) = self.open.last().map(|s| s.id) {
-            self.close(id, SessionPhase::Completed);
-        }' \
-  'C13 a cancelled session is treated as a finished one'
+  '        self.recording = false;
+        self.latch.reset();
+        vec![Effect::DiscardSession(target)]' \
+  '        self.recording = false;
+        vec![Effect::DiscardSession(target)]' \
+  'C7 cancel leaves a half-open tap behind'
 
 mutate "$S" \
   '    pub fn open_session(&mut self, capture_open: bool) -> Option<SessionId> {
@@ -119,19 +118,7 @@ mutate "$S" \
   '' \
   'C6 the tick stops pumping audio while recording'
 
-mutate "$S" \
-  '        if !self.recording {
-            return Vec::new();
-        }
-        self.recording = false;
-        self.latch.reset();
-        vec![Effect::DiscardSession]' \
-  '        if !self.recording {
-            return Vec::new();
-        }
-        self.recording = false;
-        vec![Effect::DiscardSession]' \
-  'C7 cancel leaves a half-open tap behind'
+# C7's old anchor is gone; the reshaped one is above the T1 section.
 
 mutate "$U" \
   '    if merge.text.is_empty() {
@@ -165,13 +152,14 @@ mutate "$U" \
 }' \
   'C11 a failure never clears itself (push-to-talk stays frozen)'
 
-mutate "$M" \
-  '        EmitOutcome::Typed { .. } | EmitOutcome::NotAttempted { .. } | EmitOutcome::Skipped(_) => {
-            AppState::Idle
-        }' \
-  '        EmitOutcome::Typed { .. } | EmitOutcome::Skipped(_) => AppState::Idle,
-        EmitOutcome::NotAttempted { .. } => AppState::Error("refused".to_string()),' \
-  'C17 a refused result wears the error badge the user never asked for'
+# The T2 coordinator decisions live in their own script,
+# `mutation-check-coordinator.sh`, which sources this same harness. Two copies of
+# a judge is how one of them goes stale — see the note at the top of
+# `canary-harness.sh`.
+
+# C17 used to mutate `machine::emit`'s refusal branch. That code is gone — the
+# T2 coordinator stage moved every effect into one `apply` — and the gap note
+# at the bottom now covers what replaced it.
 
 # ── O1: the orb's click target ──────────────────────────────────────────
 #
@@ -246,5 +234,15 @@ mutate "$P" \
 # test notices either way. Recording the gap beats inventing a mutation that
 # would have to report MISSED for the wrong reason. It stays "unverified" until
 # a test-session turn can exercise a cancelled session end to end.
+
+# C17 has been reshaped by the T2 coordinator stage. `machine.rs` no longer owns
+# a loop: `StateMachine::run` forwards hotkeys onto `Input` and beats every
+# 20 ms. The forwarding, the heartbeat and the real `Port` all need a live
+# capture device, so no mutation of them can be judged automatically. What IS
+# covered is that the loop those two producers feed behaves: the heartbeat is
+# `Input::Tick` in the ten scenarios, and the pure endpoint/chunk policy is
+# still unit-tested here (`endpoint_policy_finalizes_on_timeout_or_release`,
+# plus C2/C3/C4). The wiring itself stays unverified until a test-session turn
+# runs the app.
 
 canary_finish

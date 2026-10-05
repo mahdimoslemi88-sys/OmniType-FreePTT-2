@@ -131,3 +131,13 @@ perf.data*
 # Installer build output (large setup binaries)
 # ----------------------------------------------------------------------------
 installer/Output/
+
+# ----------------------------------------------------------------------------
+# Execution evidence logs (per-run transcripts, machine-local)
+# ----------------------------------------------------------------------------
+# The env wrappers in docs/execution/.i2-evidence/ ARE tracked — they are how a
+# contributor gets a working `cargo test` on Windows without hunting for vcvars.
+# The transcripts they produce are not: each names a HEAD, a dirty-entry count
+# and absolute paths that are true only on the machine that ran them.
+docs/execution/.i2-evidence/*.log
+docs/execution/.i2-evidence/*.txt

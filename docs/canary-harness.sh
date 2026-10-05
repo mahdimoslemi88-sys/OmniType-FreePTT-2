@@ -37,6 +37,12 @@
 #    baseline. That is not hypothetical — it left four mutated files and 22
 #    failing tests behind, and it reported "CAUGHT" for canaries whose verdict
 #    came from the other run's leftovers.
+#
+# 6. Never delete the lock or the snapshot while a run may still be alive. A run
+#    whose `cargo test` was killed from outside keeps going: it goes on applying
+#    mutations, and every `cp` from the snapshot it no longer has fails, so the
+#    mutations pile up and stay in the tree. Wait for a run to finish before
+#    cleaning up after it.
 
 CANARY_RED='\x1b[31m'
 CANARY_LOCK=".canary-lock"
@@ -121,7 +127,12 @@ canary_restore_one() {
   local want="$1" i=0
   for f in "${CANARY_FILES[@]}"; do
     if [ "$f" = "$want" ]; then
-      cp "$CANARY_SNAP/$i" "$f"
+      if ! cp "$CANARY_SNAP/$i" "$f"; then
+        # Silently continuing here is how a pile of mutations ends up committed:
+        # every later `cp` from the same missing snapshot fails the same way.
+        echo "!! could not restore $want from $CANARY_SNAP/$i — the run is poisoned, stop it" >&2
+        return 1
+      fi
       touch "$f" # newer than the binary the mutation built
       return 0
     fi
@@ -136,10 +147,15 @@ mutate() {
   python - "$file" "$from" "$to" <<'PY'
 import io, sys
 path, frm, to = sys.argv[1], sys.argv[2], sys.argv[3]
-s = io.open(path, encoding='utf-8').read()
+# newline='' on BOTH handles: without it python rewrites every CRLF line of a
+# Windows source file as LF, so one mutation silently converts the whole file.
+# The harness's job is to change one decision, not the line endings of the repo —
+# and a run that is interrupted mid-mutation then leaves a file that differs from
+# the snapshot in a way `cp` on the next line has to undo, or fails to.
+s = io.open(path, encoding='utf-8', newline='').read()
 if frm not in s:
     sys.exit("ANCHOR NOT FOUND in " + path + ": " + frm[:70])
-io.open(path, 'w', encoding='utf-8').write(s.replace(frm, to, 1))
+io.open(path, 'w', encoding='utf-8', newline='').write(s.replace(frm, to, 1))
 PY
   if [ $? -ne 0 ]; then echo "SKIP    $name (anchor missing)"; return; fi
 

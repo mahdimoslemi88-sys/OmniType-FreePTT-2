@@ -194,7 +194,18 @@ mod tests {
             }
         };
         assert!(resp.status().is_success(), "status: {}", resp.status());
-        let bytes = resp.bytes().unwrap();
+        // The body is a multi-megabyte ONNX, so the read can time out on a link
+        // that connected fine. That is the same offline/slow situation the
+        // connect above already treats as "nothing to assert", and without this
+        // guard the test fails on a machine that merely has a bad connection —
+        // which is exactly the false failure its own comment rules out.
+        let bytes = match resp.bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("skipping (download did not finish): {e}");
+                return;
+            }
+        };
         assert!(bytes.len() > 1_000_000, "suspiciously small: {} bytes", bytes.len());
         // ONNX files are protobuf — they start with a field-1 (ir_version) tag.
         assert_eq!(&bytes[..2], &[0x08, 0x08], "not a valid ONNX header");

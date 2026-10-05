@@ -65,7 +65,6 @@ pub fn default_corrections() -> Vec<Correction> {
         ("بکند", "بک‌اند", "برنامه‌نویسی"),
         ("فول استک", "فول‌استک", "برنامه‌نویسی"),
         ("فولستک", "فول‌استک", "برنامه‌نویسی"),
-
         // ── هوش مصنوعی و علم داده (AI / ML / Data Science) ───────────────────
         ("پای تورچ", "PyTorch", "هوش مصنوعی"),
         ("پایتورچ", "PyTorch", "هوش مصنوعی"),
@@ -97,7 +96,6 @@ pub fn default_corrections() -> Vec<Correction> {
         ("سایکیت لرن", "Scikit-learn", "هوش مصنوعی"),
         ("ماشین لرنینگ", "Machine Learning", "هوش مصنوعی"),
         ("دیپ لرنینگ", "Deep Learning", "هوش مصنوعی"),
-
         // ── دوآپس، پایگاه داده و زیرساخت (DevOps & Databases) ────────────────
         ("داکر", "Docker", "دوآپس"),
         ("داکر کامپوز", "Docker Compose", "دوآپس"),
@@ -132,11 +130,18 @@ pub fn default_corrections() -> Vec<Correction> {
         ("سی‌آی‌سی‌دی", "CI/CD", "دوآپس"),
         ("پرومتیوس", "Prometheus", "دوآپس"),
         ("گرافانا", "Grafana", "دوآپس"),
-
         // ── مهندسی، مکانیک، نفت، گاز و پتروشیمی (AITCO Domain) ───────────────
         ("گاسکت", "گسکت", "مهندسی و نفت و گاز"),
-        ("اسپیرال وند", "اسپیرال وند (Spiral Wound)", "مهندسی و نفت و گاز"),
-        ("اسپیرال‌وند", "اسپیرال وند (Spiral Wound)", "مهندسی و نفت و گاز"),
+        (
+            "اسپیرال وند",
+            "اسپیرال وند (Spiral Wound)",
+            "مهندسی و نفت و گاز",
+        ),
+        (
+            "اسپیرال‌وند",
+            "اسپیرال وند (Spiral Wound)",
+            "مهندسی و نفت و گاز",
+        ),
         ("آر تی جی", "RTJ", "مهندسی و نفت و گاز"),
         ("کلینگریت", "Klingerrit", "مهندسی و نفت و گاز"),
         ("کم پروفایل", "Kammprofile", "مهندسی و نفت و گاز"),
@@ -191,7 +196,6 @@ pub fn default_corrections() -> Vec<Correction> {
         ("دین", "DIN", "استانداردها"),
         ("انسی", "ANSI", "استانداردها"),
         ("نیس", "NACE", "استانداردها"),
-
         // ── مخفف‌ها و مفاهیم عمومی فنی (General Tech Acronyms) ───────────────
         ("اپی آی", "API", "مخفف‌ها"),
         ("ای پی آی", "API", "مخفف‌ها"),
@@ -259,9 +263,7 @@ impl Dictionary {
     }
 
     /// Compiles rules into an AhoCorasick matcher and ordered replacements.
-    fn compile_rules(
-        corrections: &[Correction],
-    ) -> (AhoCorasick, Vec<String>, Vec<Correction>) {
+    fn compile_rules(corrections: &[Correction]) -> (AhoCorasick, Vec<String>, Vec<Correction>) {
         let mut map: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
         for c in corrections {
             let from = c.from.trim();
@@ -278,11 +280,7 @@ impl Dictionary {
         for (from, (to, category)) in map {
             patterns.push(from.clone());
             replacements.push(to.clone());
-            clean_rules.push(Correction {
-                from,
-                to,
-                category,
-            });
+            clean_rules.push(Correction { from, to, category });
         }
 
         let matcher = if patterns.is_empty() {
@@ -352,11 +350,7 @@ impl Dictionary {
                 existing.category = category;
             }
         } else {
-            self.rules.push(Correction {
-                from,
-                to,
-                category,
-            });
+            self.rules.push(Correction { from, to, category });
         }
 
         let (matcher, replacements, clean_rules) = Self::compile_rules(&self.rules);
@@ -459,8 +453,7 @@ impl Dictionary {
         if self.replacements.is_empty() || text.is_empty() {
             return text.to_string();
         }
-        self.matcher
-            .replace_all(text, &self.replacements)
+        self.matcher.replace_all(text, &self.replacements)
     }
 
     /// Number of active rules.
@@ -506,10 +499,7 @@ mod tests {
     #[test]
     fn multiple_replacements_in_one_pass() {
         let d = Dictionary::with_defaults();
-        assert_eq!(
-            d.correct("اپی آی با داکر"),
-            "API با Docker"
-        );
+        assert_eq!(d.correct("اپی آی با داکر"), "API با Docker");
     }
 
     #[test]
@@ -517,11 +507,7 @@ mod tests {
         let dir = std::env::temp_dir().join("voice-ptt-dict-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("dict.toml");
-        std::fs::write(
-            &file,
-            "[[corrections]]\nfrom = \"فلان\"\nto = \"فلان‌چیز\"\n",
-        )
-        .unwrap();
+        std::fs::write(&file, "[[corrections]]\nfrom = \"فلان\"\nto = \"فلان‌چیز\"\n").unwrap();
 
         let d = Dictionary::load_or_default(&file);
         assert!(d.len() > 1, "user rules should merge with defaults");

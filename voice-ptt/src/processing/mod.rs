@@ -2,10 +2,12 @@
 //! chunk-seam stitcher (`seam`) that keeps a long, chunked dictation reading as
 //! one continuous piece of text.
 
+pub mod boundary;
 pub mod dictionary;
 pub mod normalizer;
 pub mod seam;
 
+pub use boundary::{is_attached_punctuation, needs_boundary_space, BoundaryState, BoundaryTracker};
 pub use dictionary::Dictionary;
 pub use normalizer::Normalizer;
 pub use seam::{SeamMerge, SeamOptions, SeamStitcher};
@@ -210,6 +212,8 @@ mod tests {
             ("تمام", "تمام"),
             ("اتمام", "اتمام"),
             ("ميكروفون", "میکروفون"),
+            ("کبوتر", "کبوتر"),
+            ("اژدها", "اژدها"),
         ] {
             assert_eq!(process_text(input, &n, &d), want, "{input}");
         }
@@ -292,5 +296,106 @@ mod tests {
         for mode in [TextMode::Raw, TextMode::Conservative, TextMode::Standard] {
             assert_eq!(TextMode::parse(mode.as_str()), mode);
         }
+    }
+
+    #[test]
+    fn hamza_is_preserved_in_conservative_and_standard_pipeline() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        for input in ["مسأله", "مؤمن", "تأیید", "رأی"] {
+            assert_eq!(
+                process_text_with(input, &n, &d, ProcessingOptions::conservative()),
+                input,
+                "conservative mode must preserve hamza in {input}"
+            );
+            assert_eq!(
+                process_text_with(input, &n, &d, ProcessingOptions::standard()),
+                input,
+                "standard mode must preserve hamza in {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_words_are_preserved_in_default_mode() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        for input in ["کلمات", "تمام", "اتمام", "میکروفون", "کبوتر", "اژدها"]
+        {
+            assert_eq!(
+                process_text(input, &n, &d),
+                input,
+                "default standard mode must not corrupt healthy word: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_samples_corrected_without_breaking_similar_words() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        // Valid corrections:
+        assert_eq!(process_text("کتابها", &n, &d), "کتاب‌ها");
+        assert_eq!(process_text("میروم", &n, &d), "می‌روم");
+        assert_eq!(process_text("نمیخواهم", &n, &d), "نمی‌خواهم");
+        assert_eq!(process_text("بزرگترین", &n, &d), "بزرگ‌ترین");
+
+        // Similar looking healthy words must NOT be broken:
+        assert_eq!(process_text("اژدها", &n, &d), "اژدها");
+        assert_eq!(process_text("تنها", &n, &d), "تنها");
+        assert_eq!(process_text("کبوتر", &n, &d), "کبوتر");
+        assert_eq!(process_text("دختر", &n, &d), "دختر");
+        assert_eq!(process_text("دفتر", &n, &d), "دفتر");
+        assert_eq!(process_text("میکروفون", &n, &d), "میکروفون");
+        assert_eq!(process_text("میوه", &n, &d), "میوه");
+    }
+
+    #[test]
+    fn explicit_space_in_mi_rom_preserved_across_all_modes() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        let input = "می روم";
+        for mode in [
+            ProcessingOptions::standard(),
+            ProcessingOptions::conservative(),
+            ProcessingOptions::raw(),
+        ] {
+            assert_eq!(
+                process_text_with(input, &n, &d, mode),
+                input,
+                "explicit space between می and روم must be preserved in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn latin_digits_are_preserved_without_conversion() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        for input in ["123", "کد 456 و 789", "port 8080"] {
+            assert_eq!(
+                process_text_with(input, &n, &d, ProcessingOptions::standard()),
+                input,
+                "Latin digits must remain Latin in standard mode: {input}"
+            );
+            assert_eq!(
+                process_text_with(input, &n, &d, ProcessingOptions::conservative()),
+                input,
+                "Latin digits must remain Latin in conservative mode: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_mode_bypasses_persian_normalizer_and_dictionary() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        // Input with Arabic kaf/yeh, dictionary trigger (پاتون), multi-spaces, punctuation spacing:
+        let raw_input = "  كتابهاي من با پاتون و لينوكس  كار ميكنم . واقعاً ؟  ";
+        let out = process_text_with(raw_input, &n, &d, ProcessingOptions::raw());
+        assert_eq!(
+            out, raw_input,
+            "Raw mode must not touch text with Persian normalizer or dictionary"
+        );
     }
 }

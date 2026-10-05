@@ -1,14 +1,20 @@
-//! Central state machine: Idle → Recording → Processing → Typing → Idle.
+//! The microphone, the VAD, and the wiring that starts the coordinator.
 //!
 //! Event sources:
 //! - hotkey events (forwarded from the polling thread into a Tokio channel)
 //! - a 20 ms tick that pulls audio from the ring buffer and runs VAD frames
 //!
-//! This file is the *machinery*: it owns the microphone, the recogniser and the
-//! keyboard, and performs what the rules decide. The rules themselves live in
-//! [`super::session`] (what an event means, when a chunk is cut, when an
-//! utterance ends) and [`super::utterance`] (what a transcript is worth), both
-//! pure and unit-tested. Nothing in `run` decides anything.
+//! This file is the *hardware half*: it owns the capture device and the voice
+//! activity detector, and reports what they made of the audio as plain data —
+//! [`PollOutcome`] / `Option<AudioUtterance>`. It decides nothing about
+//! sessions, about text, or about the keyboard.
+//!
+//! The decisions live in [`super::session`] (what an event means, when a chunk
+//! is cut, when an utterance ends) and [`super::utterance`] (what a transcript
+//! is worth), both pure and unit-tested. The loop that asks those questions and
+//! applies the answers — including "is this text still wanted?" — is
+//! [`super::coordinator`]. There is exactly one of it, and
+//! [`StateMachine::run`] starts that one.
 //!
 //! Finalization policy (from the research design):
 //! - trailing silence ≥ `silence_timeout_ms` after speech → finalize, or
@@ -16,10 +22,12 @@
 //! - ring buffer approached capacity (safety valve) → finalize.
 //!
 //! Utterances with less speech than `min_speech_ms` are discarded (clicks,
-//! key taps), matching the VAD research's false-positive mitigation.
+//! key taps), matching the VAD research's false-positive mitigation — which is
+//! also why [`MachinePort::take_utterance`] answers with `None` instead of
+//! handing the coordinator an empty recording to convert.
 
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -29,19 +37,17 @@ use crate::asr::router::AsrRouter;
 use crate::audio::AudioCapture;
 use crate::config::Settings;
 use crate::hotkey::HotkeyEvent;
-use crate::output::{inject_backspaces, inject_text};
-use crate::processing::seam::{SeamMerge, SeamOptions, SeamStitcher};
-use crate::processing::{process_text_with, Dictionary, Normalizer};
 use crate::vad::{AnyVad, Endpoint, VadConfig};
 
+use super::coordinator::{
+    Coordinator, Input, KeystrokeSink, PollOutcome, Port, Speech, SystemClock, WindowTargets,
+};
 use super::session::{
-    endpoint_decision, frames_to_feed, split_chunk, ChunkId, Effect, EndpointDecision,
-    SessionBuffers, SessionDriver, SessionId,
+    endpoint_decision, frames_to_feed, should_flush_chunk, split_chunk, EndpointDecision,
+    SessionBuffers, SessionDriver,
 };
-use super::status::{AppState, AppStatus, StatusChannel};
-use super::utterance::{
-    is_transient, plan_typing, AudioLevels, SkipReason, TypePlan, ERROR_READABLE,
-};
+use super::status::{AppStatus, StatusChannel};
+use super::utterance::AudioLevels;
 
 /// VAD unit: engine + endpoint state guarded by one mutex.
 pub struct VadUnit {
@@ -72,364 +78,111 @@ pub struct AppServices {
     pub capture: Arc<AudioCapture>,
     pub vad: Mutex<VadUnit>,
     pub router: AsrRouter,
-    pub normalizer: Arc<Normalizer>,
-    pub dictionary: Arc<RwLock<Dictionary>>,
+    pub normalizer: Arc<crate::processing::Normalizer>,
+    pub dictionary: Arc<RwLock<crate::processing::Dictionary>>,
     pub settings: Arc<Settings>,
 }
 
-/// What came out of trying to type one piece of text.
-#[derive(Debug)]
-enum EmitOutcome {
-    /// The transcript had nothing in it worth typing.
-    Skipped(SkipReason),
-    /// The text reached the focused window.
-    Typed { chars: usize },
-    /// The keystrokes themselves failed.
-    InjectionFailed { error: String },
-    /// No key was pressed at all, because the session that owns this text had
-    /// already ended differently.
-    ///
-    /// This is the machine's stand-in for `InjectOutcome::NotAttempted`; the
-    /// injector owns that type (wave 2, `T2`) and maps its reasons onto these.
-    NotAttempted { reason: &'static str },
-}
-
-/// Which visible state an outcome ends the session in.
+/// The real [`Port`]: capture in, plain audio out.
 ///
-/// Extracted so the rule can be tested without a microphone, an engine or a
-/// focused window — and because the one that matters is easy to get wrong: a
-/// refused result is **not** a failure. The user cancelled, so showing the error
-/// badge would blame the app for something they asked for, and the next
-/// press-to-talk would be swallowed behind a red orb the user cannot explain.
-fn state_after_emit(outcome: &EmitOutcome) -> AppState {
-    match outcome {
-        EmitOutcome::InjectionFailed { error } => {
-            AppState::Error(format!("injection failed: {error}"))
-        }
-        // Typed, refused, and skipped all end up idle: in each case the machine
-        // is ready for the next press.
-        EmitOutcome::Typed { .. } | EmitOutcome::NotAttempted { .. } | EmitOutcome::Skipped(_) => {
-            AppState::Idle
-        }
-    }
-}
-
-/// The running application.
-pub struct StateMachine {
+/// Its only job is to be honest about the hardware. Everything a cancelled
+/// result could have damaged — seam, keyboard, badge, session rules — is on the
+/// coordinator's side of the boundary, and a `None` here means "the VAD says
+/// there was nothing to transcribe", not "nothing happened": the session still
+/// has to close.
+pub struct MachinePort {
     services: Arc<AppServices>,
-    /// Owns the UI status channel and the rules for changing it (`state/status`).
-    status: StatusChannel,
-    /// Chunk-seam repair state for the running dictation session. A plain mutex
-    /// (never held across an `await`) is enough: `stitch` is pure string work.
-    seam: std::sync::Mutex<SeamStitcher>,
-    /// The session's own rules (latch, recording flag, effect plan). Plain mutex
-    /// for the same reason as `seam`, and because `run` holds `Arc<Self>` so the
-    /// GUI can read the machine while it runs.
-    session: std::sync::Mutex<SessionDriver>,
+    /// The utterance's accumulation buffer and how far the VAD has read into it.
+    ///
+    /// Behind a lock rather than a field because the coordinator holds the port
+    /// by shared reference; only that one task ever touches it.
+    bufs: Mutex<SessionBuffers>,
+    frame: usize,
 }
 
-impl StateMachine {
-    pub fn new(services: AppServices) -> Self {
-        let vad_engine = match &services.vad.try_lock() {
-            Ok(u) => u.engine_name(),
-            Err(_) => "…",
-        };
-        let status = StatusChannel::new(vad_engine);
-        let seam = SeamStitcher::new(SeamOptions::from_streaming(&services.settings.streaming));
-        let session = SessionDriver::new(&services.settings.hotkey);
+impl MachinePort {
+    pub fn new(services: Arc<AppServices>) -> Self {
+        let frame = services.settings.vad.chunk_size;
         Self {
-            services: Arc::new(services),
-            status,
-            seam: std::sync::Mutex::new(seam),
-            session: std::sync::Mutex::new(session),
+            services,
+            bufs: Mutex::new(SessionBuffers::default()),
+            frame,
         }
-    }
-
-    /// Stitches one chunk transcript onto the running session (see
-    /// [`crate::processing::seam`]) and remembers what was typed.
-    fn stitch_seam(&self, text: &str) -> SeamMerge {
-        let mut seam = self
-            .seam
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let merge = seam.stitch(text);
-        if merge.dropped_words > 0 || merge.backspaces > 0 {
-            tracing::info!(%merge, "chunk seam repaired");
-        }
-        merge
-    }
-
-    /// A new dictation session starts with an empty seam memory: two dictations
-    /// in the same document may legitimately begin with the same words.
-    fn reset_seam(&self) {
-        self.seam
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .reset();
-    }
-
-    /// Asks the session's rules one question.
-    ///
-    /// The guard never spans an `await`: every decision is a handful of integer
-    /// comparisons, so this is cheaper than it looks and it can never become the
-    /// thing that serialises the 20 ms tick.
-    fn with_session<R>(&self, f: impl FnOnce(&mut SessionDriver) -> R) -> R {
-        let mut session = self
-            .session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&mut session)
-    }
-
-    /// Subscribe to status updates (for the overlay/tray).
-    pub fn subscribe(&self) -> watch::Receiver<AppStatus> {
-        self.status.subscribe()
-    }
-
-    /// Forwards a live partial transcript from a streaming engine.
-    ///
-    /// The caller holds the machine, not the channel, so this stays a method on
-    /// `StateMachine` even though the rule it enforces now lives in
-    /// [`StatusChannel`].
-    pub fn publish_partial(&self, text: &str) {
-        self.status.publish_partial(text);
-    }
-
-    /// Main loop. Consumes hotkey events until Quit or channel close.
-    ///
-    /// The loop itself decides nothing: every event is turned into a list of
-    /// [`Effect`]s by [`SessionDriver`], and each effect is performed below.
-    pub async fn run(
-        self: Arc<Self>,
-        mut events: mpsc::UnboundedReceiver<HotkeyEvent>,
-    ) -> Result<()> {
-        let mut bufs = SessionBuffers::default();
-        let frame = self.services.settings.vad.chunk_size;
-
-        let mut tick = tokio::time::interval(Duration::from_millis(20));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        self.status.set_state(AppState::Idle);
-
-        loop {
-            tokio::select! {
-                ev = events.recv() => {
-                    let effects = match ev {
-                        Some(HotkeyEvent::Quit) | None => {
-                            tracing::info!("quit requested");
-                            break;
-                        }
-                        Some(HotkeyEvent::RecordDown) => {
-                            self.with_session(|s| s.on_record_down(Instant::now()))
-                        }
-                        Some(HotkeyEvent::RecordUp) => {
-                            self.with_session(|s| s.on_record_up(Instant::now()))
-                        }
-                        Some(HotkeyEvent::Cancel) => self.with_session(|s| s.on_cancel()),
-                        // GUI concerns; the machine stays idle.
-                        Some(HotkeyEvent::ToggleOverlay) => continue,
-                    };
-                    self.perform(effects, &mut bufs, frame).await?;
-                }
-                _ = tick.tick() => {
-                    let effects = self.with_session(|s| s.on_tick(Instant::now()));
-                    self.perform(effects, &mut bufs, frame).await?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Performs the effects the session decided on, in order.
-    ///
-    /// Every way out of a session — key release, VAD endpoint, safety cap,
-    /// cancel — goes through this one function, so none of them can forget the
-    /// hands-free badge or the bookkeeping that tells the rules whether the
-    /// microphone is still live.
-    async fn perform(
-        &self,
-        effects: Vec<Effect>,
-        bufs: &mut SessionBuffers,
-        frame: usize,
-    ) -> Result<()> {
-        for effect in effects {
-            match effect {
-                Effect::BeginRecording => {
-                    let open = self.begin_recording(&mut bufs.audio, &mut bufs.vad_cursor);
-                    let session = self.with_session(|s| s.began_recording(open));
-                    // The kind is in the log because it is the difference between
-                    // "held the key" and "tapped twice and walked away", and a
-                    // bug report about the wrong one is otherwise unreadable.
-                    let kind = session.and_then(|id| self.with_session(|s| s.kind_of(id)));
-                    tracing::info!(
-                        ?session,
-                        ?kind,
-                        samples = bufs.audio.len(),
-                        "recording started"
-                    );
-                }
-                Effect::FinishSession => {
-                    let audio = self
-                        .take_and_stop(&mut bufs.audio, &mut bufs.vad_cursor, frame)
-                        .await;
-                    let session = self.end_session();
-                    self.finalize(session, audio).await;
-                }
-                Effect::DiscardSession => {
-                    // No await follows, so the end-of-batch sync below takes
-                    // the badge down just as promptly.
-                    self.discard_recording(&mut bufs.audio, &mut bufs.vad_cursor);
-                    self.with_session(|s| s.cancelled());
-                }
-                Effect::PollAudio => {
-                    // The driver only ever asks for this while it believes a
-                    // session is live, so pumping a buffer nobody owns would mean
-                    // the two had drifted apart.
-                    debug_assert!(self.with_session(|s| s.is_recording()));
-                    if let Some(audio) = self
-                        .poll_vad(&mut bufs.audio, &mut bufs.vad_cursor, frame)
-                        .await?
-                    {
-                        let session = self.end_session();
-                        self.finalize(session, audio).await;
-                    } else if self.chunk_flush_due(bufs.audio.len()).await {
-                        // phase 3: hand this chunk over while the microphone
-                        // keeps running; the session only ends on key release
-                        // (or the safety cap).
-                        let chunk_audio =
-                            self.take_chunk(&mut bufs.audio, &mut bufs.vad_cursor).await;
-                        let session = self.with_session(|s| s.current_session());
-                        let chunk = session.and_then(|id| self.with_session(|s| s.next_chunk(id)));
-                        self.process_chunk(session, chunk, chunk_audio).await;
-                    }
-                }
-            }
-        }
-        // The badge is also synced here so the paths that only *raise* it (a
-        // double-tap) can never be forgotten.
-        self.sync_latch_badge();
-        Ok(())
-    }
-
-    /// Publishes whatever the rules currently say about the hands-free badge.
-    ///
-    /// `StatusChannel::set_latched` ignores a repeat, so calling this
-    /// unconditionally is free — the loop does not have to ask whether anything
-    /// changed.
-    fn sync_latch_badge(&self) {
-        self.status.set_latched(self.with_session(|s| s.latched()));
-    }
-
-    /// Stops the session's recording and takes the badge down with it.
-    ///
-    /// The badge has to go *before* `finalize`, which can spend seconds in the
-    /// recogniser, and it goes down here rather than on the next tick so a press
-    /// that lands right now still starts a recording.
-    ///
-    /// The session itself stays **open and waiting** for its last result, which
-    /// is why the id is returned rather than thrown away: `finalize` needs it to
-    /// decide whether the text it is about to produce is still wanted.
-    fn end_session(&self) -> Option<SessionId> {
-        let session = self.with_session(|s| s.current_session());
-        if let Some(id) = session {
-            self.with_session(|s| s.ended_session(id));
-        }
-        self.sync_latch_badge();
-        session
-    }
-
-    /// Clears the buffer and the seam memory, then opens the microphone.
-    /// Returns whether capture is really live, which the session rules need in
-    /// order to stop believing in a recording that never started.
-    fn begin_recording(&self, buffer: &mut Vec<f32>, vad_cursor: &mut usize) -> bool {
-        buffer.clear();
-        *vad_cursor = 0;
-        // Fresh session: the previous dictation's tail must not swallow the
-        // words this one starts with.
-        self.reset_seam();
-        if let Err(e) = self.services.capture.start() {
-            self.status
-                .set_state(AppState::Error(format!("capture start failed: {e:#}")));
-            return false;
-        }
-        // Reset endpoint state for the new utterance.
-        if let Ok(mut unit) = self.services.vad.try_lock() {
-            unit.endpoint.reset();
-            // Also clear the engine's cross-utterance state (Silero recurrent
-            // state + context) so stale audio cannot bias the first frames.
-            unit.vad.reset();
-        }
-        self.status.set_state(AppState::Recording);
-        true
-    }
-
-    /// Throws the utterance away without transcribing it (user cancel).
-    fn discard_recording(&self, buffer: &mut Vec<f32>, vad_cursor: &mut usize) {
-        buffer.clear();
-        *vad_cursor = 0;
-        let _ = self.services.capture.stop();
-        if let Ok(mut unit) = self.services.vad.try_lock() {
-            unit.endpoint.reset();
-            unit.vad.reset();
-        }
-        self.status.set_state(AppState::Idle);
-        tracing::info!("speech recording cancelled by user");
     }
 
     /// Feeds every complete window between the read cursor and the end of the
     /// buffer to the VAD — each exactly once, so the Silero recurrent state and
     /// the endpoint's sample count stay honest (see [`frames_to_feed`]).
-    async fn feed_vad(&self, buffer: &[f32], vad_cursor: &mut usize, frame: usize) {
-        let start = *vad_cursor;
-        let frames = frames_to_feed(start, buffer.len(), frame);
+    async fn feed_vad(&self, bufs: &mut SessionBuffers) {
+        let start = bufs.vad_cursor;
+        let frames = frames_to_feed(start, bufs.audio.len(), self.frame);
         if frames == 0 {
             return;
         }
         let mut unit = self.services.vad.lock().await;
         for i in 0..frames {
-            let from = start + i * frame;
-            let result = unit.vad.process(&buffer[from..from + frame]);
+            let from = start + i * self.frame;
+            let result = unit.vad.process(&bufs.audio[from..from + self.frame]);
             unit.endpoint.feed(&result);
         }
-        *vad_cursor = start + frames * frame;
+        bufs.vad_cursor = start + frames * self.frame;
     }
 
-    /// Pulls newly buffered audio and feeds VAD frames.
-    /// Returns `Some(full_audio)` when the rules say the utterance is over.
-    async fn poll_vad(
-        &self,
-        buffer: &mut Vec<f32>,
-        vad_cursor: &mut usize,
-        frame: usize,
-    ) -> Result<Option<Vec<f32>>> {
-        let fresh = self.services.capture.take_audio();
-        if !fresh.is_empty() {
-            buffer.extend_from_slice(&fresh);
-        }
+    /// Turns accumulated samples into the one thing the coordinator may hand to a
+    /// worker — or `None` when the endpoint says there was nothing worth an
+    /// engine call.
+    ///
+    /// The endpoint's numbers are read *here*, before the audio is handed over,
+    /// so the worker is handed a decision instead of being asked to make one.
+    /// That is also what keeps the VAD out of the worker's reach.
+    async fn take_utterance(&self, audio: Vec<f32>) -> Option<AudioUtterance> {
+        let sample_rate = self.services.capture.pipeline_sample_rate();
 
-        self.feed_vad(buffer, vad_cursor, frame).await;
+        // Audio-level diagnostics: distinguishes "mic delivered silence"
+        // (peak ≈ −∞ dBFS → wrong/muted device) from "audio arrived but the VAD
+        // called it non-speech" (healthy levels, discarded).
+        let levels = AudioLevels::measure(&audio);
+        tracing::info!(
+            samples = audio.len(),
+            peak_dbfs = format!("{:.1}", levels.peak_dbfs()),
+            rms_dbfs = format!("{:.1}", levels.rms_dbfs()),
+            "utterance audio levels"
+        );
 
-        let streaming = &self.services.settings.streaming;
-        let rate = self.services.capture.pipeline_sample_rate();
-        let decision = {
-            let unit = self.services.vad.lock().await;
-            let cutoff = self.services.settings.vad.cutoff_on_hold;
-            endpoint_decision(
-                buffer.len(),
-                unit.endpoint.should_finalize(),
-                cutoff,
-                streaming.enabled,
-                self.services.capture.capacity(),
-                u64::from(rate) * streaming.max_utterance_seconds,
-            )
+        let enough = {
+            let mut unit = self.services.vad.lock().await;
+            let ok = unit.endpoint.has_enough_speech();
+            let speech_secs = unit.endpoint.speech_samples() as f64 / f64::from(sample_rate);
+            let total_secs = unit.endpoint.total_samples() as f64 / f64::from(sample_rate);
+            tracing::info!(
+                speech_secs = format!("{speech_secs:.2}"),
+                total_secs = format!("{total_secs:.2}"),
+                "endpoint summary"
+            );
+            unit.endpoint.reset();
+            unit.vad.reset();
+            ok
         };
-        if let EndpointDecision::Finalize(reason) = decision {
-            tracing::debug!(reason = reason.as_str(), "ending utterance");
-            self.services.capture.stop()?;
-            return Ok(Some(std::mem::take(buffer)));
+        if !enough {
+            tracing::info!("utterance discarded: not enough speech");
+            return None;
         }
-        Ok(None)
+        if audio.is_empty() {
+            // A recogniser handed nothing answers "empty transcription", which
+            // the router reports as a failure — an error badge for a recording
+            // that never contained anything.
+            tracing::info!("utterance discarded: no audio");
+            return None;
+        }
+        let utterance = AudioUtterance {
+            samples: audio,
+            sample_rate,
+        };
+        tracing::info!(
+            audio_secs = utterance.duration_secs(),
+            "handing utterance over"
+        );
+        Some(utterance)
     }
 
     /// Samples of audio repeated at the start of the next chunk (seam safety).
@@ -452,300 +205,324 @@ impl StateMachine {
                 unit.endpoint.speech_samples(),
             )
         };
-        super::session::should_flush_chunk(cfg, rate, buffer_len, silence, speech)
+        should_flush_chunk(cfg, rate, buffer_len, silence, speech)
     }
 
     /// Removes the finished chunk from the accumulation buffer and keeps the
     /// configured overlap tail for the next one, so a seam cannot clip a word.
-    async fn take_chunk(&self, buffer: &mut Vec<f32>, vad_cursor: &mut usize) -> Vec<f32> {
-        let split = split_chunk(buffer.len(), *vad_cursor, self.chunk_overlap_samples());
-        let chunk: Vec<f32> = buffer[..split.keep_from].to_vec();
-        buffer.drain(..split.keep_from);
-        *vad_cursor = split.cursor;
+    fn take_chunk(&self, bufs: &mut SessionBuffers) -> AudioUtterance {
+        let rate = self.services.capture.pipeline_sample_rate();
+        let split = split_chunk(
+            bufs.audio.len(),
+            bufs.vad_cursor,
+            self.chunk_overlap_samples(),
+        );
+        let chunk: Vec<f32> = bufs.audio[..split.keep_from].to_vec();
+        bufs.audio.drain(..split.keep_from);
+        bufs.vad_cursor = split.cursor;
         // Per-chunk endpoint state: the next chunk is judged on its own speech.
         if let Ok(mut unit) = self.services.vad.try_lock() {
             unit.endpoint.reset();
         }
-        chunk
-    }
-
-    /// Erases the seam artefact, then types the planned text.
-    ///
-    /// The mid-session chunk and the final utterance differ in what a failure
-    /// *means*, not in how text reaches the window, so the backspace-then-type
-    /// sequence exists once. A failed backspace is only a warning — the text
-    /// still goes in, exactly as it did before this was extracted.
-    fn emit(
-        &self,
-        kind: &'static str,
-        session: Option<SessionId>,
-        chunk: Option<ChunkId>,
-        raw: &str,
-        plan: &TypePlan,
-    ) -> EmitOutcome {
-        let (text, backspaces) = match plan {
-            TypePlan::Skip(reason) => return EmitOutcome::Skipped(*reason),
-            TypePlan::Type { text, backspaces } => (text, *backspaces),
-        };
-        // The acceptance question is asked here, at the boundary, rather than
-        // when the transcription started: a session can be cancelled while the
-        // engine is still working, and the text that arrives afterwards is
-        // text the user did not ask for any more.
-        //
-        // Note what this is *not*: a session that stopped recording is still
-        // accepted, because that is the ordinary path for the final chunk.
-        if let Some(id) = session {
-            if let Err(reason) = self.with_session(|s| s.accepts_result(id)) {
-                tracing::warn!(
-                    session = id.0,
-                    reason,
-                    "result arrived too late; not typing it"
-                );
-                return EmitOutcome::NotAttempted { reason };
-            }
-        }
-        tracing::info!(
-            kind,
-            session = session.map(|id| id.0),
-            chunk = chunk.map(|c| c.0),
-            raw = %raw,
-            typed = %text,
-            backspaces,
-            "text ready"
-        );
-        if backspaces > 0 {
-            if let Err(e) = inject_backspaces(backspaces) {
-                tracing::warn!(error = %e, "seam backspaces failed");
-            }
-        }
-        match inject_text(text) {
-            Ok(chars) => EmitOutcome::Typed { chars },
-            Err(e) => EmitOutcome::InjectionFailed {
-                error: format!("{e:#}"),
-            },
+        AudioUtterance {
+            samples: chunk,
+            sample_rate: rate,
         }
     }
+}
 
-    /// Transcribes and injects one mid-session chunk **without leaving the
-    /// recording state**: the microphone keeps running and the session continues.
-    ///
-    /// A failed chunk is logged and skipped — a long dictation must never be
-    /// aborted because one round trip failed (the final chunk still reports
-    /// errors through [`Self::finalize`]).
-    async fn process_chunk(
-        &self,
-        session: Option<SessionId>,
-        chunk: Option<ChunkId>,
-        audio: Vec<f32>,
-    ) {
-        if audio.is_empty() {
-            return;
+impl Port for MachinePort {
+    async fn begin(&self) -> Option<String> {
+        let mut bufs = self.bufs.lock().await;
+        bufs.audio.clear();
+        bufs.vad_cursor = 0;
+        if let Err(e) = self.services.capture.start() {
+            return Some(format!("{e:#}"));
         }
-        let sample_rate = self.services.capture.pipeline_sample_rate();
-        tracing::info!(
-            audio_secs = audio.len() as f32 / sample_rate as f32,
-            still_recording = self.services.capture.is_recording(),
-            "flushing mid-session chunk"
-        );
-
-        // phase 3.2: no `set_state(Processing)` here. A chunk boundary must not
-        // look like the recording stopped and restarted.
-        self.status.set_chunk_busy(true);
-        let utterance = AudioUtterance {
-            samples: audio,
-            sample_rate,
-        };
-        let raw = match self.services.router.transcribe(&utterance).await {
-            Ok(text) => text,
-            Err(e) => {
-                tracing::warn!(error = %e, "chunk transcription failed; recording continues");
-                self.resume_after_chunk();
-                return;
-            }
-        };
-
-        let processed = {
-            let dict = self.services.dictionary.read().unwrap();
-            let options = self.services.settings.text.options();
-            process_text_with(&raw, &self.services.normalizer, &dict, options)
-        };
-        // Seam repair: the audio overlap that keeps the cut from clipping a word
-        // also makes the recogniser repeat the previous chunk's tail — and a cut
-        // mid-word leaves a fragment behind. Both are repaired here, so a long
-        // dictation reads as one continuous text instead of stuttering.
-        let plan = plan_typing(&raw, &self.stitch_seam(&processed));
-        match self.emit("chunk", session, chunk, &raw, &plan) {
-            EmitOutcome::Skipped(reason) => {
-                tracing::info!(reason = reason.as_str(), "chunk produced nothing to type");
-            }
-            EmitOutcome::Typed { chars } => {
-                tracing::info!(chars, "chunk text injected");
-                if let TypePlan::Type { text, .. } = &plan {
-                    self.status.set_last_text(text.clone());
-                }
-            }
-            EmitOutcome::InjectionFailed { error } => {
-                tracing::warn!(%error, "chunk injection failed");
-            }
-            EmitOutcome::NotAttempted { reason } => {
-                tracing::warn!(reason, "chunk not typed");
-            }
-        }
-        self.resume_after_chunk();
+        // Reset endpoint state for the new utterance, and the engine's own
+        // cross-utterance state (Silero recurrent state + context), so stale
+        // audio cannot bias the first frames.
+        let mut unit = self.services.vad.lock().await;
+        unit.endpoint.reset();
+        unit.vad.reset();
+        None
     }
 
-    /// Back to `Recording` while the microphone is still live (chunked session),
-    /// otherwise `Idle`.
-    fn resume_after_chunk(&self) {
-        self.status.set_chunk_busy(false);
-        let live = self.services.capture.is_recording();
-        if live {
-            self.status.set_state(AppState::Recording);
-        } else {
-            self.status.set_state(AppState::Idle);
+    async fn poll(&self) -> Result<PollOutcome> {
+        let mut bufs = self.bufs.lock().await;
+        let fresh = self.services.capture.take_audio();
+        if !fresh.is_empty() {
+            bufs.audio.extend_from_slice(&fresh);
         }
-        // A capture device that disappeared mid-chunk ends the session here, not
-        // on the next key press: the rules must not keep believing we are
-        // recording, or that press would find a session already open.
-        self.with_session(|s| s.note_capture_live(live));
+        self.feed_vad(&mut bufs).await;
+
+        let streaming = &self.services.settings.streaming;
+        let rate = self.services.capture.pipeline_sample_rate();
+        let decision = {
+            let unit = self.services.vad.lock().await;
+            let cutoff = self.services.settings.vad.cutoff_on_hold;
+            endpoint_decision(
+                bufs.audio.len(),
+                unit.endpoint.should_finalize(),
+                cutoff,
+                streaming.enabled,
+                self.services.capture.capacity(),
+                u64::from(rate) * streaming.max_utterance_seconds,
+            )
+        };
+        if let EndpointDecision::Finalize(reason) = decision {
+            tracing::debug!(reason = reason.as_str(), "ending utterance");
+            self.services.capture.stop()?;
+            let audio = std::mem::take(&mut bufs.audio);
+            return Ok(PollOutcome::Finished {
+                audio: self.take_utterance(audio).await,
+            });
+        }
+        if self.chunk_flush_due(bufs.audio.len()).await {
+            let chunk = self.take_chunk(&mut bufs);
+            if !chunk.samples.is_empty() {
+                return Ok(PollOutcome::Chunk { audio: chunk });
+            }
+        }
+        Ok(PollOutcome::More)
     }
 
-    /// Stops capture, feeds remaining complete frames to VAD, and returns the accumulated audio.
-    async fn take_and_stop(
-        &self,
-        buffer: &mut Vec<f32>,
-        vad_cursor: &mut usize,
-        frame: usize,
-    ) -> Vec<f32> {
+    async fn finish(&self) -> Result<Option<AudioUtterance>> {
+        let mut bufs = self.bufs.lock().await;
         // Flush anything still in the ring buffer.
         let fresh = self.services.capture.take_audio();
-        buffer.extend_from_slice(&fresh);
-        let _ = self.services.capture.stop();
-
-        // Feed any remaining complete frames to VAD so endpoint speech
-        // calculations are accurate before finalize checks has_enough_speech().
-        self.feed_vad(buffer, vad_cursor, frame).await;
-
-        std::mem::take(buffer)
-    }
-
-    /// Transcribes, post-processes and injects. Never returns Err to the
-    /// caller: failures land in the Error state and we return to Idle.
-    async fn finalize(&self, session: Option<SessionId>, audio: Vec<f32>) {
-        self.finalize_inner(session, audio).await;
-        // The session is finished on *every* path out of here — result typed,
-        // result refused, not enough speech, ASR failed, nothing to type. Doing
-        // it here rather than at each return is what keeps an abandoned session
-        // from sitting open forever, which would make every later check against
-        // it meaningless.
-        //
-        // (A panic inside `finalize_inner` skips this; `state::machine_run`
-        // catches that and the process is going down anyway.)
-        if let Some(id) = session {
-            self.with_session(|s| s.result_arrived(id));
+        if !fresh.is_empty() {
+            bufs.audio.extend_from_slice(&fresh);
         }
+        let _ = self.services.capture.stop();
+        // Feed any remaining complete frames to the VAD, so the endpoint's
+        // speech total is accurate before the verdict is read.
+        self.feed_vad(&mut bufs).await;
+        let audio = std::mem::take(&mut bufs.audio);
+        Ok(self.take_utterance(audio).await)
     }
 
-    async fn finalize_inner(&self, session: Option<SessionId>, audio: Vec<f32>) {
-        self.status.set_state(AppState::Processing);
-
-        // Audio-level diagnostics: distinguishes "mic delivered silence"
-        // (peak ≈ −∞ dBFS → wrong/muted device) from "audio arrived but VAD
-        // called it non-speech" (healthy levels, discarded).
-        let levels = AudioLevels::measure(&audio);
-        tracing::info!(
-            samples = audio.len(),
-            peak_dbfs = format!("{:.1}", levels.peak_dbfs()),
-            rms_dbfs = format!("{:.1}", levels.rms_dbfs()),
-            "utterance audio levels"
-        );
-
-        let sample_rate = self.services.capture.pipeline_sample_rate();
-        let enough = {
-            let mut unit = self.services.vad.lock().await;
-            let ok = unit.endpoint.has_enough_speech();
-            let speech_secs = unit.endpoint.speech_samples() as f64 / f64::from(sample_rate);
-            let total_secs = unit.endpoint.total_samples() as f64 / f64::from(sample_rate);
-            tracing::info!(
-                speech_secs = format!("{speech_secs:.2}"),
-                total_secs = format!("{total_secs:.2}"),
-                "endpoint summary"
-            );
+    async fn discard(&self) -> Result<()> {
+        let mut bufs = self.bufs.lock().await;
+        bufs.audio.clear();
+        bufs.vad_cursor = 0;
+        let _ = self.services.capture.stop();
+        if let Ok(mut unit) = self.services.vad.try_lock() {
             unit.endpoint.reset();
             unit.vad.reset();
-            ok
-        };
-        if !enough {
-            tracing::info!("utterance discarded: not enough speech");
-            self.status.set_state(AppState::Idle);
-            return;
         }
+        Ok(())
+    }
 
-        let utterance = AudioUtterance {
-            samples: audio,
-            sample_rate,
-        };
-        tracing::info!(
-            audio_secs = utterance.duration_secs(),
-            "transcribing utterance"
-        );
+    fn capture_live(&self) -> bool {
+        self.services.capture.is_recording()
+    }
+}
 
-        let raw = match self.services.router.transcribe(&utterance).await {
-            Ok(t) => t,
-            Err(e) => {
-                self.status
-                    .set_state(AppState::Error(format!("ASR failed: {e:#}")));
-                return;
-            }
-        };
+/// How often the heartbeat beats.
+///
+/// One value, shared by the app and by the tests that drive the beat with a
+/// clock they control: a schedule pinned to a different number in a test is a
+/// schedule nobody measured.
+pub(crate) const HEARTBEAT: Duration = Duration::from_millis(20);
 
-        let processed = {
-            let dict = self.services.dictionary.read().unwrap();
-            let options = self.services.settings.text.options();
-            process_text_with(&raw, &self.services.normalizer, &dict, options)
-        };
-        // The final chunk of a streamed session sits on the same seam as the
-        // mid-session ones, so it is stitched the same way.
-        let plan = plan_typing(&raw, &self.stitch_seam(&processed));
-        // The last piece of audio gets the next chunk id of the same session,
-        // so a streamed dictation reads 1..n across chunks and then this one.
-        let chunk = session.and_then(|id| self.with_session(|s| s.next_chunk(id)));
-        // The visible state moves to `Typing` *before* the keystrokes go out, so
-        // the orb shows it. A mid-session chunk deliberately does not (phase
-        // 3.2), which is why this stays in the finalise path and not in `emit`.
-        match &plan {
-            TypePlan::Skip(reason) => {
-                tracing::info!(reason = reason.as_str(), "nothing to type");
-                self.status.set_state(AppState::Idle);
-                return;
-            }
-            TypePlan::Type { .. } => self.status.set_state(AppState::Typing),
-        }
-        let outcome = self.emit("final", session, chunk, &raw, &plan);
-        match &outcome {
-            EmitOutcome::Typed { chars } => {
-                tracing::info!(chars, "text injected");
-                if let TypePlan::Type { text, .. } = &plan {
-                    self.status.set_last_text(text.clone());
+/// The one producer of [`Input`]: hotkey events from the source thread, and
+/// the heartbeat beat.
+///
+/// It stops the moment the event source is closed, and stopping means **dropping
+/// the sender** — a closed channel is the only shutdown signal the loop has
+/// ([`super::coordinator::Coordinator::run`]), so a beat that went on ticking
+/// would hide the end of the program: the loop would sit in its `select!`
+/// forever with a heartbeat it did not need and a source that will never speak
+/// again.
+///
+/// Both producers live in one task for that reason. Split across two, each held
+/// its own clone of the sender, and the beat's clone was the reason a closed
+/// source changed nothing at all.
+async fn forward_until_closed(
+    events: &mut mpsc::UnboundedReceiver<HotkeyEvent>,
+    input: &mpsc::UnboundedSender<Input>,
+    period: Duration,
+) {
+    // When the next beat is due. It moves in **exactly one place**: the branch
+    // that has just sent a beat.
+    //
+    // That is not a style preference. The wait below is rebuilt on every turn of
+    // this loop, and every event that arrives first throws the previous one away
+    // — so a schedule that moved while the wait was *built* would be moved by
+    // every keystroke: the heartbeat would be pushed later by the user who is
+    // typing, which is the opposite of what a heartbeat is for. Reading it and
+    // writing it are two separate statements here so that the difference stays
+    // visible.
+    //
+    // The first beat is one period out rather than immediate: a tick with no
+    // open session has no audio to pump.
+    let mut due = tokio::time::Instant::now() + period;
+    loop {
+        tokio::select! {
+            // Event first, for the same reason the loop prefers its input: what
+            // the user did outranks a background tick.
+            biased;
+            event = events.recv() => match event {
+                Some(ev) => {
+                    if input.send(Input::Event(ev)).is_err() {
+                        // The loop is gone; nothing left to feed.
+                        return;
+                    }
                 }
+                // The source is closed: no hotkey can ever arrive again, so the
+                // beat has nothing left to keep alive either. Returning drops
+                // the last sender, and the loop hears the end as the closure it
+                // was written to hear.
+                None => return,
+            },
+            _ = tokio::time::sleep_until(due) => {
+                if input.send(Input::Tick).is_err() {
+                    return;
+                }
+                // Only now, with a beat behind us, does the schedule move.
+                let now = tokio::time::Instant::now();
+                due = next_beat_at(due, now, period);
             }
-            EmitOutcome::NotAttempted { reason } => {
-                tracing::info!(reason, "final result not typed");
-            }
-            EmitOutcome::InjectionFailed { error } => {
-                tracing::error!(%error, "final injection failed");
-            }
-            EmitOutcome::Skipped(_) => unreachable!("plan was checked above"),
         }
-        self.status.set_state(state_after_emit(&outcome));
+    }
+}
 
-        // `Error` is transient: keep it visible just long enough to read, then
-        // return to Idle so the next push-to-talk press starts a fresh
-        // recording instead of being swallowed by a stale failure.
-        if is_transient(&self.status.snapshot().state) {
-            tokio::time::sleep(ERROR_READABLE).await;
-            self.status.set_state(AppState::Idle);
+/// Where the schedule goes after a beat that was due at `at` and happened at
+/// `now`: `Skip`, exactly as `MissedTickBehavior::Skip`.
+///
+/// Keep the period while the loop kept up, and start again from `now` when it did
+/// not. A long stall therefore arrives as one beat instead of the backlog it was —
+/// and re-basing to `now` rather than to `now + period` would deliver a second
+/// beat at that same instant, which is a burst of two.
+///
+/// A function rather than an inline expression for one honest reason: this is the
+/// one rule the loop's own clock cannot demonstrate. A paused clock steps from one
+/// timer deadline to the next, so the producer is never late and both branches
+/// agree; a scenario that wants a stalled task would have to stop the runtime from
+/// polling it, which is not something a test here can arrange. So the rule is
+/// tested as arithmetic ([`tests::a_late_beat_is_followed_by_one_a_full_period_later`])
+/// and the loop's use of it is read in [`forward_until_closed`].
+fn next_beat_at(
+    at: tokio::time::Instant,
+    now: tokio::time::Instant,
+    period: Duration,
+) -> tokio::time::Instant {
+    std::cmp::max(at + period, now + period)
+}
+
+/// The running application.
+///
+/// Deliberately thin now: it builds the hardware port and the coordinator and
+/// gets out of the way. The rules live in [`super::session`], the loop in
+/// [`super::coordinator`], and this type only owns the two things the GUI
+/// reaches for — a status subscription and the 20 ms heartbeat.
+pub struct StateMachine {
+    services: Arc<AppServices>,
+    /// The UI status channel, shared with the coordinator: both write it, and
+    /// the GUI reads it.
+    status: Arc<StatusChannel>,
+    /// Text waiting on the user, and the answers the loop will read.
+    ///
+    /// Owned here for the same reason the status channel is: it is the type that
+    /// builds the coordinator, and the dashboard needs the *same* instance. A
+    /// second one would be a second truth about whether text is waiting.
+    review: Arc<crate::state::ReviewChannel>,
+}
+
+impl StateMachine {
+    pub fn new(services: AppServices) -> Self {
+        let vad_engine = match &services.vad.try_lock() {
+            Ok(u) => u.engine_name(),
+            Err(_) => "…",
+        };
+        Self {
+            services: Arc::new(services),
+            status: Arc::new(StatusChannel::new(vad_engine)),
+            review: crate::state::ReviewChannel::new(),
         }
+    }
+
+    /// Subscribe to status updates (for the overlay/tray).
+    pub fn subscribe(&self) -> watch::Receiver<AppStatus> {
+        self.status.subscribe()
+    }
+
+    /// The microphone gate, for whoever runs a diagnostic test.
+    ///
+    /// Handed out from here because this is the type that *has* the status
+    /// channel the answer comes from. Building it anywhere else would mean
+    /// opening a second channel, and a second channel is a second truth: a
+    /// gate watching a status nobody publishes to would happily hand the
+    /// microphone over in the middle of a dictation.
+    pub(crate) fn mic_gate(&self) -> std::sync::Arc<crate::audio::gate::LiveMicGate> {
+        std::sync::Arc::new(crate::audio::gate::LiveMicGate::new(
+            self.status.clone(),
+        ))
+    }
+
+    /// The review/recovery wire, for whoever draws the review window.
+    ///
+    /// Handed out from here for the same reason as [`Self::mic_gate`]: the
+    /// dashboard must read the *same* drafts the loop raised, and building a
+    /// second channel would be a second answer to "is any text waiting?".
+    pub(crate) fn review_channel(&self) -> Arc<crate::state::ReviewChannel> {
+        self.review.clone()
+    }
+
+    /// Forwards a live partial transcript from a streaming engine.
+    pub fn publish_partial(&self, text: &str) {
+        self.status.publish_partial(text);
+    }
+
+    /// Starts the one coordination loop and feeds it until it stops.
+    ///
+    /// Both producers land on the same `Input` channel: forwarded hotkey
+    /// events, and a 20 ms heartbeat. The loop cannot tell them apart, which is
+    /// what lets a test beat by hand instead of sleeping — and it means there is
+    /// one place where "what the user did" enters the program.
+    pub async fn run(
+        self: Arc<Self>,
+        mut events: mpsc::UnboundedReceiver<HotkeyEvent>,
+    ) -> Result<()> {
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<Input>();
+        let producer = tokio::spawn(async move {
+            forward_until_closed(&mut events, &input_tx, HEARTBEAT).await;
+        });
+
+        let settings = self.services.settings.clone();
+        let coordinator = Coordinator::new(
+            MachinePort::new(self.services.clone()),
+            Speech {
+                // `AsrRouter` is a cheap handle over shared state, so cloning it
+                // costs an allocation and not a second copy of anything.
+                router: Arc::new(self.services.router.clone()),
+                normalizer: self.services.normalizer.clone(),
+                dictionary: self.services.dictionary.clone(),
+                settings: settings.clone(),
+            },
+            SessionDriver::new(&settings.hotkey),
+            self.status.clone(),
+            // The user's delivery choice, read once here. Pacing is decided at
+            // startup rather than per call so that one dictation can never be
+            // half burst and half paced.
+            Arc::new(KeystrokeSink {
+                pacing: crate::state::coordinator::TypePacing::from_settings(&settings.gui),
+            }),
+            // The window each dictation is for, read when recording starts and
+            // re-checked before every insert.
+            Arc::new(WindowTargets),
+            Arc::new(SystemClock),
+            self.review.clone(),
+        );
+        let result = coordinator.run(input_rx).await;
+
+        // The producer stops with the loop. After a closed source it has already
+        // returned; after a Quit it is parked on a channel that will never
+        // speak, and its sends only fail once `input_rx` is dropped — there is
+        // no reason to wait for that to be noticed.
+        producer.abort();
+        result
     }
 }
 
@@ -753,33 +530,7 @@ impl StateMachine {
 mod tests {
     use super::*;
     use crate::config::settings::StreamingSettings;
-
-    /// The bug this pins: a result refused because its session was cancelled
-    /// used to be able to land on the error badge. To a user that reads as "the
-    /// app failed" for something they just asked for, and it keeps push-to-talk
-    /// looking broken for the length of the badge.
-    #[test]
-    fn a_refused_result_is_not_shown_as_an_error() {
-        let refused = EmitOutcome::NotAttempted {
-            reason: "late result of a cancelled session",
-        };
-        assert_eq!(state_after_emit(&refused), AppState::Idle);
-
-        // A genuine insertion failure is still an error — the two must not be
-        // flattened into each other by the fix above.
-        let failed = EmitOutcome::InjectionFailed {
-            error: "blocked".to_string(),
-        };
-        assert!(matches!(
-            state_after_emit(&failed),
-            AppState::Error(_) | AppState::Idle
-        ));
-        assert_ne!(
-            state_after_emit(&refused),
-            state_after_emit(&failed),
-            "a refusal must not be reported the way a failure is"
-        );
-    }
+    use crate::processing::seam::SeamOptions;
 
     #[test]
     fn seam_repair_can_be_switched_off_from_settings() {
@@ -798,15 +549,288 @@ mod tests {
         assert!(opts.dedupe && !opts.backspace && opts.max_overlap_words == 3);
     }
 
-    /// Pure policy check mirroring the endpoint rules used by the machine.
+    /// Pure policy check mirroring the endpoint rules used by the port.
     #[test]
     fn endpoint_policy_finalizes_on_timeout_or_release() {
-        // This mirrors VadUnit logic; the machine's own transitions are
+        // This mirrors VadUnit logic; the port's own transitions are
         // integration-tested with real devices (see tests/).
         let mut ep = Endpoint::new(crate::vad::VadConfig::default(), 16_000);
         ep.feed(&crate::vad::FrameResult::from_bool(true, 16_000));
         // 1.5 s of trailing silence (≥ default 1500 ms timeout).
         ep.feed(&crate::vad::FrameResult::from_bool(false, 24_001));
         assert!(ep.should_finalize());
+    }
+
+    /// A running producer with both of its ends: `events` is the source the test
+    /// closes, `input` is what the loop reads.
+    ///
+    /// The period is [`HEARTBEAT`] — the app's own number — so what these
+    /// scenarios measure is the schedule that ships, not a convenient one.
+    fn producer() -> (
+        mpsc::UnboundedSender<HotkeyEvent>,
+        mpsc::UnboundedReceiver<Input>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (events, mut events_rx) = mpsc::unbounded_channel::<HotkeyEvent>();
+        let (input, input_rx) = mpsc::unbounded_channel::<Input>();
+        let handle = tokio::spawn(async move {
+            forward_until_closed(&mut events_rx, &input, HEARTBEAT).await;
+        });
+        (events, input_rx, handle)
+    }
+
+    /// One event through the producer, so that its schedule already exists before
+    /// the test reads the clock.
+    ///
+    /// The producer computes its first deadline when it first runs. A test that
+    /// moved the clock before that would be comparing its own `start` with a
+    /// deadline the producer counted from a *later* instant, and every assertion
+    /// would be off by exactly that difference — which is the kind of wrong that
+    /// still looks like a number.
+    async fn handshake(
+        events: &mpsc::UnboundedSender<HotkeyEvent>,
+        input: &mut mpsc::UnboundedReceiver<Input>,
+    ) {
+        events
+            .send(HotkeyEvent::RecordDown)
+            .expect("the producer is running");
+        assert!(
+            matches!(
+                input.recv().await,
+                Some(Input::Event(HotkeyEvent::RecordDown))
+            ),
+            "the handshake never reached the loop's input"
+        );
+    }
+
+    /// Whether the producer has stopped, asked without a clock.
+    ///
+    /// A paused clock advances only when the runtime is idle, so a producer that
+    /// never stops would freeze time and turn a `timeout` here into a hang — on the
+    /// very mutation this is meant to catch. A bounded number of yields asks the
+    /// question directly instead.
+    async fn settled(producer: &tokio::task::JoinHandle<()>) -> bool {
+        for _ in 0..1_000 {
+            if producer.is_finished() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        producer.is_finished()
+    }
+
+    /// Waits for the next beat and reports **when it landed**.
+    ///
+    /// The clock is the virtual one, so "when" is an exact instant rather than a
+    /// duration somebody hoped was close enough — which is the whole reason these
+    /// scenarios can say anything about a *schedule*. Events are skipped rather
+    /// than mistaken for beats, and a closed channel fails instead of waiting
+    /// forever.
+    async fn beat_at(input: &mut mpsc::UnboundedReceiver<Input>) -> tokio::time::Instant {
+        loop {
+            match input.recv().await {
+                Some(Input::Tick) => return tokio::time::Instant::now(),
+                Some(Input::Event(_)) => continue,
+                None => panic!("the producer stopped before the beat arrived"),
+            }
+        }
+    }
+
+    /// Several events before the first deadline must not push the beat later.
+    ///
+    /// This is the whole point of the schedule living in one variable that only
+    /// the beat branch writes: the wait is rebuilt on every one of these events
+    /// and thrown away, and a heartbeat that moved when the wait was *built* would
+    /// end up `HEARTBEAT` later for every keystroke the user pressed first.
+    ///
+    /// Three events, no time passing, then the beat — and the claim is the
+    /// instant it lands on, not that it arrived at all. A schedule that slid by a
+    /// period per event would land at four periods instead of one.
+    #[tokio::test(start_paused = true)]
+    async fn several_events_before_the_deadline_leave_the_beat_where_it_was() {
+        let (events, mut input, producer) = producer();
+        handshake(&events, &mut input).await;
+        let start = tokio::time::Instant::now();
+
+        // Two more before the first deadline, so three events have been handled
+        // and three waits built and thrown away.
+        for _ in 0..2 {
+            events
+                .send(HotkeyEvent::RecordUp)
+                .expect("the producer is running");
+            assert!(
+                matches!(
+                    input.recv().await,
+                    Some(Input::Event(HotkeyEvent::RecordUp))
+                ),
+                "an event never reached the loop's input"
+            );
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start,
+            "the test let time pass on its own"
+        );
+
+        let landed = beat_at(&mut input).await;
+        assert_eq!(
+            landed,
+            start + HEARTBEAT,
+            "the events moved the beat off the deadline it had already announced"
+        );
+
+        producer.abort();
+    }
+
+    /// One event, arriving while the wait is pending, cancels that wait — and
+    /// cancelling is not the same as rescheduling.
+    ///
+    /// The event lands halfway to the deadline, which is where a cancellation
+    /// would do the most damage if it were treated as a fresh beat.
+    ///
+    /// The two steps are in this order on purpose. The event is **queued before
+    /// the clock moves**, so the producer finds it waiting the next time it runs
+    /// rather than racing the deadline; advancing first would let the clock reach
+    /// the deadline while the event was still in the channel, and the scenario
+    /// would stop being about a cancellation at all.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_that_cancels_the_wait_does_not_move_the_beat() {
+        let (events, mut input, producer) = producer();
+        handshake(&events, &mut input).await;
+        let start = tokio::time::Instant::now();
+
+        events
+            .send(HotkeyEvent::RecordUp)
+            .expect("the producer is running");
+        tokio::time::advance(HEARTBEAT / 2).await;
+        assert!(
+            matches!(
+                input.recv().await,
+                Some(Input::Event(HotkeyEvent::RecordUp))
+            ),
+            "the cancelling event never reached the loop's input"
+        );
+
+        let landed = beat_at(&mut input).await;
+        assert_eq!(
+            landed,
+            start + HEARTBEAT,
+            "cancelling the wait pushed the beat half a period later"
+        );
+
+        producer.abort();
+    }
+
+    /// A late beat is followed by one a full period later, not by the backlog —
+    /// the part of `Skip` that a clock cannot show, so it is tested as
+    /// arithmetic.
+    ///
+    /// All three wrong answers are here because they are all different: `now`
+    /// (no period at all) delivers a second beat at the same instant, a plain
+    /// `at + period` walks the backlog, and a bare `max(at, now) + period` of the
+    /// *due* time keeps the lateness instead of measuring the quiet from now.
+    #[test]
+    fn a_late_beat_is_followed_by_one_a_full_period_later() {
+        let t0 = tokio::time::Instant::now();
+        let due = t0 + HEARTBEAT;
+
+        // On time: the period is kept, so the schedule neither drifts nor slips.
+        assert_eq!(next_beat_at(due, due, HEARTBEAT), t0 + HEARTBEAT * 2);
+        // A hair late: still a full period of quiet, measured from the beat that
+        // actually happened — a heartbeat that pumps audio is better slightly
+        // off-phase than back-to-back.
+        assert_eq!(
+            next_beat_at(due, due + Duration::from_millis(1), HEARTBEAT),
+            due + HEARTBEAT + Duration::from_millis(1)
+        );
+        // Twenty-five periods late: the backlog is dropped, and the next beat is
+        // one period after the one that happened.
+        let late = due + Duration::from_millis(500);
+        assert_eq!(next_beat_at(due, late, HEARTBEAT), late + HEARTBEAT);
+        assert_ne!(
+            next_beat_at(due, late, HEARTBEAT),
+            late,
+            "re-basing to the stall itself would deliver a second beat at once"
+        );
+        assert_ne!(
+            next_beat_at(due, late, HEARTBEAT),
+            due + HEARTBEAT,
+            "the backlog was walked instead of dropped"
+        );
+    }
+
+    /// The schedule keeps its period over several beats — the clock-level half of
+    /// what `Skip` promises, and the part a loop can be caught on.
+    ///
+    /// What this cannot cover is spelled out in [`next_beat_at`]: a paused clock
+    /// never lets the producer be late, so the "long stall" half of the rule is
+    /// arithmetic over there, not a scenario in here.
+    #[tokio::test(start_paused = true)]
+    async fn beats_keep_the_period_they_were_given() {
+        let (events, mut input, producer) = producer();
+        handshake(&events, &mut input).await;
+        let start = tokio::time::Instant::now();
+
+        for beat in 1..=5u32 {
+            tokio::time::advance(HEARTBEAT).await;
+            assert_eq!(
+                beat_at(&mut input).await,
+                start + HEARTBEAT * beat,
+                "beat {beat} landed off the schedule"
+            );
+        }
+
+        producer.abort();
+    }
+
+    /// A closed event source has to reach the loop, and a heartbeat must not be
+    /// able to hide it.
+    ///
+    /// That is not a promise about the loop — it is about the *channel*. The
+    /// loop stops when its input closes, so anything still holding a sender
+    /// after the source is gone keeps the loop waiting for a hotkey that can
+    /// never arrive. The old wiring had two senders: the forwarder returned
+    /// quietly on a closed source while the heartbeat's clone went on beating
+    /// every 20 ms, and the program never learned its input had ended.
+    ///
+    /// No microphone, and neither wait below asks the clock. That is not a
+    /// detail: a paused clock only moves when the runtime has nothing else to
+    /// do, so a producer that never stops — which is exactly what this scenario
+    /// exists to catch — would keep the runtime busy forever and the virtual
+    /// `timeout` would never fire. The first version of this test therefore
+    /// *hung* on the mutation it was written for, which is the worst possible way
+    /// to be green. Yielding a bounded number of times asks the same question
+    /// with no clock involved.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_event_source_drops_the_last_sender_while_the_beat_is_alive() {
+        let (events, mut input, producer) = producer();
+        handshake(&events, &mut input).await;
+
+        // A beat happens, so the heartbeat is a live one: the source is about to
+        // close with the beat still able to fire, which is the case that used to
+        // hide the shutdown.
+        tokio::time::advance(HEARTBEAT).await;
+        assert!(
+            matches!(input.recv().await, Some(Input::Tick)),
+            "the heartbeat never reached the loop's input"
+        );
+
+        drop(events);
+        assert!(
+            settled(&producer).await,
+            "the producer kept running after its event source closed"
+        );
+        producer.await.expect("the producer task itself");
+
+        // With the last sender gone, the loop's `recv` is the closure it was
+        // written to hear. This is the whole propagation: a channel with a sender
+        // still in it would read as empty-here, and that is the shape the bug
+        // had.
+        assert!(
+            input.try_recv().is_err_and(|closed| {
+                matches!(closed, tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            }),
+            "the loop's input is still open after the source closed"
+        );
     }
 }

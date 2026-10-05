@@ -148,6 +148,30 @@ pub struct Orb {
     /// wgpu surface reconfigure continuously (thousands of
     /// `wgpu_hal::vulkan ... present mode` warnings per session).
     sent_side_pt: Option<f32>,
+    /// Whether the primary button was down last frame, so a **press** can be
+    /// told from a hold. A press that never becomes a click is exactly what a
+    /// dead ring looks like from the outside, and `clicked` alone never sees
+    /// it, so the edge is detected here to be able to write it down.
+    press_down: bool,
+    /// Pixels-per-point and the pointer position, captured each frame for
+    /// [`Self::log_pointer`].
+    ///
+    /// Held as fields rather than passed in because the diagnostic is called
+    /// from inside the `Area` closure, where both values already exist but the
+    /// closure cannot borrow them out of `self` alongside `ui`. The position is
+    /// in **egui points**, the same space as the orb's `center` — see the note
+    /// on `log_pointer` for why the Win32 screen cursor cannot be used there.
+    last_ppp: f32,
+    last_pointer_pos: Option<Pos2>,
+    /// The user's chosen size, as a multiplier on the built-in one.
+    ///
+    /// A **multiplier on the whole orb**, including its click target and the
+    /// canvas it is painted into — not a separate size for the drawing. Those
+    /// have to move together, because the click region is derived from the
+    /// painted circle: a larger drawing with the old region would be an orb you
+    /// cannot reliably click, and a smaller region than the drawing would eat
+    /// clicks belonging to the desktop behind it.
+    user_scale: f32,
 }
 
 impl Orb {
@@ -171,6 +195,9 @@ impl Orb {
             // Reconciled with the work area on the first frame, once ppp is real.
             home_needs_clamp: saved_center.is_some(),
             drag: None,
+        last_ppp: 1.0,
+        last_pointer_pos: None,
+            user_scale: 1.0,
             shown_mode: OrbMode::Idle,
             complete_hold: 0.0,
             error_shake: 0.0,
@@ -178,14 +205,24 @@ impl Orb {
             time: 0.0,
             audio_level: None,
             sent_side_pt: None,
+            press_down: false,
         }
     }
 
-    /// Initial window side: the fixed canvas from [`Orb::max_canvas_points`],
-    /// so the very first frame already has the final size and the window is
-    /// never resized afterwards.
+    /// Initial window side: the fixed canvas from
+    /// [`Orb::max_canvas_points_for`], so the very first frame already has the
+    /// final size and the window is never resized afterwards.
+    ///
+    /// Sized for [`MAX_USER_SCALE`] rather than the user's current setting,
+    /// because the window is created **once**: sizing it for the setting as it
+    /// stands today would clip the orb the moment the user enlarged it, and
+    /// growing the window later would strand the pixels the old rect covered.
+    ///
+    /// The window is fully transparent and its click region is shaped to the
+    /// orb each frame, so the extra margin costs nothing the user can see or
+    /// click through.
     pub fn initial_side_points() -> f32 {
-        Self::max_canvas_points()
+        Self::max_canvas_points_for(MAX_USER_SCALE)
     }
 
     /// Optional: hand over an HWND you already own instead of title lookup.
@@ -200,6 +237,120 @@ impl Orb {
 
     pub fn home_position(&self) -> (i32, i32) {
         (self.home.x.round() as i32, self.home.y.round() as i32)
+    }
+
+    /// Whether a drag is in progress. The idle policy treats this as a blocker
+    /// rather than inferring it from a mode, because a drag and an `Idle` orb
+    /// look identical from the state channel.
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Moves the orb's resting centre to `to`, in physical screen pixels.
+    ///
+    /// Returns whether the orb actually got there. The orb is clamped into the
+    /// work area before it moves, so a target that was computed for a monitor
+    /// which has since changed ends up somewhere legal but not where it was
+    /// asked to go — and the policy needs to be told that, because a "return"
+    /// that silently landed elsewhere is worse than one that did not happen.
+    ///
+    /// `home_needs_clamp` is cleared here rather than deferred to the next
+    /// frame: this is a whole position change, not the first-frame reconcile,
+    /// and leaving the flag set would let `clamp_home` move the orb a second
+    /// time with a possibly different `ppp`.
+    pub fn move_home_to(&mut self, to: Pos2, ppp: f32) -> bool {
+        let clamped = win::clamp_center(to, keep_out_px(self.draw_scale(), ppp));
+        let reached = (clamped - to).length() <= 1.0;
+        if !reached {
+            tracing::info!(
+                requested = %format_args!("({:.0}, {:.0})", to.x, to.y),
+                clamped_to = %format_args!("({:.0}, {:.0})", clamped.x, clamped.y),
+                "orb could not reach the requested waiting spot"
+            );
+        }
+        self.home = clamped;
+        self.anim.snap_position(clamped);
+        self.home_needs_clamp = false;
+        reached
+    }
+
+    /// Moves the orb to `to` as a **visible glide** rather than a jump.
+    ///
+    /// The idle return used to call [`Self::move_home_to`], which calls
+    /// `snap_position` and puts the orb at its destination inside a single
+    /// frame. From the user's side the orb was simply not there any more for a
+    /// moment and then was, somewhere else — which reads as the app glitching
+    /// rather than as the app tidying up.
+    ///
+    /// So the destination is published as the spring's *target* and the existing
+    /// per-frame integration carries it there. No new easing, no timer, no
+    /// second animation: the mechanism that already smooths the orb's hover and
+    /// scale excursion is the one that moves it, which is also why the canvas
+    /// has to stay large enough for the excursion (it already is).
+    ///
+    /// `reached` is reported the same way as the instant move — whether the
+    /// spot was reachable — because "it is still gliding" is not a failure, and
+    /// the policy's job is to know the *destination* was valid.
+    ///
+    /// The spring's overshoot is why the canvas carries margin: a plain ease
+    /// would be simpler, but a spring that visibly overshoots into the corner
+    /// and settles back is what makes the motion read as a deliberate trip
+    /// rather than a glitch.
+    pub fn glide_home_to(&mut self, to: Pos2, ppp: f32) -> bool {
+        let clamped = win::clamp_center(to, keep_out_px(self.draw_scale(), ppp));
+        let reached = (clamped - to).length() <= 1.0;
+        if !reached {
+            tracing::info!(
+                requested = %format_args!("({:.0}, {:.0})", to.x, to.y),
+                clamped_to = %format_args!("({:.0}, {:.0})", clamped.x, clamped.y),
+                "orb could not reach the requested waiting spot"
+            );
+        }
+        self.home = clamped;
+        // Target only: `current_position` is left where it is and the animation
+        // closes the gap over the next frames.
+        self.anim.set_target_position(clamped);
+        self.home_needs_clamp = false;
+        reached
+    }
+
+    /// Whether a glide is still in progress, for callers that need the window to
+    /// stay awake until the orb has arrived.
+    pub fn is_gliding(&self) -> bool {
+        (self.anim.target_position - self.anim.current_position).length() >= 0.35
+    }
+
+    /// The scale every piece of orb geometry is drawn and clicked at: the
+    /// animation's own scale, times the user's size preference.
+    ///
+    /// **One accessor on purpose.** The radius, the click target, the window
+    /// region, the edge margin and the clamp all have to agree, and each of them
+    /// used to read `anim.current_scale` directly. A user-size setting threaded
+    /// into seven places is seven chances to grow the drawing and forget the
+    /// click region, which produces the one failure this code must never have:
+    /// an orb that is visible but cannot be clicked.
+    pub fn draw_scale(&self) -> f32 {
+        self.anim.current_scale * self.user_scale
+    }
+
+    /// Sets the user's size preference, clamped by the caller.
+    pub fn set_user_scale(&mut self, scale: f32) {
+        self.user_scale = scale.clamp(0.6, 2.0);
+    }
+
+    pub fn user_scale(&self) -> f32 {
+        self.user_scale
+    }
+
+    /// The canvas this orb needs, at the given user scale.
+    ///
+    /// A parameter rather than reading `self.user_scale`, because the window is
+    /// created once at startup and must be sized for the **largest** orb the
+    /// user can select — not the one currently selected. Sizing it for the
+    /// current one would clip a later enlargement, and resizing a layered
+    /// window strands the pixels the old rect covered.
+    pub fn max_canvas_points_for(user_scale: f32) -> f32 {
+        painted_reach_pt(max_reachable_scale() * user_scale, true) * 2.0
     }
 
     pub fn show(&mut self, ctx: &eframe::egui::Context, requested: OrbMode) -> OrbOutput {
@@ -232,7 +383,7 @@ impl Orb {
             .interactable(true)
             .show(ctx, |ui| {
                 let screen = ui.ctx().screen_rect();
-                let radius = BASE_DIAMETER * 0.5 * self.anim.current_scale;
+                let radius = BASE_DIAMETER * 0.5 * self.draw_scale();
                 let center = screen.center() + self.shake_offset(radius);
 
                 // The pointer target is the orb's own painted circle, not a
@@ -241,10 +392,28 @@ impl Orb {
                 // (drawn from the geometry) was 27.9 pt wider than this and the
                 // difference was a dead ring around the orb — clicks the window
                 // took from the desktop and threw away.
-                let hit_radius = interaction_radius_pt(self.anim.current_scale, mode.shakes());
+                let hit_radius = interaction_radius_pt(self.draw_scale(), mode.shakes());
                 let hit_rect = Rect::from_center_size(center, Vec2::splat(hit_radius * 2.0));
                 let response =
                     ui.interact(hit_rect, Id::new("omnitype_orb"), Sense::click_and_drag());
+
+                // Measured here rather than in `handle_pointer` because this is
+                // where the two numbers the measurement needs already exist, and
+                // threading them through would make the signature lie about what
+                // the function is about. The press edge (not the click) is what
+                // makes a swallowed press visible at all: `clicked` alone never
+                // fires for it, which is why "there is still a ring" could not be
+                // confirmed or refuted from anything the program recorded.
+                let pointer_down = ui.input(|i| i.pointer.primary_down());
+                self.last_ppp = ppp;
+                self.last_pointer_pos = ui.input(|i| i.pointer.hover_pos());
+                if pointer_down && !self.press_down {
+                    self.log_pointer(center, mode, hit_radius, "press");
+                }
+                self.press_down = pointer_down;
+                if response.clicked() {
+                    self.log_pointer(center, mode, hit_radius, "click");
+                }
 
                 self.handle_pointer(ui, &response, mode, ppp, &mut out);
 
@@ -285,7 +454,7 @@ impl Orb {
         // reach — and the same number sizes the pointer target, so the region
         // and the hit test cannot drift apart. See `ClickRegion`.
         let region_radius_px =
-            (interaction_radius_pt(self.anim.current_scale, mode.shakes()) * ppp).ceil() as i32;
+            (interaction_radius_pt(self.draw_scale(), mode.shakes()) * ppp).ceil() as i32;
         self.window
             .place(self.anim.current_position, side_px, region_radius_px, ppp);
         // phase 1: only resize when the canvas actually changed.
@@ -364,7 +533,7 @@ impl Orb {
                     // where points become pixels — once, in `keep_out_px`.
                     let c = win::clamp_center(
                         drag.center_start + delta,
-                        keep_out_px(self.anim.current_scale, ppp),
+                        keep_out_px(self.draw_scale(), ppp),
                     );
                     self.home = c;
                     self.anim.snap_position(c);
@@ -380,6 +549,51 @@ impl Orb {
         }
     }
 
+    /// Writes one line describing where the pointer is relative to the orb.
+    ///
+    /// Everything a hand test needs in a single row: the radius in **both**
+    /// units, the region it had to beat, and whether this press was inside
+    /// it. A press logged with `inside = true` and no matching `click` is a
+    /// received-but-unrecognised gesture; a press with `inside = false` never
+    /// reached the orb at all. The two look identical on screen and only this
+    /// line tells them apart.
+    ///
+    /// **Both operands are egui points, on purpose.** This used to subtract
+    /// `GetCursorPos` — absolute *physical screen* pixels — from `center`, which
+    /// is a point offset inside the window. The two are different coordinate
+    /// spaces, so the difference was meaningless, and the symptom was a log
+    /// full of confident nonsense: every single event read `inside = false` with
+    /// a radius near 1500 pt on a 73 pt target, which looks exactly like "the
+    /// click never arrived" and sent the last investigation after the wrong
+    /// subsystem entirely. `i.pointer.hover_pos()` is already in the same space
+    /// as `center`, so the subtraction is now a real distance.
+    fn log_pointer(
+        &self,
+        center: Pos2,
+        mode: OrbMode,
+        hit_radius: f32,
+        kind: &'static str,
+    ) {
+        let ppp = self.last_ppp;
+        let Some(pos) = self.last_pointer_pos else {
+            return;
+        };
+        let radius_pt = (pos - center).length();
+        let radius_px = radius_pt * ppp;
+        let region_px = hit_radius * ppp;
+        tracing::info!(
+            kind,
+            mode = ?mode,
+            x = pos.x.round() as i32,
+            y = pos.y.round() as i32,
+            radius_px = radius_px.round() as i32,
+            radius_pt = (radius_pt * 100.0).round() / 100.0,
+            region_px = region_px.round() as i32,
+            inside = radius_pt <= hit_radius,
+            "orb pointer",
+        );
+    }
+
     /// Brings `home` inside the work area, keeping the orb's **painted** edge
     /// `EDGE_MARGIN_PT` away from it.
     ///
@@ -392,7 +606,7 @@ impl Orb {
     /// only comes nearer the screen edge, and springs back in when the orb
     /// shrinks.
     fn clamp_home(&mut self, ppp: f32) {
-        let clamped = win::clamp_center(self.home, keep_out_px(self.anim.current_scale, ppp));
+        let clamped = win::clamp_center(self.home, keep_out_px(self.draw_scale(), ppp));
         if clamped != self.home {
             tracing::info!(
                 from = %format_args!("({}, {})", self.home.x, self.home.y),
@@ -412,7 +626,7 @@ impl Orb {
     /// always-on-top window strands the pixels its old rect covered, which is
     /// the ghost-aura artifact measured in `docs/GUI-WINDOW-ARTIFACT-REPORT.md`.
     pub fn max_canvas_points() -> f32 {
-        painted_reach_pt(max_reachable_scale(), true) * 2.0
+        Self::max_canvas_points_for(1.0)
     }
 
     fn repaint_interval(&self, mode: OrbMode) -> Duration {
@@ -1014,10 +1228,20 @@ mod win {
 /// Free-standing, and free of [`Orb`], so the five modes can be checked without
 /// building a window.
 fn interaction_radius_pt(scale: f32, with_shake: bool) -> f32 {
+    // The ceiling is the canvas, and the canvas is sized for the largest orb the
+    // *user* can choose. A clamp against the un-scaled canvas would silently cap
+    // every enlarged orb back to the default size's click target, so the orb
+    // would grow visually while its clickable area did not.
     painted_reach_pt(scale, with_shake)
         .max(MIN_INTERACTION_RADIUS)
-        .min(Orb::max_canvas_points() * 0.5)
+        .min(Orb::max_canvas_points_for(MAX_USER_SCALE) * 0.5)
 }
+
+/// The largest size multiplier a user can select.
+///
+/// Named rather than inlined so the ceiling the click radius is clamped against
+/// and the clamp on the setting itself cannot drift apart.
+pub const MAX_USER_SCALE: f32 = 2.0;
 
 /// How far out from the orb's centre it can paint, in points, at `scale`.
 ///
@@ -1055,6 +1279,17 @@ fn keep_out_px(scale: f32, ppp: f32) -> f32 {
     (painted_reach_pt(scale, true) + EDGE_MARGIN_PT) * ppp
 }
 
+/// The orb's reach while it is at rest, in physical pixels: painted extent plus
+/// the edge margin.
+///
+/// Exposed so the idle policy's waiting spot is computed from *this* number
+/// rather than a second guess at it. A spot derived from a smaller reach than
+/// the clamp uses would be pushed away by the clamp on every single attempt,
+/// which would present as a return that never works.
+pub fn idle_half_reach_px(ppp: f32) -> f32 {
+    keep_out_px(1.0, ppp)
+}
+
 /// The orb's click target, for `window_shape`'s click-through tests.
 ///
 /// The region the orb asks Win32 for and the number egui hit-tests on are both
@@ -1067,6 +1302,59 @@ pub(crate) fn interaction_radius_pt_for_test(scale: f32, with_shake: bool) -> f3
 
 #[cfg(test)]
 mod tests {
+    /// The pointer diagnostic used to subtract the Win32 cursor — absolute
+    /// physical screen pixels — from the orb's `center`, which is a point
+    /// offset inside the window. Different coordinate spaces, so the "distance"
+    /// was meaningless, and the log said `inside = false` with a radius of
+    /// ~1500 pt against a 73 pt target on *every* event. That reads exactly like
+    /// "the click never arrived", and it is what sent the last investigation
+    /// looking at the window region instead of at the state machine.
+    ///
+    /// The property to pin is the one that was broken: a press on the orb must
+    /// measure as inside its own hit radius. Both operands are points here, so
+    /// the distance is real.
+    #[test]
+    fn a_press_on_the_orb_measures_as_inside_its_own_hit_radius() {
+        let center = Pos2::new(148.0, 61.0);
+        // A press at the orb's centre, and one on its painted edge, are both
+        // inside; a press far away in the same canvas is not.
+        for (label, offset, expect_inside) in [
+            ("centre", Vec2::ZERO, true),
+            ("on the painted edge", Vec2::new(70.0, 0.0), true),
+            ("far outside", Vec2::new(900.0, 0.0), false),
+        ] {
+            let hit_radius = 73.0f32;
+            let pos = center + offset;
+            let radius_pt = (pos - center).length();
+            assert_eq!(
+                radius_pt <= hit_radius,
+                expect_inside,
+                "{label}: {radius_pt} pt against a {hit_radius} pt target"
+            );
+        }
+    }
+
+    /// The same comparison in the units the log prints, since that is what a
+    /// reader is checking. At 1.25x scaling the 73 pt target is 91 physical
+    /// pixels; a press at the centre must report a radius of zero, not a
+    /// screen-coordinate difference in the hundreds.
+    #[test]
+    fn the_logged_radius_is_a_real_distance_not_a_screen_offset() {
+        let ppp = 1.25f32;
+        let hit_radius = 73.0f32;
+        let center = Pos2::new(148.0, 61.0);
+        let pos = Pos2::new(151.0, 61.0); // 3 pt from centre
+        let radius_px = (pos - center).length() * ppp;
+        assert!(
+            (radius_px - 3.75).abs() < 0.01,
+            "3 pt at 1.25x is 3.75 px, got {radius_px}"
+        );
+        assert!(
+            radius_px <= hit_radius * ppp,
+            "a press 3 pt from the centre is inside the target"
+        );
+    }
+
     use super::*;
     use crate::gui::orb_animation::{max_reachable_scale, HOVER_SCALE_BOOST};
 
@@ -1158,7 +1446,14 @@ mod tests {
         let collapsed = interaction_radius_pt(0.2, false);
         assert_eq!(collapsed, MIN_INTERACTION_RADIUS);
         assert!(collapsed > painted_reach_pt(0.2, false));
-        assert!(collapsed <= Orb::max_canvas_points() * 0.5);
+        // The ceiling is the canvas **for the largest orb the user can choose**.
+        //
+        // It used to be the un-scaled canvas, which silently capped every
+        // enlarged orb's click target back to the default size: the orb would
+        // grow on screen and its clickable area would not, which is the one
+        // combination this code must never produce. The window is created once
+        // at [`MAX_USER_SCALE`], so that canvas is the one that actually exists.
+        assert!(collapsed <= Orb::max_canvas_points_for(MAX_USER_SCALE) * 0.5);
         // A nonsense scale cannot produce a nonsense target either.
         assert_eq!(
             interaction_radius_pt(f32::NAN, false),
@@ -1166,7 +1461,42 @@ mod tests {
         );
         assert_eq!(
             interaction_radius_pt(f32::INFINITY, false),
-            Orb::max_canvas_points() * 0.5
+            Orb::max_canvas_points_for(MAX_USER_SCALE) * 0.5
+        );
+    }
+
+    /// The property the user-size setting rests on: **a bigger orb is a bigger
+    /// click target.**
+    ///
+    /// Not an obvious consequence, and the failure it guards is the one that
+    /// makes the feature worse than useless — a large orb that swallows clicks
+    /// only in its painted middle, or (the bug this replaced) a large orb whose
+    /// click target stayed at the default size so its edges did nothing.
+    #[test]
+    fn a_larger_orb_also_answers_a_larger_click() {
+        let small = interaction_radius_pt(1.0, false);
+        let large = interaction_radius_pt(MAX_USER_SCALE, false);
+        assert!(
+            large > small,
+            "the click target must follow the drawing, or the enlarged orb's edges are dead"
+        );
+        // And the enlarged target must still fit the window it is drawn in.
+        assert!(large <= Orb::max_canvas_points_for(MAX_USER_SCALE) * 0.5);
+    }
+
+    /// The window is created once, so it has to be big enough for the largest
+    /// orb the user can select — not the one selected today. Sizing it for
+    /// today's would clip a later enlargement, and growing a layered window
+    /// later strands the pixels its old rect covered.
+    #[test]
+    fn the_window_is_sized_for_the_largest_orb_not_the_current_one() {
+        assert!(
+            Orb::initial_side_points() >= Orb::max_canvas_points_for(MAX_USER_SCALE),
+            "the canvas must hold the largest selectable orb"
+        );
+        assert!(
+            Orb::initial_side_points() > Orb::max_canvas_points(),
+            "and it must be larger than the default-size orb, or enlarging would clip"
         );
     }
 

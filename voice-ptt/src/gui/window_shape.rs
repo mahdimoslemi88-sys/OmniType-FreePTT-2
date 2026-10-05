@@ -818,6 +818,160 @@ pub fn true_screen_size_px() -> Option<(i32, i32)> {
     None
 }
 
+// ── monitor enumeration ─────────────────────────────────────────────────────
+// One query, three shapes, so the idle policy never has to know about HMONITOR.
+//
+// `MonitorFromWindow`-style lookup is not enough on its own: the policy needs to
+// tell "the orb is on the second monitor" from "the second monitor was unplugged",
+// and only an enumeration with a stable index can do that. The index is the
+// enumeration order, which Windows does not guarantee across reboots — so it is
+// used as a *within-session* handle and never written to `config.toml`.
+
+/// One monitor's usable desktop, plus how to recognise it.
+///
+/// Named rather than a tuple because it travels through three signatures and
+/// `(i32, i32, i32, i32), u8, bool` reads as three unrelated things rather than
+/// one monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorWorkArea {
+    /// Usable rectangle, physical pixels: `left, top, right, bottom`.
+    pub rect: (i32, i32, i32, i32),
+    /// Position in this session's enumeration order. **Not** stable across
+    /// reboots, so it is never written to `config.toml`.
+    pub index: u8,
+    pub is_primary: bool,
+}
+
+/// `MONITORINFOF_PRIMARY` from the Win32 headers.
+///
+/// Spelled out here because the `windows` 0.58 bindings do not export it as a
+/// named constant, and an unnamed magic number in a bit test is exactly the kind
+/// of thing that survives a dependency bump as a wrong answer.
+#[cfg(windows)]
+const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
+
+/// Work area of the monitor containing `(x, y)`, plus its index and whether it
+/// is the primary. Physical pixels.
+#[cfg(windows)]
+pub fn monitor_work_area(x: i32, y: i32) -> Option<MonitorWorkArea> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let pt = POINT { x, y };
+    let mon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    if mon.is_invalid() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(mon, &mut info) }.as_bool() {
+        return None;
+    }
+    let rc = info.rcWork;
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return None;
+    }
+    let rect = (rc.left, rc.top, rc.right, rc.bottom);
+    let all = all_monitor_work_areas();
+    // Matching on the rectangle rather than on the handle: the handle cannot be
+    // compared with a usable `PartialEq`, and two monitors cannot share a work
+    // rect, so the match is unambiguous.
+    let index = all
+        .iter()
+        .find(|m| m.rect == rect)
+        .map(|m| m.index)
+        .unwrap_or(0);
+    Some(MonitorWorkArea {
+        rect,
+        index,
+        is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn monitor_work_area(_x: i32, _y: i32) -> Option<MonitorWorkArea> {
+    None
+}
+
+/// Work area of the primary monitor, if there is one.
+#[cfg(windows)]
+pub fn primary_monitor_work_area() -> Option<MonitorWorkArea> {
+    all_monitor_work_areas().into_iter().find(|m| m.is_primary)
+}
+
+#[cfg(not(windows))]
+pub fn primary_monitor_work_area() -> Option<MonitorWorkArea> {
+    None
+}
+
+/// Every monitor's work area, in enumeration order.
+#[cfg(windows)]
+pub fn all_monitor_work_areas() -> Vec<MonitorWorkArea> {
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+
+    // The callback cannot borrow, so the rectangles land in a raw pointer the
+    // caller owns. `EnumDisplayMonitors` is synchronous and returns only after
+    // the callback has finished for every monitor, so nothing can touch the
+    // vector afterwards.
+    unsafe extern "system" fn collect(mon: HMONITOR, _dc: HDC, _rect: *mut RECT, data: LPARAM) -> BOOL {
+        let out = &mut *(data.0 as *mut Vec<MonitorWorkArea>);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut info).as_bool() {
+            let rc: RECT = info.rcWork;
+            if rc.right > rc.left && rc.bottom > rc.top {
+                out.push(MonitorWorkArea {
+                    rect: (rc.left, rc.top, rc.right, rc.bottom),
+                    index: 0,
+                    is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+                });
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut out: Vec<MonitorWorkArea> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut out as *mut _ as isize),
+        )
+    };
+    // A failed enumeration means "no answer", not "no monitors" — but the two
+    // lead to the same place for the caller, and returning the partial list
+    // would be the dangerous one: a monitor that was not enumerated would look
+    // like a monitor that has been unplugged.
+    if !ok.as_bool() {
+        return Vec::new();
+    }
+    for (i, entry) in out.iter_mut().enumerate() {
+        entry.index = i as u8;
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn all_monitor_work_areas() -> Vec<MonitorWorkArea> {
+    Vec::new()
+}
+
+/// How many monitors are attached right now. Part of the idle policy's
+/// geometry stamp: unplugging a display must invalidate an in-flight request.
+pub fn monitor_count() -> usize {
+    all_monitor_work_areas().len()
+}
+
 #[cfg(windows)]
 pub static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 

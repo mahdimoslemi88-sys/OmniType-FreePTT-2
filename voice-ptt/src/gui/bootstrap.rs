@@ -51,6 +51,15 @@ pub struct GuiStartup {
     pub dictionary: Arc<RwLock<Dictionary>>,
     pub router: AsrRouter,
     pub status: tokio::sync::watch::Receiver<AppStatus>,
+    /// The microphone gate, built by the state machine that owns the status
+    /// channel it reads. Passed in rather than rebuilt here so the dashboard and
+    /// the recorder cannot consult two different truths about whether a
+    /// dictation is live.
+    pub mic_gate: Arc<crate::audio::gate::LiveMicGate>,
+    /// The review/recovery wire, built by the state machine that owns the loop
+    /// which resolves answers. Passed in for the same reason as `mic_gate`: the
+    /// review window and the loop must be looking at the same drafts.
+    pub review: Arc<crate::state::ReviewChannel>,
 }
 
 /// The orb center the user last dragged to, or `None` on a first run.
@@ -203,6 +212,8 @@ pub fn run_gui(startup: GuiStartup) -> Result<()> {
         router,
         status,
         boot_warning,
+        mic_gate,
+        review,
     } = startup;
 
     let native_options = native_options(&settings);
@@ -225,6 +236,8 @@ pub fn run_gui(startup: GuiStartup) -> Result<()> {
                 update_state,
                 Some(hotkey_control),
                 boot_warning,
+                mic_gate,
+                review,
             )) as Box<dyn eframe::App>)
         }),
     )
