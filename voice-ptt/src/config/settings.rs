@@ -53,6 +53,14 @@ pub struct Settings {
     pub custom_providers: Vec<CustomProvider>,
     #[serde(default)]
     pub updates: UpdateSettings,
+    /// Per-application rules, applied on top of the general settings above.
+    ///
+    /// Written as `[[profiles]]` entries, bound to an executable. An empty set
+    /// is the default and means every window gets the general rules, so a user
+    /// who never opens the panel sees exactly the behaviour they had before
+    /// this section existed.
+    #[serde(default)]
+    pub profiles: crate::profiles::ProfileSet,
 }
 
 impl Default for Settings {
@@ -71,6 +79,7 @@ impl Default for Settings {
             active_engine: "auto".into(),
             custom_providers: Vec::new(),
             updates: UpdateSettings::default(),
+            profiles: crate::profiles::ProfileSet::default(),
         }
     }
 }
@@ -125,6 +134,24 @@ impl TextSettings {
 pub struct UpdateSettings {
     pub check_on_startup: bool,
     pub auto_check_interval_hours: u64,
+    /// Say so out loud when a newer release exists, rather than waiting for
+    /// the user to open the settings tab and notice the banner.
+    ///
+    /// On by default, and this is the fix for the gap that motivated the whole
+    /// balloon: detection worked and nothing interrupted anybody. Turning it
+    /// off restores the old silence; the check itself keeps running, so this
+    /// governs the *notification* and not the checking.
+    #[serde(default = "default_true")]
+    pub notify_on_available: bool,
+    /// The newest version already announced to this user.
+    ///
+    /// Written by the app, never meant to be edited — but it lives in
+    /// `config.toml` like everything else, which is why
+    /// [`crate::gui::tray_balloon::decide`] normalises it before comparing. A
+    /// hand-typed `v0.4.0` must not read as a different release from `0.4.0`,
+    /// because that would re-announce on every single start.
+    #[serde(default)]
+    pub last_notified_version: String,
 }
 
 impl Default for UpdateSettings {
@@ -132,6 +159,8 @@ impl Default for UpdateSettings {
         Self {
             check_on_startup: true,
             auto_check_interval_hours: 6,
+            notify_on_available: true,
+            last_notified_version: String::new(),
         }
     }
 }
@@ -820,6 +849,14 @@ mod tests {
         assert_eq!(s.google.language, "fa-IR");
         assert!(s.updates.check_on_startup);
         assert_eq!(s.updates.auto_check_interval_hours, 6);
+        // Announcing an available update is the point of the feature: an
+        // install that checks for updates and then says nothing is the gap
+        // this setting was added to close.
+        assert!(s.updates.notify_on_available);
+        assert_eq!(
+            s.updates.last_notified_version, "",
+            "a fresh install must not believe it has announced anything"
+        );
         // The idle return is on by default: the feature exists to fix the orb
         // parking itself wherever the last dictation left it, so a fresh install
         // that did not get it would be the install most likely to want it.
@@ -896,6 +933,86 @@ mod tests {
         s3.save(&path).unwrap();
         let s4 = Settings::load_or_create(&path).unwrap();
         assert!((s4.vad.threshold - 0.7).abs() < f32::EPSILON);
+    }
+
+    /// Profiles are written by the panel's save button and read back by the
+    /// coordinator on the next dictation, through the **same** `save` /
+    /// `load_or_create` pair every other setting uses.
+    ///
+    /// Tested here rather than only in `crate::profiles`, because the thing
+    /// that can break is the *file*: a section that round-trips through
+    /// `toml::to_string` in isolation can still be dropped, renamed or nested
+    /// wrongly once `Settings` writes it.
+    #[test]
+    fn profiles_survive_a_save_and_load_cycle() {
+        let dir = std::env::temp_dir().join("voice-ptt-cfg-profiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let s = Settings {
+            profiles: crate::profiles::ProfileSet::new(vec![
+                crate::profiles::AppProfile::new(
+                    "Editor",
+                    "code.exe",
+                    crate::profiles::Overrides {
+                        text_mode: Some("raw".into()),
+                        ..Default::default()
+                    },
+                ),
+                crate::profiles::AppProfile::new(
+                    "Chat",
+                    "slack.exe",
+                    crate::profiles::Overrides {
+                        review_before_insert: Some(true),
+                        corrections: vec![crate::processing::dictionary::Correction {
+                            from: "پاتون".into(),
+                            to: "پایتون".into(),
+                            category: Some("profile".into()),
+                        }],
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Settings::default()
+        };
+        s.save(&path).unwrap();
+
+        let loaded = Settings::load_or_create(&path).unwrap();
+        assert_eq!(loaded.profiles.len(), 2, "a profile did not survive the file");
+
+        // What the coordinator asks, against the file that was just read: the
+        // whole point is that the *loaded* set resolves, not the one in memory.
+        let general = crate::profiles::GeneralRules::from(&loaded);
+        let editor = crate::profiles::effective(
+            &loaded.profiles,
+            Some(std::path::Path::new("D:/portable/VSCode/code.exe")),
+            general,
+        );
+        assert_eq!(editor.mode, crate::processing::TextMode::Raw);
+        assert!(editor.is_profiled());
+
+        let chat = crate::profiles::effective(
+            &loaded.profiles,
+            Some(std::path::Path::new("C:/Apps/slack.exe")),
+            general,
+        );
+        assert!(chat.review_before_insert);
+        assert_eq!(chat.corrections.len(), 1);
+        assert_eq!(chat.corrections[0].to, "پایتون");
+
+        // …and an application with no entry is untouched by either of them.
+        let other = crate::profiles::effective(
+            &loaded.profiles,
+            Some(std::path::Path::new("C:/Apps/notepad.exe")),
+            general,
+        );
+        assert!(!other.is_profiled());
+
+        // The file carries the array-of-tables spelling, so a user editing it by
+        // hand has something to copy.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[profiles]]"), "{text}");
     }
 
     #[test]

@@ -101,12 +101,33 @@ fn test_render_dashboard_does_not_panic() {
         DashboardTab::Dictionary,
         DashboardTab::History,
         DashboardTab::Settings,
+        DashboardTab::Profiles,
     ] {
         testutil::sweep(|app, ctx| {
             app.dashboard_tab = tab;
             app.render_dashboard(ctx);
         });
     }
+}
+
+/// The Dictionary tab's quick-fix card with a word in it.
+///
+/// The sweep above renders the card empty, which takes the "nothing to
+/// preview yet" path and never builds the preview lines, the warnings or the
+/// Save button. This is the populated state — a sentence from a real
+/// dictation, the word that came out wrong in it, and its replacement — which
+/// is the card's whole reason to exist. Twenty-five pointer positions, so the
+/// hover-only code inside it is reached too.
+#[test]
+fn test_dictionary_quick_fix_renders_a_seeded_fix() {
+    testutil::sweep(|app, ctx| {
+        app.dashboard_tab = DashboardTab::Dictionary;
+        // `seed` clears the replacement, so it is set after: the pair is what
+        // the preview is about, and half of it would be refused, not rendered.
+        app.dict_fix.seed("پاتون", "من با پاتون کار می‌کنم");
+        app.dict_fix.to = "پایتون".into();
+        app.render_dashboard(ctx);
+    });
 }
 
 #[tokio::test]

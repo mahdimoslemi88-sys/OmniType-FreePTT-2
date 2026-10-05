@@ -449,11 +449,33 @@ impl Dictionary {
     /// Applies all corrections. Replacements are plain text (no capture
     /// groups), so a single ordered pass with leftmost-longest semantics is
     /// sufficient.
+    ///
+    /// A match is applied only when it **stands as a word** — when neither
+    /// neighbour is part of a word. A find/replace is meant to fix a word the
+    /// recogniser misheard, and a word is the unit it emits; without this, the
+    /// seed list's short technical aliases rewrite healthy words that merely
+    /// contain them, which is how "نیست" became `NACEت`.
+    ///
+    /// Skipping a match cannot hide another one: `find_iter` hands out
+    /// non-overlapping matches, and any match starting *inside* a word has a
+    /// word character before it, so it would have been skipped too.
     pub fn correct(&self, text: &str) -> String {
         if self.replacements.is_empty() || text.is_empty() {
             return text.to_string();
         }
-        self.matcher.replace_all(text, &self.replacements)
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0;
+        for m in self.matcher.find_iter(text) {
+            let (start, end) = (m.start(), m.end());
+            if !stands_as_a_word(text, start, end) {
+                continue;
+            }
+            out.push_str(&text[copied..start]);
+            out.push_str(&self.replacements[m.pattern().as_usize()]);
+            copied = end;
+        }
+        out.push_str(&text[copied..]);
+        out
     }
 
     /// Number of active rules.
@@ -465,6 +487,51 @@ impl Dictionary {
     pub fn is_empty(&self) -> bool {
         self.replacements.is_empty()
     }
+}
+
+/// Whether the match at `start..end` is a whole word rather than a fragment of
+/// one.
+///
+/// Both sides are checked, because the recogniser attaches punctuation without
+/// a space on either side: `نیس.` is a word and so is `(نیس`, while `نیست` is
+/// not.
+fn stands_as_a_word(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.is_some_and(joins_words) && !after.is_some_and(joins_words)
+}
+
+/// Whether `c` glues itself to a neighbouring letter, making the two one word.
+///
+/// Letters and digits are the obvious half. The other three are the Persian and
+/// technical specifics:
+///
+/// * the **ZWNJ**, which Persian writes *inside* words (`می‌کنم`) — a rule must
+///   not fire across it;
+/// * the **underscore**, which identifiers are built from (`my_var`);
+/// * the **combining marks** (harakat), which sit *on* a letter rather than
+///   beside it, so a rule matching a bare letter must not fire when that letter
+///   is wearing a vowel mark.
+fn joins_words(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '\u{200c}' || is_combining_mark(c)
+}
+
+/// The Arabic/Persian harakat and the generic combining diacriticals.
+///
+/// Spelled out rather than pulled from a Unicode table: this crate's whole
+/// dependency list is deliberate, and the ranges that can appear in Persian
+/// dictation are a closed, well-known set.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036f}'   // combining diacritical marks
+        | '\u{0610}'..='\u{061a}' // Arabic sign marks
+        | '\u{064b}'..='\u{065f}' // Arabic/Persian harakat
+        | '\u{0670}'              // superscript alef
+        | '\u{06d6}'..='\u{06dc}' // Quranic annotation marks
+        | '\u{06df}'..='\u{06e4}'
+        | '\u{06e7}'..='\u{06e8}'
+        | '\u{06ea}'..='\u{06ed}'
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +561,25 @@ mod tests {
         let d = Dictionary::with_defaults();
         let text = "امروز هوا خیلی خوب بود";
         assert_eq!(d.correct(text), text);
+    }
+
+    /// A rule may fix a misheard word without touching a healthy word that
+    /// merely *contains* the same letters.
+    ///
+    /// The seed list ships short aliases for technical terms — `دین` → `DIN`,
+    /// `نیس` → `NACE`, `ویت` → `Vite` — and every one of them is a substring of
+    /// an ordinary Persian word (`دینامیک`, `نیست`, `ویتنام`). Matching a rule
+    /// as a bare substring therefore types `NACEت` for "نیست".
+    #[test]
+    fn a_rule_does_not_rewrite_a_healthy_word_that_contains_it() {
+        let d = Dictionary::with_defaults();
+        for text in ["این نیست", "دینامیک است", "قیمت ویتنام"] {
+            assert_eq!(
+                d.correct(text),
+                text,
+                "{text:?} was rewritten by a rule that only matched inside a word"
+            );
+        }
     }
 
     #[test]

@@ -162,7 +162,9 @@ pub fn spawn(
     Ok(())
 }
 
-const ICON_BYTES: &[u8] = include_bytes!("../../assets/icon.ico");
+/// The embedded icon, shared with the update balloon's own notify icon
+/// (`tray_balloon`), which needs the same bytes to build an `HICON`.
+pub(crate) const ICON_BYTES: &[u8] = include_bytes!("../../assets/icon.ico");
 
 /// Parses a 32-bpp uncompressed Windows ICO file into top-to-bottom RGBA bytes.
 pub fn parse_ico_32bpp(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {

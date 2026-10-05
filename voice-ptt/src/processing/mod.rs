@@ -5,10 +5,11 @@
 pub mod boundary;
 pub mod dictionary;
 pub mod normalizer;
+pub mod quickfix;
 pub mod seam;
 
 pub use boundary::{is_attached_punctuation, needs_boundary_space, BoundaryState, BoundaryTracker};
-pub use dictionary::Dictionary;
+pub use dictionary::{Correction, Dictionary};
 pub use normalizer::Normalizer;
 pub use seam::{SeamMerge, SeamOptions, SeamStitcher};
 
@@ -92,6 +93,50 @@ impl ProcessingOptions {
 /// Runs the full text post-processing pipeline in order.
 pub fn process_text(text: &str, normalizer: &Normalizer, dictionary: &Dictionary) -> String {
     process_text_with(text, normalizer, dictionary, ProcessingOptions::default())
+}
+
+/// Everything one dictation's text goes through, as a value.
+///
+/// Exists so there is **one** implementation of "what happens to this text":
+/// the coordinator runs it for real, and the dictionary panel's quick-fix
+/// preview runs it to show the user the result before they save a rule. A
+/// preview that re-implemented the order — mode first, general dictionary next,
+/// the destination's own rules last — would sooner or later disagree with the
+/// product, and a preview that lies is worse than no preview.
+///
+/// Borrowed rather than owned because both callers already hold these values:
+/// the coordinator for the whole of a session, the panel for one frame — and
+/// `Copy`, because a preview needs the same rules twice, once for each side of
+/// the comparison.
+#[derive(Clone, Copy)]
+pub struct TextRules<'a> {
+    pub mode: TextMode,
+    pub normalizer: &'a Normalizer,
+    /// The general dictionary: normalizer plus the user's own file rules.
+    pub dictionary: &'a Dictionary,
+    /// The destination's extra rules, applied **after** the general dictionary
+    /// and **regardless of the mode** — they are the user's explicit
+    /// instruction for that application, not part of the automatic pipeline.
+    pub corrections: &'a [Correction],
+}
+
+impl TextRules<'_> {
+    /// Applies everything, in the order above.
+    pub fn apply(&self, text: &str) -> String {
+        let processed = process_text_with(
+            text,
+            self.normalizer,
+            self.dictionary,
+            ProcessingOptions::new(self.mode),
+        );
+        if self.corrections.is_empty() {
+            return processed;
+        }
+        // Compiled per call rather than cached: a destination holds a handful of
+        // rules, and the cost sits beside an engine call measured in hundreds of
+        // milliseconds.
+        Dictionary::new(self.corrections.to_vec()).correct(&processed)
+    }
 }
 
 /// [`process_text`] with the mode chosen by the caller.

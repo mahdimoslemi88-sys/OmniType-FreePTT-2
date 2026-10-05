@@ -603,6 +603,18 @@ pub(crate) fn render(
                             ui.checkbox(
                                 &mut state.draft.updates.check_on_startup,
                                 format_persian_display("بررسی خودکار در شروع برنامه"),
+                            )
+                            .on_hover_text(
+                                "Check GitHub for a newer release when the app starts.",
+                            );
+                            ui.checkbox(
+                                &mut state.draft.updates.notify_on_available,
+                                format_persian_display("اعلان نسخهٔ جدید"),
+                            )
+                            .on_hover_text(
+                                "Show a tray balloon when a new version exists. Turn this \
+                                 off to keep checking without being told. Each release is \
+                                 announced once, not once per check.",
                             );
                         });
                     },

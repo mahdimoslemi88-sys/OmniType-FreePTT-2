@@ -23,6 +23,21 @@ pub(crate) struct HistoryItem {
     pub engine: String,
 }
 
+/// A request to fix a word in one of the transcripts.
+///
+/// The tab's *output*, not an action: History does not open the dictionary, does
+/// not know the fix panel exists, and does not guess which word was wrong. It
+/// reports that the user picked a sentence, and the overlay seeds the fix card
+/// with it. This is the same hand-off shape the settings tab's orb controls use,
+/// and it is what keeps a change in one tab from being able to reach another.
+pub(crate) struct FixRequest {
+    /// The word to correct. Empty: the user has not pointed at one yet, and
+    /// guessing would be the unauthorised learning the roadmap forbids.
+    pub word: String,
+    /// The whole sentence, which becomes the preview's subject.
+    pub sentence: String,
+}
+
 /// Renders the History tab body into the dashboard's current panel.
 ///
 /// Takes the three fields it mutates as arguments instead of `&mut self`:
@@ -35,6 +50,7 @@ pub(crate) fn render(
     history: &mut Vec<HistoryItem>,
     search: &mut String,
     copy_msg: &mut Option<(String, Instant)>,
+    fix_request: &mut Option<FixRequest>,
 ) {
     let now = Instant::now();
 
@@ -194,6 +210,27 @@ pub(crate) fn render(
                                     {
                                         delete_idx = Some(idx);
                                     }
+
+                                    // The way into the dictionary fix: this
+                                    // sentence, whose wrong word the user is
+                                    // about to point at.
+                                    let fix_btn = ui.button(
+                                        egui::RichText::new(format!(
+                                            "{}  {}",
+                                            format_persian_display("اصلاح واژه"),
+                                            ic::MAGIC_WAND
+                                        ))
+                                        .size(11.5),
+                                    );
+                                    if fix_btn.clicked() {
+                                        *fix_request = Some(FixRequest {
+                                            word: String::new(),
+                                            sentence: item.text.clone(),
+                                        });
+                                    }
+                                    fix_btn.on_hover_text(format_persian_display(
+                                        "این جمله را در اصلاح سریع واژه باز کن تا واژهٔ غلط را انتخاب کنی",
+                                    ));
 
                                     let copy_btn = ui.button(
                                         egui::RichText::new(format!(

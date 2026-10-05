@@ -1,6 +1,6 @@
 [package]
 name = "voice-ptt"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "High-performance Push-to-Talk voice typing for Windows (Persian-first)"
 license = "MIT"
@@ -70,6 +70,9 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     # Credential Manager: where the service API key lives instead of config.toml
     "Win32_Security_Credentials",
+    # Shell_NotifyIconW: the update balloon. tray-icon does not expose the
+    # HWND of the icon it registers, so the balloon carries its own icon.
+    "Win32_UI_Shell",
 ] }
 
 # Raw platform window handle: lets the overlay ask eframe for the *real* main

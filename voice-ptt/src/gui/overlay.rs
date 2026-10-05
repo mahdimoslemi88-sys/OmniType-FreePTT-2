@@ -20,10 +20,12 @@
 //! out when the state it touches is disjoint from its neighbours'. That is
 //! what keeps a panel change from being able to alter a different tab.
 
+mod dict_fix_panel;
 mod dict_panel;
 mod engine_panel;
 mod history_panel;
 mod mic_test_panel;
+mod profiles_panel;
 mod review_panel;
 mod settings_panel;
 #[cfg(test)]
@@ -179,6 +181,10 @@ pub enum DashboardTab {
     /// fields that merely persist invites the wrong assumption about which is
     /// which.
     MicTest,
+    /// Per-application rules. Its own tab rather than a card in Settings: it is
+    /// a list with an editor, and the things it changes are the *text rules*
+    /// that Settings' own `[text]` section owns only as a general default.
+    Profiles,
 }
 
 impl DashboardTab {
@@ -190,6 +196,7 @@ impl DashboardTab {
             Self::History => "تاریخچه",
             Self::Settings => "تنظیمات",
             Self::MicTest => "میکروفون",
+            Self::Profiles => "پروفایل‌ها",
         }
     }
 
@@ -201,6 +208,7 @@ impl DashboardTab {
             Self::History => ic::CLOCK_COUNTER_CLOCKWISE,
             Self::Settings => ic::GEAR,
             Self::MicTest => ic::MICROPHONE,
+            Self::Profiles => ic::APP_WINDOW,
         }
     }
 }
@@ -263,6 +271,13 @@ pub struct OverlayApp {
     dict: dict_panel::DictPanelState,
     /// Settings tab: the unvalidated draft plus its UI state.
     settings_tab: settings_panel::SettingsPanelState,
+    /// The profiles tab's own UI state. The profiles themselves live in the
+    /// settings draft above; this is only which row is open and what is
+    /// half-typed into the new-rule fields.
+    profiles_tab: profiles_panel::ProfilesPanelState,
+    /// The quick dictionary fix: one word, its replacement, the scope, and the
+    /// phrase being previewed. Lives at the top of the Dictionary tab.
+    dict_fix: dict_fix_panel::DictFixState,
     /// Microphone test tab: the gated short capture and its measurement.
     ///
     /// The gate is shared with the state machine on purpose: a panel that
@@ -387,6 +402,8 @@ impl OverlayApp {
             dict: dict_panel::DictPanelState::default(),
             show_dashboard: false,
             dashboard_tab: DashboardTab::Engines,
+            profiles_tab: profiles_panel::ProfilesPanelState::default(),
+            dict_fix: dict_fix_panel::DictFixState::default(),
             settings_tab: settings_panel::SettingsPanelState::from_settings(
                 &settings.read().map(|s| s.clone()).unwrap_or_default(),
             ),
@@ -442,6 +459,25 @@ impl OverlayApp {
     /// Delegates to [`dict_panel`], which owns the tab's nine form and
     /// inline-editor fields as a single [`DictPanelState`].
     fn render_dict_body(&mut self, ui: &mut egui::Ui) {
+        // The quick fix comes first, and takes its corpus from the history:
+        // the sentences the user actually dictated are the only evidence of
+        // which *healthy words* a short rule would sit inside of.
+        //
+        // Built per frame rather than cached because it is bounded by the
+        // history's own cap and is not consulted unless the fix card has a
+        // word in it — see `dict_fix_panel`'s cache, which keeps the matcher
+        // work off the redraw path.
+        let corpus: Vec<String> = self.history.iter().map(|item| item.text.clone()).collect();
+        dict_fix_panel::render(
+            ui,
+            &mut self.dict_fix,
+            &mut self.settings_tab.draft,
+            &self.settings,
+            &self.config_path,
+            &self.dictionary,
+            &corpus,
+        );
+        ui.add_space(8.0);
         dict_panel::render(ui, &mut self.dict, &self.dictionary);
     }
 
@@ -467,13 +503,22 @@ impl OverlayApp {
     /// Delegates to [`history_panel`], which owns the three history
     /// fields; this is only the borrow-checked hand-off point.
     fn render_history_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The History tab reports a fix request rather than acting on it: the
+        // two panels do not know about each other, and the overlay is the one
+        // place that can seed the fix card *and* move the user to it.
+        let mut fix_request: Option<history_panel::FixRequest> = None;
         history_panel::render(
             ui,
             ctx,
             &mut self.history,
             &mut self.history_search,
             &mut self.history_copy_msg,
+            &mut fix_request,
         );
+        if let Some(request) = fix_request {
+            self.dict_fix.seed(&request.word, &request.sentence);
+            self.dashboard_tab = DashboardTab::Dictionary;
+        }
     }
     /// Delegates to [`settings_panel`], which owns the draft and the UI
     /// state around it. The four borrows are disjoint fields of `self`,
@@ -549,6 +594,25 @@ impl OverlayApp {
                 self.orb.set_user_scale(s.gui.orb_scale());
             }
         }
+    }
+
+    /// Delegates to [`profiles_panel`], which owns the row selection and edits
+    /// the *settings draft* the Settings tab already holds.
+    ///
+    /// Nothing is written back out here, unlike the orb controls: a profile is
+    /// a value the coordinator reads when the next dictation starts, so no live
+    /// object has to be re-bound the moment it changes. The panel's own save
+    /// button writes the draft through the same validator the Settings tab
+    /// uses, which is what stops this tab from being the one place that can put
+    /// an invalid `config.toml` on disk.
+    fn render_profiles_body(&mut self, ui: &mut egui::Ui) {
+        profiles_panel::render(
+            ui,
+            &mut self.profiles_tab,
+            &mut self.settings_tab.draft,
+            &self.settings,
+            &self.config_path,
+        );
     }
 
     /// Changes how long the orb waits before returning.
@@ -883,6 +947,7 @@ impl OverlayApp {
                                 DashboardTab::Dictionary,
                                 DashboardTab::History,
                                 DashboardTab::Settings,
+                                DashboardTab::Profiles,
                                 DashboardTab::MicTest,
                             ] {
                                 let selected = self.dashboard_tab == tab;
@@ -982,6 +1047,7 @@ impl OverlayApp {
                                 DashboardTab::Dictionary => self.render_dict_body(ui),
                                 DashboardTab::History => self.render_history_body(ui, ctx),
                                 DashboardTab::Settings => self.render_settings_body(ui),
+                                DashboardTab::Profiles => self.render_profiles_body(ui),
                                 DashboardTab::MicTest => self.render_mic_test_body(ui),
                             });
 

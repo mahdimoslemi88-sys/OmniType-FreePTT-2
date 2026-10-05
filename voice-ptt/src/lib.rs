@@ -18,6 +18,7 @@ pub mod logging;
 pub mod output;
 pub mod paths;
 pub mod processing;
+pub mod profiles;
 pub mod state;
 pub mod updates;
 pub mod vad;
@@ -291,6 +292,18 @@ pub fn run() -> Result<()> {
         update_state.clone(),
         settings_rwlock.clone(),
         env!("CARGO_PKG_VERSION"),
+    );
+
+    // Announce a new release instead of waiting for the user to open the
+    // settings tab. The notifier owns its own thread and window; the watcher
+    // reads the same state the checker writes and shows one balloon per
+    // release (see `gui::tray_balloon` for why the dedup is persisted).
+    let balloon_handle = gui::tray_balloon::spawn_notifier(flags.clone());
+    gui::tray_balloon::spawn_watcher(
+        update_state.clone(),
+        settings_rwlock.clone(),
+        config_path.clone(),
+        balloon_handle,
     );
 
     // ---- bridge: std channel → tokio channel ---------------------------------

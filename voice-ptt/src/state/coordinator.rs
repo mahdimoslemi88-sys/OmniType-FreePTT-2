@@ -46,7 +46,8 @@ use crate::processing::boundary::BoundaryTracker;
 use crate::processing::seam::{SeamMerge, SeamOptions, SeamStitcher};
 use crate::state::review::{self, DraftKind, PendingDraft, ReviewCommand, ReviewOutcome};
 use crate::state::review_channel::ReviewChannel;
-use crate::processing::{process_text_with, Dictionary, Normalizer};
+use crate::processing::{Dictionary, Normalizer};
+use crate::profiles::{effective, EffectiveRules, GeneralRules};
 use crate::state::session::{ChunkId, Effect, SessionDriver, SessionId};
 use crate::state::status::{AppState, StatusChannel};
 use crate::state::utterance::{
@@ -331,6 +332,63 @@ struct ErrorWindow {
 /// side of the channel, so "a cancelled result changed nothing" is true by
 /// construction rather than by remembering to check at each of the five steps a
 /// conversion used to walk through.
+/// The rules one dictation runs under, resolved from the destination it was
+/// aimed at.
+///
+/// The destination is the **carried** one: captured when the microphone really
+/// opened, and copied into the job when the work was handed out. Never the
+/// foreground window at this moment. That is what makes a profile a property of
+/// the dictation rather than of the instant — a user who switches windows while
+/// a long utterance is being transcribed cannot have its later chunks governed
+/// by the rules of the window they moved to.
+///
+/// A destination whose executable could not be read (`exe_path: None`) is an
+/// application this program cannot name, and it gets the general rules. Nothing
+/// here consults the window title, which changes as the user types and would
+/// therefore stop matching halfway through the document the profile was made
+/// for.
+///
+/// Deliberately **one** decision point: the conversion path and the insert path
+/// both call this, so "which rules applied to this text" cannot have two
+/// answers that disagree.
+pub(crate) fn rules_for(settings: &Settings, target: Option<&TargetIdentity>) -> EffectiveRules {
+    effective(
+        &settings.profiles,
+        target.and_then(|t| t.exe_path.as_deref()),
+        GeneralRules::from(settings),
+    )
+}
+
+/// Runs the text pipeline under `rules`.
+///
+/// Two stages, in this order: the general pipeline at the profile's mode, then
+/// the profile's own correction rules.
+///
+/// The profile's rules are applied **even in `Raw` mode**. `Raw` silences the
+/// built-in pipeline — the normalizer and the general dictionary — because a
+/// terminal wants the recogniser's string verbatim. It does not silence a rule
+/// the user wrote for that terminal by hand: an explicit instruction outranks a
+/// mode chosen to suppress *implicit* rewriting. The other way round, a panel
+/// that accepts a correction in a raw profile would never apply it, which reads
+/// as the feature being broken.
+fn process_with_rules(
+    text: &str,
+    normalizer: &Normalizer,
+    dictionary: &Dictionary,
+    rules: &EffectiveRules,
+) -> String {
+    // Delegated rather than reimplemented: [`crate::processing::TextRules`] is
+    // the one place that knows the order, and the dictionary panel's quick-fix
+    // preview runs the same value to show the user what a rule will do.
+    crate::processing::TextRules {
+        mode: rules.mode,
+        normalizer,
+        dictionary,
+        corrections: &rules.corrections,
+    }
+    .apply(text)
+}
+
 pub(crate) async fn convert(
     speech: Speech,
     seq: u64,
@@ -352,17 +410,28 @@ pub(crate) async fn convert(
     };
     match speech.router.transcribe(&audio).await {
         Ok(raw) => {
+            // Resolved per conversion from the destination this job carries,
+            // so every chunk of one dictation is judged against the window the
+            // dictation started in. Read back off the result: `target` itself
+            // was moved into it above.
+            let rules = rules_for(&speech.settings, result.target.as_ref());
+            if rules.is_profiled() {
+                // Only when a profile matched: a user with no profiles sees no
+                // new lines, and a user with one can see which rules ran.
+                tracing::info!(
+                    seq,
+                    profile = rules.profile.as_deref().unwrap_or(""),
+                    mode = rules.mode.as_str(),
+                    review = rules.review_before_insert,
+                    "application profile in force"
+                );
+            }
             let processed = {
                 let dict = speech
                     .dictionary
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                process_text_with(
-                    &raw,
-                    &speech.normalizer,
-                    &dict,
-                    speech.settings.text.options(),
-                )
+                process_with_rules(&raw, &speech.normalizer, &dict, &rules)
             };
             result.raw = raw;
             result.processed = processed;
@@ -635,8 +704,14 @@ impl<P: Port> Coordinator<P> {
     /// Read from the live settings rather than captured at startup, because the
     /// dashboard offers this as a switch and a user who flips it should not
     /// have to restart to feel it.
-    fn review_enabled(&self) -> bool {
-        self.speech.settings.gui.review_before_insert
+    ///
+    /// The matched profile wins over the general setting, and the match is made
+    /// against the destination this dictation carries: a profile that asks for
+    /// review in one application holds its text there even when the general
+    /// switch is off, and a profile that turns it off inserts straight into the
+    /// windows it names.
+    fn review_enabled(&self, target: Option<&TargetIdentity>) -> bool {
+        rules_for(&self.speech.settings, target).review_before_insert
     }
 
     /// How long a draft may wait before the app stops offering it.
@@ -1222,7 +1297,7 @@ impl<P: Port> Coordinator<P> {
         // repair erases a fragment this app itself typed a moment ago; if the
         // user edited the text in between, the erase would delete their words.
         // So an approved insert is a plain type of whatever the box says.
-        if review::should_hold(DraftKind::Review, self.review_enabled()) {
+        if review::should_hold(DraftKind::Review, self.review_enabled(target.as_ref())) {
             self.raise_draft(
                 DraftKind::Review,
                 to_type.to_string(),
@@ -2405,6 +2480,12 @@ mod tests {
         title: Mutex<Option<String>>,
         /// False makes the window look closed.
         alive: AtomicBool,
+        /// The executable the window in front belongs to, as a profile resolves
+        /// it. `None` is the ordinary case — a process whose image could not be
+        /// read — and it means an unknown application, which takes the general
+        /// rules. Every scenario written before profiles existed gets `None`
+        /// and therefore sees exactly the behaviour it asserted before.
+        exe: Mutex<Option<std::path::PathBuf>>,
         /// Every capture, in order, so a scenario can see which window each
         /// dictation was given.
         seen: watch::Sender<Vec<TargetIdentity>>,
@@ -2418,6 +2499,7 @@ mod tests {
                 now: Mutex::new(Some(0x1000)),
                 title: Mutex::new(None),
                 alive: AtomicBool::new(true),
+                exe: Mutex::new(None),
                 seen,
             })
         }
@@ -2438,6 +2520,15 @@ mod tests {
         /// Test side: dynamic window title update without changing handle or process.
         fn set_title(&self, title: impl Into<String>) {
             *self.title.lock().unwrap() = Some(title.into());
+        }
+
+        /// Test side: the window in front belongs to this executable.
+        ///
+        /// The handle and the pid are unchanged, which is the point — a profile
+        /// binds to *which application* a window is, and that identity has to be
+        /// readable without the window being a different one.
+        fn belongs_to(&self, path: impl Into<std::path::PathBuf>) {
+            *self.exe.lock().unwrap() = Some(path.into());
         }
 
         /// Test side: no window in front at all.
@@ -2488,7 +2579,7 @@ mod tests {
             let id = TargetIdentity {
                 hwnd,
                 pid: hwnd as u32,
-                exe_path: None,
+                exe_path: self.exe.lock().unwrap().clone(),
                 title_at_capture: title,
             };
             self.seen.send_modify(|seen| seen.push(id.clone()));
@@ -2781,6 +2872,58 @@ mod tests {
             Self::start_scripted(port, discarded, engine, Arc::new(SystemClock), false, rig, false)
         }
 
+        /// A loop whose *policy* the scenario wrote.
+        ///
+        /// The clock is real and the port is the ordinary scripted one, because
+        /// a profile is not a timing question: what is asserted is which rules
+        /// one dictation ran under, and that is decided from the settings and
+        /// the captured destination alone. The dictionary is the real seed
+        /// list, so a scenario can tell "the dictionary was applied" from "it
+        /// was not" — which is the only way a profile's `raw` mode is
+        /// observable from out here.
+        fn start_profiled(
+            port: ScriptedPort,
+            discarded: Arc<Notify>,
+            engine: &Arc<ScriptedEngine>,
+            desktop: Arc<ScriptedDesktop>,
+            settings: Settings,
+        ) -> Self {
+            let review = ReviewChannel::new();
+            let session = SessionDriver::new(&settings.hotkey);
+            let (sink, seen) = RecordingSink::scripted(Platform::default());
+            let status = Arc::new(StatusChannel::new("scripted"));
+            let mut status_rx = status.subscribe();
+            let _ = status_rx.borrow_and_update();
+
+            let coordinator = Coordinator::new(
+                port,
+                Speech {
+                    router: engine.router(),
+                    normalizer: Arc::new(Normalizer::new()),
+                    dictionary: Arc::new(RwLock::new(Dictionary::with_defaults())),
+                    settings: Arc::new(settings),
+                },
+                session,
+                status,
+                sink,
+                desktop,
+                Arc::new(SystemClock),
+                review.clone(),
+            );
+            let kept = coordinator.kept_handle();
+            let (input, input_rx) = mpsc::unbounded_channel();
+            let loop_task = tokio::spawn(coordinator.run(input_rx));
+            Self {
+                input,
+                discarded,
+                seen,
+                status: status_rx,
+                loop_task,
+                kept,
+                review,
+            }
+        }
+
         /// The same, with the hands-free double-tap latch **on**.
         ///
         /// Off everywhere else, so that releasing the record key ends the
@@ -2908,6 +3051,33 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        /// Waits until at least `n` undelivered records have been kept.
+        ///
+        /// The kept list sits behind a plain mutex with no change notification,
+        /// so this polls — deliberately, and not as a sleep-and-hope. The
+        /// subtlety it exists for: a record is pushed *before* that chunk's
+        /// error is shown, but a **later** chunk's record is a later moment
+        /// still. Waiting for the badge to read `Error` therefore proves only
+        /// that the *first* refusal finished, and a scenario with two refused
+        /// chunks that asserts immediately after samples the loop mid-flight —
+        /// seeing one record and calling it a lost record.
+        async fn kept_until(&mut self, n: usize) -> Vec<KeptRecord> {
+            within(
+                PATIENCE,
+                &format!("{n} refused-text record(s) to be kept"),
+                async {
+                    loop {
+                        let records = self.kept_records();
+                        if records.len() >= n {
+                            return records;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                },
+            )
+            .await
         }
 
         fn event(&self, ev: HotkeyEvent) {
@@ -4768,7 +4938,11 @@ mod tests {
                 .await
         );
 
-        let records = h.kept_records();
+        // Both records, not just the first one's error. The badge reads `Error`
+        // as soon as chunk 1 is refused, while chunk 2's conversion is still
+        // running — asserting on the list there would read one record and
+        // report a lost record that was never lost.
+        let records = h.kept_until(2).await;
         h.quit().await;
 
         assert_eq!(
@@ -6102,6 +6276,455 @@ mod tests {
             "direct mode has nothing to ask the user about"
         );
 
+        h.quit().await;
+    }
+    // ── application profiles (P1) ─────────────────────────────────────────
+    //
+    // The *decisions* — general fallback, an override merging field by field, an
+    // unknown application, an ambiguous binding, a binding that stops matching —
+    // are values, and they are decided and tested in `crate::profiles`. What
+    // only this loop can answer is the wiring: that the rules a dictation ran
+    // under came from the destination it **started** in, that the conversion
+    // path and the insert path agree about which those are, and that a profile
+    // can hold its text for review while the general switch says otherwise.
+
+    /// The mishearing the seed dictionary fixes. Standard mode types `پایتون`;
+    /// `raw` types exactly what the engine said.
+    const MISHEARD: &str = "من با پاتون کار میکنم";
+    /// What the seed dictionary makes of it.
+    const CORRECTED_WORD: &str = "پایتون";
+    /// The word RAW mode must leave untouched, corrector or no corrector.
+    const MISHEARD_WORD: &str = "پاتون";
+
+    /// The general rules plus the profiles the scenario wrote.
+    ///
+    /// The general mode is `Settings`' own default — `standard`, which corrects
+    /// — so a profile asking for `raw` has something to be a change *from*. The
+    /// general review switch is off, so a profile turning it on is visible.
+    fn profiled_settings(profiles: Vec<crate::profiles::AppProfile>) -> Settings {
+        let mut settings = Settings::default();
+        settings.hotkey.double_tap_latch = false;
+        settings.gui.review_before_insert = false;
+        settings.profiles = crate::profiles::ProfileSet::new(profiles);
+        settings
+    }
+
+    /// Everything the sink was told to type, in order, as one string.
+    ///
+    /// Joined rather than compared as a list because the seam and the boundary
+    /// policy legitimately add a separator between two dictations, and a test
+    /// about *which rules ran* should not fail over a space.
+    fn typed_text(ops: &[Op]) -> String {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Type(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A profile that asks for the recogniser's string verbatim.
+    fn raw_overrides() -> crate::profiles::Overrides {
+        crate::profiles::Overrides {
+            text_mode: Some("raw".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A profile for `code.exe` that says `raw`.
+    fn raw_profile() -> crate::profiles::AppProfile {
+        crate::profiles::AppProfile::new("Editor", "code.exe", raw_overrides())
+    }
+
+    /// A profile decides the text rules of the application it names.
+    ///
+    /// The general mode would have corrected the mishearing; this window's
+    /// profile says `raw`, so what reaches the keyboard is the engine's own
+    /// string. Nothing else about the rig changed, which is what makes this
+    /// about the profile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_profile_for_the_destination_decides_its_text_rules() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance(MISHEARD);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\Code.exe");
+        let mut h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![raw_profile()]),
+        );
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the dictation to type itself", h.wait_ops(1)).await;
+
+        let typed = typed_text(&h.seen.borrow().clone());
+        assert_eq!(
+            typed, MISHEARD,
+            "the profile asked for raw, so the engine's string must be typed untouched"
+        );
+        h.quit().await;
+    }
+
+    /// An application nobody wrote a profile for keeps the general rules.
+    ///
+    /// The negative half of the test above, and the one that matters most: a
+    /// user who installed profiles for one application must not have the rest of
+    /// their machine governed by them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_application_without_a_profile_keeps_the_general_rules() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance(MISHEARD);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\Chrome.exe");
+        let mut h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![raw_profile()]),
+        );
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the dictation to type itself", h.wait_ops(1)).await;
+
+        let typed = typed_text(&h.seen.borrow().clone());
+        assert!(
+            typed.contains(CORRECTED_WORD) && !typed.contains(MISHEARD_WORD),
+            "a window with no profile must run the general rules: {typed:?}"
+        );
+        h.quit().await;
+    }
+
+    /// The window the dictation **started** in decides — even when the user has
+    /// moved to another application before the engine answers.
+    ///
+    /// This is the session-stability criterion, and it is deliberately built out
+    /// of a real ordering rather than a hope: the capture happens inside the
+    /// loop's own turn, so waiting for it proves the destination was read while
+    /// `code.exe` was in front. The switch happens *after* that, and the text
+    /// must still be `raw`.
+    ///
+    /// If the rules were resolved from the foreground window at the moment the
+    /// text was ready, the correction below would appear — so this test fails on
+    /// exactly the bug it is named for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn switching_application_mid_dictation_does_not_change_its_rules() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance(MISHEARD);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\Code.exe");
+        let mut h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![raw_profile()]),
+        );
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        // The user clicks into another application while still dictating.
+        desktop.belongs_to("C:\\Apps\\Chrome.exe");
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the dictation to type itself", h.wait_ops(1)).await;
+
+        let typed = typed_text(&h.seen.borrow().clone());
+        assert_eq!(
+            typed, MISHEARD,
+            "the rules followed the window that happened to be in front at the end"
+        );
+        h.quit().await;
+    }
+
+    /// …and the symmetry: a dictation that started in a window with no profile
+    /// keeps the general rules even if the user moves *into* an application that
+    /// has one.
+    ///
+    /// Without this half, the test above would pass just as well on an
+    /// implementation that always used the general rules.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn moving_into_a_profiled_application_mid_dictation_changes_nothing() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance(MISHEARD);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\Chrome.exe");
+        let mut h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![raw_profile()]),
+        );
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        desktop.belongs_to("C:\\Apps\\Code.exe");
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the dictation to type itself", h.wait_ops(1)).await;
+
+        let typed = typed_text(&h.seen.borrow().clone());
+        assert!(
+            typed.contains(CORRECTED_WORD),
+            "a dictation does not acquire a profile it never started under: {typed:?}"
+        );
+        h.quit().await;
+    }
+
+    /// A window whose executable could not be read is an unknown application,
+    /// and unknown means general — never a guess from the title.
+    ///
+    /// The rig's default destination has no executable at all, which is the
+    /// production case for a process this program is not allowed to open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unreadable_executable_gets_the_general_rules() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance(MISHEARD);
+        let desktop = ScriptedDesktop::new();
+        // A title that *looks* like an executable name, which must not be read
+        // as the application's identity.
+        desktop.set_title("code.exe");
+        let mut h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![raw_profile()]),
+        );
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the dictation to type itself", h.wait_ops(1)).await;
+
+        let typed = typed_text(&h.seen.borrow().clone());
+        assert!(
+            typed.contains(CORRECTED_WORD),
+            "the window title must not stand in for the application: {typed:?}"
+        );
+        h.quit().await;
+    }
+
+    /// A profile's own correction rules run in its application — including under
+    /// `raw`, where the built-in dictionary was told to stand down.
+    ///
+    /// `raw` suppresses *implicit* rewriting (a terminal wants the recogniser's
+    /// string). A rule the user wrote into that profile by hand is not implicit,
+    /// and a panel that accepted it would otherwise never apply it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_profiles_own_rules_run_even_under_raw() {
+        // A pair the seed dictionary has never heard of, so the word in the
+        // output can only have come from the profile. The first version of this
+        // test used a mishearing the built-in list already fixes, and the
+        // negative control showed it passing with profiles ignored entirely.
+        const SPOKEN: &str = "این تستواره است";
+        const PROFILE_FROM: &str = "تستواره";
+        const PROFILE_TO: &str = "تستآوره";
+        const EXPECTED: &str = "این تستآوره است";
+
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance(SPOKEN);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\wt.exe");
+        let profile = crate::profiles::AppProfile::new(
+            "Terminal",
+            "wt.exe",
+            crate::profiles::Overrides {
+                text_mode: Some("raw".into()),
+                corrections: vec![crate::processing::dictionary::Correction {
+                    from: PROFILE_FROM.into(),
+                    to: PROFILE_TO.into(),
+                    category: Some("profile".into()),
+                }],
+                ..Default::default()
+            },
+        );
+        let mut h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![profile]),
+        );
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the dictation to type itself", h.wait_ops(1)).await;
+
+        let typed = typed_text(&h.seen.borrow().clone());
+        assert_eq!(
+            typed, EXPECTED,
+            "raw, plus the one rule this profile owns, is the whole pipeline here"
+        );
+        h.quit().await;
+    }
+
+    /// A profile can hold its text for review in one application while the
+    /// general switch stays off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_profile_can_hold_its_text_for_review() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance(MISHEARD);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\Code.exe");
+        let profile = crate::profiles::AppProfile::new(
+            "Editor",
+            "code.exe",
+            crate::profiles::Overrides {
+                review_before_insert: Some(true),
+                ..Default::default()
+            },
+        );
+        let h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![profile]),
+        );
+
+        let draft = dictate_once(&h, &desktop).await;
+
+        assert_eq!(draft.kind, DraftKind::Review);
+        assert!(
+            draft.text.contains(CORRECTED_WORD),
+            "the preview must show the text the rules produced: {:?}",
+            draft.text
+        );
+        assert!(
+            h.seen.borrow().is_empty(),
+            "nothing may reach the keyboard while a profile holds the text: {:?}",
+            h.seen.borrow()
+        );
+
+        h.quit().await;
+    }
+
+    /// …and the other way round: a profile that inserts directly keeps typing
+    /// straight away in its own windows, while the general switch holds everyone
+    /// else's text.
+    ///
+    /// This is the override-removal criterion at the loop level. Read on its own
+    /// it would pass on an implementation that ignored profiles entirely, which
+    /// is why the assertion after it checks that a window *without* a profile is
+    /// still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_profile_can_insert_directly_while_the_general_switch_holds_text() {
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(1)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: MISHEARD,
+            },
+            Step::Text {
+                samples: n(1),
+                text: MISHEARD,
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\Code.exe");
+        let profile = crate::profiles::AppProfile::new(
+            "Editor",
+            "code.exe",
+            crate::profiles::Overrides {
+                review_before_insert: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut settings = profiled_settings(vec![profile]);
+        settings.gui.review_before_insert = true;
+        let mut h = Harness::start_profiled(h_port, discarded, &h_engine, desktop.clone(), settings);
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the dictation to type itself", h.wait_ops(1)).await;
+
+        assert_eq!(
+            h.seen.borrow().len(),
+            1,
+            "the profile asked for a direct insert: {:?}",
+            h.seen.borrow()
+        );
+        assert!(
+            h.drafts().is_empty(),
+            "the profile turned review off for this application"
+        );
+
+        // The control: the same harness, another window, the general switch.
+        desktop.belongs_to("C:\\Apps\\Chrome.exe");
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(2).await;
+        h.event(HotkeyEvent::RecordUp);
+        let draft = h.wait_draft().await;
+        assert_eq!(draft.kind, DraftKind::Review);
+        assert_eq!(
+            h.seen.borrow().len(),
+            1,
+            "nothing more may be typed while the general switch holds the text"
+        );
+
+        h.quit().await;
+    }
+
+    /// Editing the profiles while a dictation is in flight does not re-govern
+    /// the work already handed out.
+    ///
+    /// The rules are read from the **destination the job carries**, so the
+    /// profile set is consulted where the work is converted. A user who edits
+    /// `[[profiles]]` between two dictations gets the new rules — but the
+    /// dictation that is already running is not retroactively rewritten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_destination_that_stops_matching_loses_its_profile_for_the_next_dictation() {
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(1)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: MISHEARD,
+            },
+            Step::Text {
+                samples: n(1),
+                text: MISHEARD,
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        desktop.belongs_to("C:\\Apps\\Code.exe");
+        let mut h = Harness::start_profiled(
+            h_port,
+            discarded,
+            &h_engine,
+            desktop.clone(),
+            profiled_settings(vec![raw_profile()]),
+        );
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the first dictation to type itself", h.wait_ops(1)).await;
+        assert_eq!(
+            typed_text(&h.seen.borrow().clone()),
+            MISHEARD,
+            "the profiled window types the engine's string"
+        );
+
+        // The user renames the executable (an update that moved the app).
+        desktop.belongs_to("C:\\Apps\\code2.exe");
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(2).await;
+        h.event(HotkeyEvent::RecordUp);
+        within(PATIENCE, "the second dictation to type itself", h.wait_ops(2)).await;
+
+        let typed = typed_text(&h.seen.borrow().clone());
+        assert!(
+            typed.contains(CORRECTED_WORD),
+            "the next dictation must run the general rules again: {typed:?}"
+        );
         h.quit().await;
     }
 }
