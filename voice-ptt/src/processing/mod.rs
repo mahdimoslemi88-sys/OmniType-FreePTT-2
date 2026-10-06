@@ -195,6 +195,21 @@ impl TextRules<'_> {
     }
 }
 
+/// A character a Latin word, file name, domain or URL can continue with.
+///
+/// Shared by the two stages that decide whether a mark ends a clause —
+/// [`normalizer`]'s attachment pass and [`formal`]'s punctuation group — so the
+/// two cannot drift apart about the same question. Every character a token may
+/// carry on with after a `.`, `:` or `,` is here: `example.com`,
+/// `http://site`, `test@site.com`, `file_name-v2.txt`, `50%`, `a=1`.
+///
+/// Deliberately made of ASCII only. A mark followed by a **Persian** letter is
+/// the case this whole pipeline exists to repair (`سلام.خوبی` → `سلام. خوبی`),
+/// and that must keep splitting.
+pub(crate) fn continues_latin_token(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || "/%#&?=@_~+$-".contains(ch)
+}
+
 /// [`process_text`] with the mode chosen by the caller.
 ///
 /// The old three-argument entry point is kept and still means `Standard`, so
@@ -381,7 +396,11 @@ mod tests {
                 );
             }
         }
-        assert_eq!(checked, 42, "the fixture gained or lost a case");
+        // 18 cases × 3 modes, the three `seam` ones being replay-tested elsewhere.
+        // Grew from 42 when the post-I5 scan added T0-018 (a mark inside a Latin
+        // token), which is exactly what this counter is for: a fixture cannot
+        // gain or lose a row without somebody saying so here.
+        assert_eq!(checked, 45, "the fixture gained or lost a case");
     }
 
     /// The fixture is only meaningful if its `current` column is the default.

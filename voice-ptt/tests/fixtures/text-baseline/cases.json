@@ -3,7 +3,8 @@
     "package": "T0",
     "measured_on": "2026-10-01",
     "updated_by": "T1 (2026-10-01): every `current` below was re-measured from a run after the suffix rule changed; none of it was read out of the code",
-    "how_measured": "temporary integration test calling the public API (Normalizer::normalize, processing::process_text_with, SeamStitcher::stitch) with the strings below; the probe was deleted afterwards, nothing else changed",
+    "added_by": "۲۰۲۶-۱۰-۰۷ scan: T0-018 added by the roadmap-coverage scan (Q1-review-2 / Q2-1) from a temporary probe run in all three modes; the probe was deleted afterwards. Everything above it is still T0/T1 measurement.",
+  "how_measured": "temporary integration test calling the public API (Normalizer::normalize, processing::process_text_with, SeamStitcher::stitch) with the strings below; the probe was deleted afterwards, nothing else changed",
     "note": "ZWNJ is U+200C, written here as \\u200c so it is visible. `current` is Standard mode (what the app did before T1 and still does); `modes` records the same input through all three modes. `expected` is what the roadmap says must hold; `verdict` is the gap that remains.",
     "encoding": "all strings are Persian unless stated"
   },
@@ -172,6 +173,20 @@
       "note": "a truncated word is kept as-is until the full word arrives; no backspace is invented",
       "input": "می‌خوا (chunk 3)",
       "current": "text = \"می‌خوا\", dropped 0, backspaces 0",
+      "expected": "same",
+      "verdict": "OK"
+    },
+    {
+      "id": "T0-018",
+      "stage": "normalize",
+      "note": "a mark inside a Latin token is notation, not a clause boundary (found by the post-I5 scan, Q2-1). Measured before the fix: this came out as `سایت example. com را ببین` in every mode except raw, and `http://site.com` as `http: //site. com`",
+      "input": "سایت example.com را ببین",
+      "current": "سایت example.com را ببین",
+      "modes": {
+        "standard": "سایت example.com را ببین",
+        "conservative": "سایت example.com را ببین",
+        "raw": "سایت example.com را ببین"
+      },
       "expected": "same",
       "verdict": "OK"
     }

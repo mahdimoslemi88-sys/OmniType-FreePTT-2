@@ -407,7 +407,21 @@ impl Normalizer {
                     // building the formal mode, which deliberately does not
                     // touch digits).
                     let numeric = before.is_some_and(is_digit) && is_digit(next);
-                    if next != ' ' && !ATTACH_PUNCT.contains(&next) && !numeric {
+                    // …and the same idea in Latin: `example.com`,
+                    // `report.docx`, `www.test.org` and `http://site` are one
+                    // token each, so a space after the mark would split a file
+                    // name, a domain or a URL into two words. Measured before
+                    // this rule: `سایت example.com را ببین` came out as
+                    // `سایت example. com را ببین` (and `http://` as `http: //`)
+                    // in **every** mode except `raw`.
+                    //
+                    // Left side Arabic/Persian stays a clause boundary on
+                    // purpose: `سلام.خوبی` is the shape a recogniser emits and
+                    // the space there is the correction the pipeline is for.
+                    let notation = numeric
+                        || (before.is_some_and(super::continues_latin_token)
+                            && super::continues_latin_token(next));
+                    if next != ' ' && !ATTACH_PUNCT.contains(&next) && !notation {
                         punct_fixed.push(' ');
                     }
                 }
@@ -601,6 +615,39 @@ mod tests {
         assert_eq!(n.normalize("ساعت ۵:۳۰ باشد"), "ساعت ۵:۳۰ باشد");
         // Non-numeric neighbours keep the rule they always had.
         assert_eq!(n.normalize("۱۰۰درصد،خوب"), "۱۰۰درصد، خوب");
+    }
+
+    /// A mark inside a Latin token is notation too, not a clause boundary.
+    ///
+    /// Measured before this rule, in every mode except `raw`:
+    /// `سایت example.com را ببین` → `سایت example. com را ببین`،
+    /// `http://site.com` → `http: //site. com`، `report.docx` → `report. docx`.
+    /// A file name, a domain and a URL are each one word, and a space in the
+    /// middle of one is corruption of a sample that was already correct — the
+    /// same argument the digit rule beside it makes.
+    #[test]
+    fn a_mark_inside_a_latin_token_is_not_a_clause_boundary() {
+        let n = Normalizer::new();
+        for input in [
+            "سایت example.com را ببین",
+            "www.test.org",
+            "فایل report.docx را باز کن",
+            "آدرس http://site.com را باز کن",
+            "test@site.com",
+            "file_name-v2.txt",
+        ] {
+            assert_eq!(n.normalize(input), input, "{input:?} was split");
+        }
+
+        // The case the pipeline exists for is untouched by the new rule: a
+        // Persian word and a Persian word around the mark is a clause
+        // boundary, and the space there is the correction.
+        assert_eq!(n.normalize("سلام.خوبی"), "سلام. خوبی");
+        assert_eq!(n.normalize("تمام شد.برو"), "تمام شد. برو");
+        // …and a Latin word that really does end a sentence still gets its
+        // space, because the Persian letter after the mark is not part of a
+        // Latin token.
+        assert_eq!(n.normalize("Python.بعد"), "Python. بعد");
     }
 
     #[test]

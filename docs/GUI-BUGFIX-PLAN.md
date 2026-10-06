@@ -130,7 +130,8 @@ hwnd=0x009111A6 class=tray_icon_app             visible=False rect=(1329,436 162
 ```
 
 - مصرف CPU در حالت بیکار ≈ ۲٫۵–۵٪ یک هسته = اثر همان حلقهٔ دائمی.
-- جهش‌های دوره‌ای (private ۳۵۰→۴۰۲MB، handles ۹۱۲→۱۰۰۲، threads ۵۸→۶۷) با پروبِ پس‌زمینهٔ موتور **Antigravity** هم‌زمان است: ترد نگه‌دارنده هر ۳۰–۶۰ ثانیه `maintain()` را صدا می‌زند که **PowerShell + netstat** را اجرا می‌کند ([lib.rs:331](../voice-ptt/src/lib.rs#L331)، [antigravity.rs:558](../voice-ptt/src/asr/antigravity.rs#L558)) — حتی وقتی کاربر آن موتور را انتخاب نکرده و اصلاً Antigravity نصب/اجرا نیست.
+- جهش‌های دوره‌ای (private ۳۵۰→۴۰۲MB، handles ۹۱۲→۱۰۰۲، threads ۵۸→۶۷) با پروبِ پس‌زمینهٔ موتور **Antigravity** هم‌زمان است: ترد نگه‌دارنده هر ۳۰–۶۰ ثانیه `maintain()` را صدا می‌زند که **PowerShell + netstat** را اجرا می‌کند ([lib.rs](../voice-ptt/src/lib.rs#L492)، موقعِ نوشتنِ این گزارش [antigravity.rs](../voice-ptt/src/asr/antigravity/mod.rs#L141)) — حتی وقتی کاربر آن موتور را انتخاب نکرده و اصلاً Antigravity نصب/اجرا نیست.
+  - **رفع شد (۲۰۲۶-۱۰-۰۷، بازبینیِ مسیرهای مستند).** حالا `probe.maintain()` تنها وقتی صدا زده می‌شود که همان موتور انتخاب شده باشد: `if selected { probe.maintain(); }` در [lib.rs:492](../../voice-ptt/src/lib.rs#L492)، و کامنتِ خودِ کد هم همین چرن را توضیح می‌دهد («probing forever for an engine the user never chose was measurable churn»). ماژول هم از یک فایل به پوشهٔ [asr/antigravity/](../voice-ptt/src/asr/antigravity/) رفته؛ لینکِ قدیمی به `asr/antigravity.rs` مرده بود و همین اسکن پیدایش کرد.
 
 **پ) مدل لوکال: الان لود نمی‌شود ولی دو تله باز باقی است**
 

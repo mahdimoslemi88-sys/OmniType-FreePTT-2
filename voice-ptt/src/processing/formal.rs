@@ -2,11 +2,16 @@
 //! expects, on top of [`Normalizer::normalize`].
 //!
 //! The mode sits **after** the ordinary pipeline and touches only whitespace
-//! around marks and at script boundaries — it never rewrites a word, never
-//! infers meaning, and never removes anything. That is the line the roadmap
-//! draws: نگارش means نشانه‌گذاری and spacing, not بازنویسی معنایی, and a
-//! service that rewrites what the user said is out of scope by decision, not
-//! by omission.
+//! around marks and at script boundaries — it never rewrites a word and never
+//! infers meaning. That is the line the roadmap draws: نگارش means نشانه‌گذاری and
+//! spacing, not بازنویسی معنایی, and a service that rewrites what the user said
+//! is out of scope by decision, not by omission.
+//!
+//! **What it does to whitespace, precisely.** It inserts one space where a
+//! written document wants one, and it **absorbs** a run of spaces that sits
+//! before a mark — the "none before" half of the punctuation group, since
+//! `سلام ، خوبی` is not written Persian. No other character is touched, at any
+//! time, which is what `nothing_is_removed` pins.
 //!
 //! # The groups, and why each is its own switch
 //!
@@ -14,9 +19,14 @@
 //! so a user who disagrees with one of them can turn just that one off instead
 //! of losing the mode. The flags live in `[text]` of `config.toml`.
 //!
-//! * [`FormalOptions::punctuation`] — one space **after** `، , . ؟ ? ! : ؛ ;`
+//! * [`FormalOptions::punctuation`] — one space **after** `، , . ؟ ? ! : ؛ ; …`
 //!   when a letter follows, and none before. Speech recognisers emit
 //!   `سلام،خوبی` routinely; written Persian does not.
+//!   A mark **inside a Latin token** is notation, not a clause boundary, and is
+//!   left alone: `example.com`, `report.docx` and `http://site` are each one
+//!   word, and the same rule governs the normalizer's attachment pass
+//!   ([`super::continues_latin_token`]). Measured before that rule existed:
+//!   `سایت example.com را ببین` came out as `سایت example. com را ببین`.
 //! * [`FormalOptions::mixed_spacing`] — one space at the boundary between a
 //!   Persian/Arabic word and a Latin word or a digit, in either direction
 //!   (`ازPython` → `از Python`, `۱۰۰درصد` → `۱۰۰ درصد`). Persian does not join
@@ -116,19 +126,31 @@ fn needs_script_space(left: Class, right: Class) -> bool {
 /// and is here anyway: this group has to be able to stand on its own when the
 /// other groups are off, and a rule whose result depends on which *other*
 /// mode ran first is a rule nobody can reason about.
+///
+/// It absorbs the **whole run** of spaces before a mark, not one of them: a
+/// rule that ate a single space would leave `سلام  ، خوبی` as `سلام ، خوبی`
+/// — half-corrected, and different depending on how many spaces the source
+/// happened to have. The mark itself decides nothing about the next character
+/// when that character continues a Latin token.
 fn punctuate(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 8);
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if CLAUSE_MARKS.contains(&ch) {
+            // The character the mark attaches to, read before the spaces below
+            // are absorbed: it is what tells `example.com` from `سلام.خوبی`.
+            let before = out.trim_end().chars().next_back();
             // No space before a mark.
-            if out.ends_with(' ') {
+            while out.ends_with(' ') {
                 out.pop();
             }
             out.push(ch);
-            // One space after it, only when a letter actually follows.
+            // One space after it, only when a letter actually follows — and
+            // never inside a Latin token, where the mark is notation.
             if let Some(&next) = chars.peek() {
-                if is_letter(next) && !out.ends_with(' ') {
+                let notation = before.is_some_and(super::continues_latin_token)
+                    && super::continues_latin_token(next);
+                if is_letter(next) && !notation && !out.ends_with(' ') {
                     out.push(' ');
                 }
             }
@@ -205,6 +227,13 @@ mod tests {
             ("۲مین مرحله", "۲ مین مرحله"),
             ("نسخه 2.5 را نصب کنید", "نسخه 2.5 را نصب کنید"),
             // ترکیبی
+            // توکن لاتین: نقطه و دو نقطه‌اش نشانهٔ بند نیستند. این نمونه‌ها پیش از
+            // اصلاح خراب می‌شدند: `example. com`، `report. docx`،
+            // `http: //site. com`، `file_name-v2. txt`.
+            ("سایت example.com را ببین", "سایت example.com را ببین"),
+            ("فایل report.docx را باز کن", "فایل report.docx را باز کن"),
+            ("آدرس http://site.com را باز کن", "آدرس http://site.com را باز کن"),
+            ("test@site.com", "test@site.com"),
             ("من Python3 و راست کار میکنم", "من Python3 و راست کار میکنم"),
             // نشانه‌گذاری
             ("چرا؟!", "چرا؟!"),
@@ -214,8 +243,9 @@ mod tests {
         }
     }
 
-    /// The mode only ever inserts. Nothing a user wrote may disappear — not a
-    /// space, not a mark, not a letter.
+    /// The mode only ever inserts, except for the run of spaces the "none
+    /// before" half of the punctuation group absorbs. No other character a user
+    /// wrote may disappear — not a mark, not a letter.
     #[test]
     fn nothing_is_removed() {
         for input in [
@@ -303,5 +333,17 @@ mod tests {
         for input in ["سلام دنیا", "بیا بریم", "تمام شد"] {
             assert_eq!(formal(input), input);
         }
+    }
+
+    /// The "none before" half takes the whole run, so the result does not
+    /// depend on how many spaces the source carried. Before this, a two-space
+    /// run came out as `سلام ، خوبی`: one space absorbed, one left standing.
+    #[test]
+    fn the_space_run_before_a_mark_is_absorbed_whole() {
+        assert_eq!(formal("سلام ، خوبی"), "سلام، خوبی");
+        assert_eq!(formal("سلام  ، خوبی"), "سلام، خوبی");
+        assert_eq!(formal("پایان   ."), "پایان.");
+        assert_eq!(formal("چرا ؟"), "چرا؟");
+        assert_eq!(formal("مهم :\nصبر کن"), "مهم:\nصبر کن");
     }
 }

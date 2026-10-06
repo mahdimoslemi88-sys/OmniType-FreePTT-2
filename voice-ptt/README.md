@@ -127,14 +127,19 @@ commands = false          # "خط جدید" / "ویرگول" insert a break or p
 # plus commands is a supported combination.
 #
 # `formal` (also accepted: "رسمی") is `standard` plus written-register spacing.
-# It only ever inserts whitespace: one space after ، , . ؟ ? ! : ؛ ; … when a
-# letter follows (and none before it), and one where a Persian word meets a
-# Latin word or a number (ازPython → از Python, ۱۰۰درصد → ۱۰۰ درصد). No word is
-# rewritten, nothing is removed, no mark is invented, and a mark between digits
-# is left alone (نسخه 2.5 stays 2.5). Each group below can be turned off on its
-# own; both are consulted only in `mode = "formal"`, so their checkboxes appear
-# in the settings tab only while that mode is configured.
-formal_punctuation = true # space after clause marks, none before
+# One space after ، , . ؟ ? ! : ؛ ; … when a letter follows, and the run of
+# spaces *before* one is absorbed (سلام  ، خوبی → سلام، خوبی); one space where a
+# Persian word meets a Latin word or a number (ازPython → از Python,
+# ۱۰۰درصد → ۱۰۰ درصد). No word is rewritten, no character other than that
+# whitespace run is removed, no mark is invented, and a mark between digits is
+# left alone (نسخه 2.5 stays 2.5). A mark inside a Latin token is notation
+# rather than a clause boundary, so a file name, domain or URL survives whole:
+# example.com, report.docx, http://site.com, file_name-v2.txt. That rule also
+# applies to `standard` and `conservative` (it lives in the normalizer), and it
+# is why hello.World is not split either. Each group below can be turned off on
+# its own; both are consulted only in `mode = "formal"`, so their checkboxes
+# appear in the settings tab only while that mode is configured.
+formal_punctuation = true # space after clause marks; the spaces before one are absorbed
 formal_mixed_spacing = true # space at Persian↔Latin/digit boundaries
 
 [gui]
