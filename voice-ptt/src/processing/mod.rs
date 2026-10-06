@@ -7,6 +7,7 @@
 pub mod boundary;
 pub mod commands;
 pub mod dictionary;
+pub mod formal;
 pub mod normalizer;
 pub mod quickfix;
 pub mod seam;
@@ -40,6 +41,14 @@ pub enum TextMode {
     /// has always done.
     #[default]
     Standard,
+    /// `Standard` plus written-register spacing: one space after a clause mark,
+    /// and one where a Persian word meets a Latin word or a number.
+    ///
+    /// Word-independent by construction — see [`formal`]. It never rewrites a
+    /// word, never removes anything, and never invents a mark, because
+    /// "formal" is a register of *presentation* and not a licence to say what
+    /// the user meant.
+    Formal,
 }
 
 impl TextMode {
@@ -52,6 +61,7 @@ impl TextMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "raw" => TextMode::Raw,
             "conservative" => TextMode::Conservative,
+            "formal" | "رسمی" => TextMode::Formal,
             _ => TextMode::Standard,
         }
     }
@@ -62,6 +72,7 @@ impl TextMode {
             TextMode::Raw => "raw",
             TextMode::Conservative => "conservative",
             TextMode::Standard => "standard",
+            TextMode::Formal => "formal",
         }
     }
 }
@@ -82,6 +93,10 @@ pub struct ProcessingOptions {
     /// commands on wants the line break whether or not they also asked for
     /// their words verbatim.
     pub commands: bool,
+    /// Which formal-writing groups run — only consulted in
+    /// [`TextMode::Formal`], and carried here so a preview and the coordinator
+    /// agree about what the mode does.
+    pub formal: formal::FormalOptions,
 }
 
 impl ProcessingOptions {
@@ -89,12 +104,19 @@ impl ProcessingOptions {
         Self {
             mode,
             commands: false,
+            formal: formal::FormalOptions::default(),
         }
     }
 
     /// Sets the command switch; the rest is unchanged.
     pub fn with_commands(mut self, commands: bool) -> Self {
         self.commands = commands;
+        self
+    }
+
+    /// Sets the formal-writing groups; the rest is unchanged.
+    pub fn with_formal(mut self, formal: formal::FormalOptions) -> Self {
+        self.formal = formal;
         self
     }
 
@@ -108,6 +130,10 @@ impl ProcessingOptions {
 
     pub fn standard() -> Self {
         Self::new(TextMode::Standard)
+    }
+
+    pub fn formal() -> Self {
+        Self::new(TextMode::Formal)
     }
 }
 
@@ -144,6 +170,8 @@ pub struct TextRules<'a> {
     /// coordinator will. A preview that left the switch out would show text
     /// that is not what gets typed.
     pub commands: bool,
+    /// Which formal-writing groups run, for [`TextMode::Formal`].
+    pub formal: formal::FormalOptions,
 }
 
 impl TextRules<'_> {
@@ -153,7 +181,9 @@ impl TextRules<'_> {
             text,
             self.normalizer,
             self.dictionary,
-            ProcessingOptions::new(self.mode).with_commands(self.commands),
+            ProcessingOptions::new(self.mode)
+                .with_commands(self.commands)
+                .with_formal(self.formal),
         );
         if self.corrections.is_empty() {
             return processed;
@@ -180,6 +210,12 @@ pub fn process_text_with(
         TextMode::Raw => text.to_string(),
         TextMode::Conservative => dictionary.correct(&normalizer.normalize_conservative(text)),
         TextMode::Standard => dictionary.correct(&normalizer.normalize(text)),
+        // The ordinary pipeline first, then the formal groups: `formal` is
+        // spacing on top of the same text, never a second opinion about it.
+        TextMode::Formal => {
+            let written = formal::apply(&normalizer.normalize(text), options.formal);
+            dictionary.correct(&written)
+        }
     };
     // Last, after the mode and the general dictionary: the marker a command
     // becomes must survive the whitespace pass, and no rule gets to rewrite a
@@ -559,5 +595,93 @@ mod tests {
             ProcessingOptions::standard().with_commands(true)
         );
         assert_eq!(out, "کلینت.", "the word was normalized, the command acted");
+    }
+
+    // ── formal (P2) through the real pipeline ─────────────────────────
+
+    /// The mode is reachable by the spelling `config.toml` uses and by the one
+    /// a Persian reader would write, and `as_str` is what round-trips back
+    /// into the file and the profile drop-down.
+    #[test]
+    fn formal_is_reachable_by_both_spellings() {
+        assert_eq!(TextMode::parse("formal"), TextMode::Formal);
+        assert_eq!(TextMode::parse("رسمی"), TextMode::Formal);
+        assert_eq!(TextMode::Formal.as_str(), "formal");
+        assert_eq!(
+            TextMode::parse(TextMode::Formal.as_str()),
+            TextMode::Formal,
+            "what is written back must parse as what it was"
+        );
+        assert_eq!(
+            ProcessingOptions::formal().formal,
+            formal::FormalOptions::default(),
+            "the mode's groups default to on"
+        );
+    }
+
+    /// Acceptance from the plan: raw and conservative behave exactly as they
+    /// did before this mode existed. Raw is byte-for-byte, and conservative
+    /// does not pick up the formal mode's own contribution — the script
+    /// boundary — by accident.
+    #[test]
+    fn the_formal_groups_never_run_outside_the_formal_mode() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        for input in ["سلام،خوبی؟ چرا؟چون", "ازPython و ۱۰۰درصد"] {
+            assert_eq!(
+                process_text_with(input, &n, &d, ProcessingOptions::raw()),
+                input,
+                "raw must stay verbatim for {input:?}"
+            );
+        }
+        assert_eq!(
+            process_text_with("ازPython و ۱۰۰درصد", &n, &d, ProcessingOptions::conservative()),
+            "ازPython و ۱۰۰درصد",
+            "conservative gained formal spacing"
+        );
+    }
+
+    /// The formal mode is the standard pipeline *plus* spacing: the
+    /// normalizer runs first (so Arabic codepoints are Persian by the time the
+    /// spacing rules look at them) and the dictionary still runs afterwards,
+    /// so a mishearing is corrected in this mode too.
+    #[test]
+    fn formal_is_the_standard_pipeline_plus_spacing() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        assert_eq!(
+            process_text_with("من با پاتون ازPython", &n, &d, ProcessingOptions::formal()),
+            "من با پایتون از Python",
+            "dictionary correction and script spacing both happened"
+        );
+    }
+
+    /// Turning a group off changes only that group, through the same path the
+    /// coordinator and the previews use. ASCII `?` is the witness: the
+    /// normalizer has never covered it, so a space after it can only have come
+    /// from the formal punctuation group.
+    #[test]
+    fn a_formal_group_can_be_turned_off_through_the_pipeline() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        let spacing_only = formal::FormalOptions {
+            punctuation: false,
+            mixed_spacing: true,
+        };
+        assert_eq!(
+            process_text_with(
+                "چرا?چون ازPython",
+                &n,
+                &d,
+                ProcessingOptions::formal().with_formal(spacing_only)
+            ),
+            "چرا?چون از Python",
+            "punctuation off: only the script boundary moved"
+        );
+        assert_eq!(
+            process_text_with("چرا?چون ازPython", &n, &d, ProcessingOptions::formal()),
+            "چرا? چون از Python",
+            "both groups on"
+        );
     }
 }

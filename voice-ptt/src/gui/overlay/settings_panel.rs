@@ -466,6 +466,32 @@ pub(crate) fn render(
                             .on_hover_text(
                                 "say \"خط جدید\" or \"ویرگول\" to insert a line break or punctuation.\nIt fires when the whole sentence is the phrase, or after the word \"دستور\" —\na sentence that merely mentions one is typed exactly as spoken.\nOff by default: a spoken sentence must not become a line break until you ask.",
                             );
+                            // The formal mode's groups are consulted only by
+                            // that mode, so they are shown only when it is the
+                            // configured one: a switch that does nothing until
+                            // an unrelated setting changes is a switch nobody
+                            // can reason about. Each group stands alone — the
+                            // plan requires that turning one off keeps the
+                            // other.
+                            if state.draft.text.mode()
+                                == crate::processing::TextMode::Formal
+                            {
+                                ui.add_space(4.0);
+                                ui.checkbox(
+                                    &mut state.draft.text.formal_punctuation,
+                                    format_persian_display("فاصله پس از نشانه‌ها"),
+                                )
+                                .on_hover_text(
+                                    "one space after ، , . ؟ ? ! : ؛ when a letter follows, and none before.\nOnly consulted while mode = \"formal\".",
+                                );
+                                ui.checkbox(
+                                    &mut state.draft.text.formal_mixed_spacing,
+                                    format_persian_display("فاصله در مرز فارسی و لاتین"),
+                                )
+                                .on_hover_text(
+                                    "one space where a Persian word meets a Latin word or a number\n(ازPython → از Python, ۱۰۰درصد → ۱۰۰ درصد). Insertion only — never removal.\nOnly consulted while mode = \"formal\".",
+                                );
+                            }
                         });
 
                         ui.add_space(8.0);

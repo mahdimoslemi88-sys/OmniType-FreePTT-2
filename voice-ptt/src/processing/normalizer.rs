@@ -305,6 +305,12 @@ const ADJECTIVE_STEMS: &[&str] = &[
 /// one space after).
 const ATTACH_PUNCT: &[char] = &['،', '؛', '؟', '!', '.', ':', ','];
 
+/// A digit in either script — the adjacency that makes a mark notation
+/// rather than a clause boundary.
+fn is_digit(ch: char) -> bool {
+    ch.is_ascii_digit() || ('۰'..='۹').contains(&ch)
+}
+
 pub struct Normalizer {
     zwnj: char,
 }
@@ -383,6 +389,10 @@ impl Normalizer {
         let chars: Vec<char> = collapsed.chars().collect();
         for (i, &c) in chars.iter().enumerate() {
             if ATTACH_PUNCT.contains(&c) {
+                // The word the mark attaches to: the last non-space character
+                // before it, read before the space below is popped. It decides
+                // the numeric case.
+                let before = punct_fixed.trim_end().chars().next_back();
                 // Remove a space immediately before the punctuation.
                 if punct_fixed.ends_with(' ') {
                     punct_fixed.pop();
@@ -390,7 +400,14 @@ impl Normalizer {
                 punct_fixed.push(c);
                 // Ensure exactly one space after, unless next is also punct or end.
                 if let Some(&next) = chars.get(i + 1) {
-                    if next != ' ' && !ATTACH_PUNCT.contains(&next) {
+                    // A digit on both sides is notation, not a clause:
+                    // "نسخه 2.5" is a version and "۱۲،۳۴" is a number, and
+                    // splitting them into "2. 5" and "۱۲، ۳۴" is corruption
+                    // of a sample that was already correct (found while
+                    // building the formal mode, which deliberately does not
+                    // touch digits).
+                    let numeric = before.is_some_and(is_digit) && is_digit(next);
+                    if next != ' ' && !ATTACH_PUNCT.contains(&next) && !numeric {
                         punct_fixed.push(' ');
                     }
                 }
@@ -566,6 +583,24 @@ mod tests {
     fn punctuation_attaches_to_previous_word() {
         let n = Normalizer::new();
         assert_eq!(n.normalize("سلام ، خوبی ؟"), "سلام، خوبی؟");
+    }
+
+    /// A digit on both sides of a mark is notation, not a clause boundary.
+    ///
+    /// Measured before the fix: `نسخه 2.5` came out as `نسخه 2. 5` and
+    /// `۱۲،۳۴` as `۱۲، ۳۴`, in **every** non-raw mode — the stage that
+    /// attaches punctuation did not look at what surrounded the mark. A
+    /// sample that was already correct must not be split; found while
+    /// building the formal mode, whose own spacing rule deliberately skips
+    /// digits.
+    #[test]
+    fn a_mark_between_digits_is_not_a_clause_boundary() {
+        let n = Normalizer::new();
+        assert_eq!(n.normalize("نسخه 2.5 را نصب کنید"), "نسخه 2.5 را نصب کنید");
+        assert_eq!(n.normalize("۱۲،۳۴"), "۱۲،۳۴");
+        assert_eq!(n.normalize("ساعت ۵:۳۰ باشد"), "ساعت ۵:۳۰ باشد");
+        // Non-numeric neighbours keep the rule they always had.
+        assert_eq!(n.normalize("۱۰۰درصد،خوب"), "۱۰۰درصد، خوب");
     }
 
     #[test]

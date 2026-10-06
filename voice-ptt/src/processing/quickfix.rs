@@ -562,6 +562,7 @@ mod tests {
             // The preview's subject is a rule, not the command switch; off
             // keeps this harness about the dictionary it is testing.
             commands: false,
+            formal: crate::processing::formal::FormalOptions::default(),
         }
     }
 

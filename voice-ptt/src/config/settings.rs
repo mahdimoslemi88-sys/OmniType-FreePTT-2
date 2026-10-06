@@ -107,6 +107,16 @@ pub struct TextSettings {
     /// sentence into a line break until the user has asked it to. See
     /// [`crate::processing::commands`] for the two shapes a command may take.
     pub commands: bool,
+    /// One space after `، , . ؟ ? ! : ؛` when a letter follows — the formal
+    /// mode's punctuation group. Consulted only in `mode = "formal"`.
+    ///
+    /// Separate key rather than a baked-in rule so a reader who disagrees with
+    /// this one rule can turn it off without losing the mode; that is what
+    /// «هر گروه قواعد قابل‌خاموش‌کردن باشد» asks for.
+    pub formal_punctuation: bool,
+    /// One space where a Persian word meets a Latin word or a number — the
+    /// formal mode's mixed-script group. Consulted only in `mode = "formal"`.
+    pub formal_mixed_spacing: bool,
 }
 
 impl Default for TextSettings {
@@ -114,6 +124,8 @@ impl Default for TextSettings {
         Self {
             mode: "standard".into(),
             commands: false,
+            formal_punctuation: true,
+            formal_mixed_spacing: true,
         }
     }
 }
@@ -132,7 +144,17 @@ impl TextSettings {
 
     /// The pipeline options this section describes.
     pub fn options(&self) -> crate::processing::ProcessingOptions {
-        crate::processing::ProcessingOptions::new(self.mode()).with_commands(self.commands)
+        crate::processing::ProcessingOptions::new(self.mode())
+            .with_commands(self.commands)
+            .with_formal(self.formal_options())
+    }
+
+    /// The formal-writing groups, as one value.
+    pub fn formal_options(&self) -> crate::processing::formal::FormalOptions {
+        crate::processing::formal::FormalOptions {
+            punctuation: self.formal_punctuation,
+            mixed_spacing: self.formal_mixed_spacing,
+        }
     }
 }
 
@@ -1068,6 +1090,9 @@ mod tests {
             ("raw", crate::processing::TextMode::Raw),
             ("conservative", crate::processing::TextMode::Conservative),
             ("standard", crate::processing::TextMode::Standard),
+            ("formal", crate::processing::TextMode::Formal),
+            // The spelling a Persian reader would use is accepted too.
+            ("رسمی", crate::processing::TextMode::Formal),
             // A typo must not silently become "type everything verbatim".
             ("nonsense", crate::processing::TextMode::Standard),
         ] {
@@ -1080,6 +1105,41 @@ mod tests {
         std::fs::write(&path, "[audio]\nsample_rate = 16000\n").unwrap();
         let s = Settings::load_or_create(&path).expect("loads");
         assert_eq!(s.text.mode(), crate::processing::TextMode::Standard);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The formal groups are on by default and each key reaches the pipeline
+    /// on its own — the plan requires every group to be switchable without
+    /// losing the mode, and a key that parsed but never arrived at
+    /// `options()` would read as "my option does nothing".
+    #[test]
+    fn the_formal_groups_default_on_and_each_key_reaches_the_pipeline() {
+        let defaults = TextSettings::default();
+        assert!(defaults.formal_punctuation);
+        assert!(defaults.formal_mixed_spacing);
+        assert_eq!(
+            defaults.options().formal,
+            crate::processing::formal::FormalOptions::default()
+        );
+
+        let dir = std::env::temp_dir().join("omnitype-formal-groups-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[text]\nmode = \"formal\"\nformal_punctuation = false\n",
+        )
+        .unwrap();
+        let s = Settings::load_or_create(&path).expect("a [text] section loads");
+        assert_eq!(s.text.mode(), crate::processing::TextMode::Formal);
+        let groups = s.text.options().formal;
+        assert!(!groups.punctuation, "the key was written as false");
+        assert!(
+            groups.mixed_spacing,
+            "the other group keeps the shipped default"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

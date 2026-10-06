@@ -155,6 +155,7 @@ pub(crate) fn preview_effect(
     sample: &str,
     general_mode: TextMode,
     commands: bool,
+    formal: crate::processing::formal::FormalOptions,
     normalizer: &Normalizer,
     dictionary: &Dictionary,
     overrides: &Overrides,
@@ -165,6 +166,7 @@ pub(crate) fn preview_effect(
         TextRules {
             mode: general_mode,
             commands,
+            formal,
             normalizer,
             dictionary,
             corrections: &[],
@@ -172,6 +174,7 @@ pub(crate) fn preview_effect(
         TextRules {
             mode,
             commands,
+            formal,
             normalizer,
             dictionary,
             corrections: &overrides.corrections,
@@ -188,11 +191,12 @@ pub(crate) fn preview_effect(
 ///
 /// `None` first, because it is the default state of a new profile and the one
 /// a user who only wants a dictionary rule for one application leaves alone.
-const MODE_CHOICES: [(&str, Option<&str>); 4] = [
+const MODE_CHOICES: [(&str, Option<&str>); 5] = [
     ("مقدار عمومی", None),
     ("خام (بدون پردازش)", Some("raw")),
     ("محافظه‌کارانه", Some("conservative")),
     ("استاندارد", Some("standard")),
+    ("رسمی (نگارش رسمی)", Some("formal")),
 ];
 
 /// A one-line description of what a profile changes.
@@ -861,6 +865,7 @@ pub(crate) fn render(
                                         &state.preview_sample,
                                         general_mode,
                                         draft.text.commands,
+                                        draft.text.formal_options(),
                                         &state.normalizer,
                                         &dict,
                                         &edited.overrides,
@@ -1167,6 +1172,7 @@ mod tests {
             DEFAULT_SAMPLE,
             TextMode::Standard,
             false,
+            crate::processing::formal::FormalOptions::default(),
             &Normalizer::new(),
             &Dictionary::with_defaults(),
             &Overrides::default(),
@@ -1191,6 +1197,7 @@ mod tests {
             DEFAULT_SAMPLE,
             TextMode::Standard,
             false,
+            crate::processing::formal::FormalOptions::default(),
             &Normalizer::new(),
             &Dictionary::with_defaults(),
             &Overrides::default(),
@@ -1209,6 +1216,7 @@ mod tests {
             DEFAULT_SAMPLE,
             TextMode::Standard,
             false,
+            crate::processing::formal::FormalOptions::default(),
             &Normalizer::new(),
             &Dictionary::with_defaults(),
             &Overrides {
@@ -1241,6 +1249,7 @@ mod tests {
             DEFAULT_SAMPLE,
             TextMode::Standard,
             false,
+            crate::processing::formal::FormalOptions::default(),
             &Normalizer::new(),
             &dictionary,
             &Overrides {
@@ -1278,6 +1287,7 @@ mod tests {
             DEFAULT_SAMPLE,
             TextMode::Standard,
             false,
+            crate::processing::formal::FormalOptions::default(),
             &Normalizer::new(),
             &dictionary,
             &Overrides::default(),

@@ -407,6 +407,7 @@ pub(crate) fn mode_label(mode: TextMode) -> &'static str {
         TextMode::Raw => "خام",
         TextMode::Conservative => "محافظه‌کارانه",
         TextMode::Standard => "استاندارد",
+        TextMode::Formal => "رسمی",
     }
 }
 

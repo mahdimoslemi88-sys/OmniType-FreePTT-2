@@ -386,6 +386,7 @@ fn process_with_rules(
         dictionary,
         corrections: &rules.corrections,
         commands: rules.commands,
+        formal: rules.formal,
     }
     .apply(text)
 }

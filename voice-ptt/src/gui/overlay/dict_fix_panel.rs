@@ -212,6 +212,7 @@ fn compute(
         dictionary,
         corrections: own_rules,
         commands: draft.text.commands,
+        formal: draft.text.formal_options(),
     };
 
     let widened_general;
@@ -225,6 +226,7 @@ fn compute(
                 dictionary: &widened_general,
                 corrections: own_rules,
                 commands: draft.text.commands,
+                formal: draft.text.formal_options(),
             }
         }
         Some(_) => {
@@ -235,6 +237,7 @@ fn compute(
                 dictionary,
                 corrections: &widened_own,
                 commands: draft.text.commands,
+                formal: draft.text.formal_options(),
             }
         }
     };

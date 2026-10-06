@@ -119,12 +119,23 @@ seam_fuzzy = true         # tolerate ZWNJ/diacritics/one recognition slip
 # How much the pipeline may change what the recogniser said, and whether a
 # spoken phrase may be an instruction rather than words.
 [text]
-mode = "standard"         # standard | conservative | raw
+mode = "standard"         # standard | conservative | raw | formal
 commands = false          # "خط جدید" / "ویرگول" insert a break or punctuation
 # Fires only when the whole sentence IS the phrase, or after the word "دستور" —
 # a sentence that merely mentions one is typed exactly as spoken. A newline is
 # sent as the Enter key, never as a character. Independent of `mode`: raw text
 # plus commands is a supported combination.
+#
+# `formal` (also accepted: "رسمی") is `standard` plus written-register spacing.
+# It only ever inserts whitespace: one space after ، , . ؟ ? ! : ؛ ; … when a
+# letter follows (and none before it), and one where a Persian word meets a
+# Latin word or a number (ازPython → از Python, ۱۰۰درصد → ۱۰۰ درصد). No word is
+# rewritten, nothing is removed, no mark is invented, and a mark between digits
+# is left alone (نسخه 2.5 stays 2.5). Each group below can be turned off on its
+# own; both are consulted only in `mode = "formal"`, so their checkboxes appear
+# in the settings tab only while that mode is configured.
+formal_punctuation = true # space after clause marks, none before
+formal_mixed_spacing = true # space at Persian↔Latin/digit boundaries
 
 [gui]
 show_overlay = true
