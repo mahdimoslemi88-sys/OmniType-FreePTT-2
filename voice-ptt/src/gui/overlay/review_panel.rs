@@ -234,8 +234,15 @@ impl ReviewPanelState {
 ///
 /// Returns nothing; every action is sent to the loop, which is the only holder
 /// of the keyboard. This function's authority is limited to drawing a box and
-/// saying which button was pressed.
-pub fn render(ctx: &egui::Context, channel: &Arc<ReviewChannel>, state: &mut ReviewPanelState) {
+/// saying which button was pressed. `ttl` is the deadline the *loop* expires
+/// drafts with, handed in so the countdown this window draws cannot promise a
+/// different one.
+pub fn render(
+    ctx: &egui::Context,
+    channel: &Arc<ReviewChannel>,
+    state: &mut ReviewPanelState,
+    ttl: Duration,
+) {
     let snapshot = channel.snapshot();
 
     // The box follows the store. When the newest draft is not the one loaded,
@@ -275,12 +282,17 @@ pub fn render(ctx: &egui::Context, channel: &Arc<ReviewChannel>, state: &mut Rev
     }
 
     let (win_w, win_h) = (win_w(), win_h());
-    let screen = ctx.screen_rect();
-    // Bottom-centre, above the taskbar: where the transcript bubble already
-    // lives, so a review reads as "your dictation finished" rather than as an
-    // unrelated dialog.
-    let pos_x = (screen.center().x - win_w / 2.0).round();
-    let pos_y = (screen.bottom() - win_h - 48.0).round();
+    // Bottom-centre of the **screen**, above the taskbar: where the transcript
+    // bubble already lives, so a review reads as "your dictation finished"
+    // rather than as an unrelated dialog. The screen, not `ctx.screen_rect()` —
+    // that is the capsule's own rect with its origin at (0,0), and deriving
+    // position from it dropped this window off the top-left of the desktop
+    // (Q1-1).
+    let (pos_x, pos_y) = crate::gui::window_shape::position_in_screen(
+        super::screen_size_pt(ctx),
+        (win_w, win_h),
+        Some(BOTTOM_MARGIN),
+    );
 
     ctx.show_viewport_immediate(
         review_viewport_id(),
@@ -300,7 +312,7 @@ pub fn render(ctx: &egui::Context, channel: &Arc<ReviewChannel>, state: &mut Rev
                     ui.with_layout(
                         egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
                         |ui| {
-                            render_body(ui, state, &draft, channel);
+                            render_body(ui, state, &draft, channel, ttl);
                         },
                     );
                 });
@@ -326,6 +338,33 @@ fn win_h() -> f32 {
     300.0
 }
 
+/// How far above the bottom edge the window hangs, so it clears the taskbar.
+const BOTTOM_MARGIN: f32 = 48.0;
+
+/// How long the window is open before it is worth mentioning that it closes.
+const SHOW_AFTER: Duration = Duration::from_secs(5);
+
+/// What the window says about its own deadline, and only when it is worth
+/// saying.
+///
+/// The line this replaced printed `elapsed` in a sentence that reads as a
+/// deadline («پس از {secs} ثانیه بسته می‌شود») — a count-**up** claiming to be a
+/// count-down, so the number was wrong at every moment it was shown (Q1-2).
+/// This prints what is actually left, counted against the same `ttl` the loop
+/// expires drafts with, and stays quiet for the first few seconds so opening
+/// the window is not an alarm.
+fn deadline_line(elapsed: Duration, ttl: Duration) -> Option<String> {
+    if elapsed < SHOW_AFTER {
+        return None;
+    }
+    let remaining = ttl.saturating_sub(elapsed).as_secs();
+    Some(if remaining == 0 {
+        "این پنجره بدون پاسخ بسته می‌شود.".to_string()
+    } else {
+        format!("این پنجره تا {remaining} ثانیهٔ دیگر بدون پاسخ بسته می‌شود.")
+    })
+}
+
 fn title_for(draft: &PendingDraft) -> &'static str {
     match draft.kind {
         DraftKind::Review => "بازبینی متن — OmniType",
@@ -338,6 +377,7 @@ fn render_body(
     state: &mut ReviewPanelState,
     draft: &PendingDraft,
     channel: &Arc<ReviewChannel>,
+    ttl: Duration,
 ) {
     manager_header(ui, "متن آمادهٔ درج", None);
 
@@ -483,14 +523,11 @@ fn render_body(
         .color(palette::TEXT_SECONDARY),
     );
     if let Some(opened) = state.opened {
-        let secs = opened.elapsed().as_secs();
-        if secs >= 5 {
+        if let Some(line) = deadline_line(opened.elapsed(), ttl) {
             ui.label(
-                egui::RichText::new(format_persian_display(&format!(
-                    "این پنجره پس از {secs} ثانیه بی‌پاسخ بسته می‌شود."
-                )))
-                .size(10.0)
-                .color(palette::TEXT_SECONDARY),
+                egui::RichText::new(format_persian_display(&line))
+                    .size(10.0)
+                    .color(palette::TEXT_SECONDARY),
             );
         }
     }
@@ -510,7 +547,7 @@ fn answer(channel: &Arc<ReviewChannel>, command: ReviewCommand) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::review::DraftKind;
+    use crate::state::review::{DraftKind, DEFAULT_DRAFT_TTL};
     use crate::state::ReviewSnapshot;
 
     fn draft(id: u64, text: &str) -> PendingDraft {
@@ -584,6 +621,35 @@ mod tests {
         let state = ReviewPanelState::default();
         assert_eq!(state.editing_id(), None);
         assert!(state.text.is_empty());
+    }
+
+    // ── Q1-2: what the window promises about its own deadline ───────────
+
+    /// The countdown says what is **left**, counted against the same ttl the
+    /// loop expires drafts with. The line this replaced printed elapsed time
+    /// inside a sentence that reads as a deadline («پس از {secs} ثانیه…»), so
+    /// it was wrong at every moment it was shown — five seconds in, it
+    /// promised five seconds.
+    #[test]
+    fn the_countdown_says_what_is_left_not_what_has_passed() {
+        let ttl = DEFAULT_DRAFT_TTL;
+        // Quiet for the first few seconds: opening the window is not an alarm.
+        assert_eq!(deadline_line(Duration::from_secs(0), ttl), None);
+        assert_eq!(deadline_line(Duration::from_secs(4), ttl), None);
+
+        let line = deadline_line(Duration::from_secs(10), ttl).expect("worth saying");
+        assert!(line.contains("110"), "ten seconds in, 110 are left: {line}");
+
+        let line = deadline_line(Duration::from_secs(119), ttl).expect("worth saying");
+        assert!(line.contains('1'), "one second is left: {line}");
+
+        // At and past the deadline there is no number left to promise.
+        let line = deadline_line(ttl, ttl).expect("worth saying");
+        assert!(
+            !line.contains('0'),
+            "an expired window must not promise zero seconds: {line}"
+        );
+        assert!(deadline_line(ttl + Duration::from_secs(30), ttl).is_some());
     }
 
     // ── U1: stepping back through the box ────────────────────────────────
@@ -673,14 +739,14 @@ mod tests {
 
         channel.raise(draft(0, "اول"));
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
         state.text = "اول ویرایش‌شده".into();
         state.history.observe(&state.text, Instant::now());
         assert!(state.history.can_undo());
 
         // A second dictation arrives while the first is still in the box.
         channel.raise(draft(1, "دوم"));
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
         assert_eq!(state.text, "دوم");
         assert!(
             !state.history.can_undo(),
@@ -700,7 +766,7 @@ mod tests {
         channel.raise(draft(0, "سلام"));
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
         let before = channel.snapshot();
 
         state.text = "سلام ویرایش".into();
@@ -737,7 +803,7 @@ mod tests {
         channel.raise(d);
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
 
         // The user edits, then takes the edit back.
         state.text = "سلام!".into();
@@ -783,7 +849,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.with_layout(
                     egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
-                    |ui| render_body(ui, state, draft, channel),
+                    |ui| render_body(ui, state, draft, channel, DEFAULT_DRAFT_TTL),
                 );
             });
         })
@@ -851,13 +917,13 @@ mod tests {
         let mut state = ReviewPanelState::default();
 
         // Nothing pending: nothing is loaded.
-        render(&egui::Context::default(), &channel, &mut state);
+        render(&egui::Context::default(), &channel, &mut state, DEFAULT_DRAFT_TTL);
         assert_eq!(state.editing_id(), None);
 
         channel.raise(draft(0, "سلام دنیا"));
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
-            render(ctx, &channel, &mut state);
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL);
         });
         assert_eq!(state.editing_id(), Some(0), "the box takes the draft");
         assert_eq!(state.text, "سلام دنیا");
@@ -867,7 +933,7 @@ mod tests {
         channel.raise(draft(1, "دوم"));
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
-            render(ctx, &channel, &mut state);
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL);
         });
         assert_eq!(state.editing_id(), Some(1));
         assert_eq!(

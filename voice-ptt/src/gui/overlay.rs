@@ -59,7 +59,8 @@ use crate::gui::orb_idle_policy;
 use crate::gui::orb::{Orb, OrbMode};
 use crate::gui::preview_window;
 use crate::gui::window_shape::{
-    enforce_frameless_window, local_time_str, register_main_hwnd, true_screen_size_px, MAIN_HWND,
+    enforce_frameless_window, local_time_str, position_in_screen, register_main_hwnd,
+    true_screen_size_px, MAIN_HWND,
 };
 use crate::hotkey::binding::HotkeyBinding;
 use crate::hotkey::{HotkeyControl, HotkeyEvent};
@@ -118,6 +119,31 @@ impl StatusClient {
 
     pub fn get(&self) -> AppStatus {
         self.rx.borrow().clone()
+    }
+}
+
+/// The screen a secondary window is placed on, in logical points.
+///
+/// `true_screen_size_px` first: `ctx.screen_rect()` is the *capsule's own* rect
+/// with its origin at `(0,0)` — egui-winit builds it from `window.inner_size()`
+/// (`egui-winit-0.28.1/src/lib.rs:38-41`, `:239-241`) — so deriving a position
+/// from it pinned the review and consent windows to the top-left of the desktop,
+/// partly off-screen, wherever the orb was. The dashboard
+/// (`render_dashboard`) and the transcript bubble already use the true screen;
+/// found again by Q1-1 on two windows that had not been converted.
+///
+/// The `None` branch is the non-Windows build, where there is nothing else to
+/// ask and the root window's rect is all egui has.
+fn screen_size_pt(ctx: &egui::Context) -> (f32, f32) {
+    match true_screen_size_px() {
+        Some((w, h)) => {
+            let ppp = ctx.pixels_per_point().max(1.0);
+            (w as f32 / ppp, h as f32 / ppp)
+        }
+        None => {
+            let rect = ctx.screen_rect();
+            (rect.width(), rect.height())
+        }
     }
 }
 
@@ -1155,15 +1181,27 @@ impl OverlayApp {
         );
     }
 
+    /// How long a draft may wait for an answer before the review window stops
+    /// offering it — the same number the loop expires drafts with
+    /// (`coordinator.draft_ttl`), read from the same settings so the window's
+    /// countdown and the store's deadline cannot disagree.
+    fn draft_ttl(&self) -> Duration {
+        let secs = self
+            .settings
+            .read()
+            .map(|s| s.gui.draft_ttl_secs())
+            .unwrap_or(crate::state::review::DEFAULT_DRAFT_TTL.as_secs());
+        Duration::from_secs(secs)
+    }
+
     fn render_consent_window(&mut self, ctx: &egui::Context) {
         if !self.show_consent_window {
             return;
         }
 
         let (win_w, win_h) = (440.0, 260.0);
-        let screen = ctx.screen_rect();
-        let pos_x = (screen.center().x - win_w / 2.0).round();
-        let pos_y = (screen.center().y - win_h / 2.0).round();
+        // Centred on the **screen**, not on the capsule: see `screen_size_pt`.
+        let (pos_x, pos_y) = position_in_screen(screen_size_pt(ctx), (win_w, win_h), None);
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("cloud_consent_viewport"),
@@ -1434,7 +1472,11 @@ impl eframe::App for OverlayApp {
         // The review window reads the shared store rather than a flag, so it can
         // appear and disappear on the loop's schedule without the GUI having to
         // poll a boolean that could be a frame stale.
-        review_panel::render(ctx, &self.review, &mut self.review_panel);
+        // Hoisted so the shared settings are read before the panel is mutably
+        // borrowed — one frame's worth of a `RwLock` read, and it keeps the
+        // window's countdown on the same number the loop expires drafts with.
+        let ttl = self.draft_ttl();
+        review_panel::render(ctx, &self.review, &mut self.review_panel, ttl);
 
         // Repaint loop. A continuous 30 fps loop was applied unconditionally
         // here (a fresh shape/allocation pass every frame), which kept the GPU

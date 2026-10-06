@@ -334,10 +334,20 @@ pub enum ClickRegion {
 /// Converts a region to physical pixels against a window of `window_pt`.
 ///
 /// Returns `None` for any shape that would describe an empty or out-of-window
-/// region, which is the caller's signal to fall back to [`ClickRegion::Full`].
-/// `SetWindowRgn` fails on an empty region and, when it is handed a shape that
-/// degenerates at runtime (the orb scaled to nothing, the card not laid out
-/// yet), silently leaves a window nobody can see and everybody can click.
+/// region.
+///
+/// **What the caller does with that is "keep whatever region the window
+/// already has", not the `ClickRegion::Full` this note used to promise.**
+/// `apply_click_region` returns early instead (see `window_shape.rs:558`), so a
+/// window that has never had a region keeps taking clicks over its whole rect,
+/// and one that has keeps a region that may no longer match its shape. Whether
+/// clearing to `Full` would be better is an open question — clearing means the
+/// whole rect swallows desktop clicks, which is the defect the region exists
+/// to remove — so the behaviour is left alone until someone can see it happen
+/// (Q1-4, unconfirmed: no one has reached this state).
+///
+/// `SetWindowRgn` fails on an empty region, which is why an empty shape cannot
+/// simply be applied.
 #[cfg(windows)]
 pub fn click_region_px(region: ClickRegion, window_pt: [f32; 2], ppp: f32) -> Option<ClickRegion> {
     /// `NaN` and non-positive both have to be rejected: `NaN` would otherwise
@@ -939,6 +949,33 @@ pub fn true_screen_size_px() -> Option<(i32, i32)> {
     None
 }
 
+/// A secondary window's top-left corner, in logical screen points.
+///
+/// Centred horizontally; vertically either centred or hung `bottom_margin`
+/// above the bottom edge. Never negative: a screen smaller than the window
+/// pins it to the corner rather than throwing it off the desktop.
+///
+/// **The screen, not `ctx.screen_rect()`.** That rect is the calling window's
+/// own, with its origin at `(0,0)` — `egui-winit-0.28.1/src/lib.rs:38-41` and
+/// `:239-241` set it from `window.inner_size()` — and the calling window here
+/// is the small capsule. Deriving a position from it put the review and the
+/// consent windows at the top-left of the desktop, partly off-screen, wherever
+/// the orb happened to be. The dashboard and the transcript bubble were already
+/// fixed with `true_screen_size_px()`; this is that answer, in one place, for
+/// every window that needs it (found by Q1-1).
+pub fn position_in_screen(
+    screen_pt: (f32, f32),
+    win_pt: (f32, f32),
+    bottom_margin: Option<f32>,
+) -> (f32, f32) {
+    let x = ((screen_pt.0 - win_pt.0) / 2.0).round().max(0.0);
+    let y = match bottom_margin {
+        Some(margin) => (screen_pt.1 - win_pt.1 - margin).round().max(0.0),
+        None => ((screen_pt.1 - win_pt.1) / 2.0).round().max(0.0),
+    };
+    (x, y)
+}
+
 // ── monitor enumeration ─────────────────────────────────────────────────────
 // One query, three shapes, so the idle policy never has to know about HMONITOR.
 //
@@ -1395,11 +1432,43 @@ const PREVIEW_RESHAPE_INTERVAL: u32 = 15;
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        click_region_px, expected_region_box, invalidate_click_region, region_is_current,
-        transparency_mode_from, ClickRegion, TransparencyMode,
+        click_region_px, expected_region_box, invalidate_click_region, position_in_screen,
+        region_is_current, transparency_mode_from, ClickRegion, TransparencyMode,
     };
     use super::super::orb::{self, Orb};
     use super::super::orb_animation::OrbMode;
+
+    /// Q1-1, pinned as arithmetic: every window this places has to end up
+    /// **inside** the screen it was given, for both anchors and for screens
+    /// far larger than the window. The defect this replaces produced negative
+    /// coordinates — a window whose top-left is off the desktop is a window
+    /// the user never sees.
+    #[test]
+    fn a_placed_window_stays_inside_the_screen_it_was_given() {
+        for screen in [(1920.0, 1080.0), (1280.0, 720.0), (2560.0, 1440.0), (3840.0, 2160.0)] {
+            for win in [(460.0, 300.0), (440.0, 260.0), (720.0, 640.0)] {
+                for bottom in [Some(48.0), None] {
+                    let (x, y) = position_in_screen(screen, win, bottom);
+                    assert!(x >= 0.0 && x + win.0 <= screen.0, "{screen:?} {win:?} {bottom:?} → x={x}");
+                    assert!(y >= 0.0 && y + win.1 <= screen.1, "{screen:?} {win:?} {bottom:?} → y={y}");
+                    if bottom.is_some() {
+                        assert!(
+                            (screen.1 - (y + win.1) - 48.0).abs() < 1.0,
+                            "the bottom-anchored window keeps its margin"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A screen smaller than the window pins it to the corner instead of
+    /// sending it to negative coordinates.
+    #[test]
+    fn a_screen_smaller_than_the_window_does_not_go_negative() {
+        assert_eq!(position_in_screen((300.0, 200.0), (460.0, 300.0), None), (0.0, 0.0));
+        assert_eq!(position_in_screen((300.0, 200.0), (460.0, 300.0), Some(48.0)), (0.0, 0.0));
+    }
 
     /// The transparency default is the one thing here a user can only verify by
     /// looking at the screen, so pin the mapping: an unset/unknown env var must

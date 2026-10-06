@@ -140,9 +140,24 @@ pub fn validate_target(id: &TargetIdentity) -> TargetValidity;
 
 ## ۳. درج
 
-**وضعیت: دو حالت.** `EmitOutcome` الان سه حالت دارد
-([machine.rs:82](../../voice-ptt/src/state/machine.rs#L82)) و `flush` می‌تواند وسط کار خطا
-بدهد ([injector.rs:128](../../voice-ptt/src/output/injector.rs#L128)).
+**وضعیت: موجود، و این بند در ۲۰۲۶-۱۰-۰۶ اصلاح شد چون خلافِ واقع گفته بود (Q1-3).**
+پیش‌تر می‌گفت «`EmitOutcome` الان سه حالت دارد ([machine.rs:82](../../voice-ptt/src/state/machine.rs#L82))»
+— نه `EmitOutcome` در کد هست و نه سطرِ 82 دیگر چیزی از این‌ها دارد (اکنون `MachinePort` است).
+شکلِ اجراشده امروز:
+
+* [`state/utterance.rs`](../../voice-ptt/src/state/utterance.rs) — `InjectOutcome` با چهار
+  حالت: `Complete { accepted_pairs }`، `Partial { accepted_pairs }`، `Failed`،
+  `NotAttempted`. شمارش‌ها **جفتِ رویداد**‌اند نه نویسهٔ اثبات‌شده در سند، و همین هم در لاگ
+  آمده است.
+* [`output/target.rs`](../../voice-ptt/src/output/target.rs) — `TargetValidity::{Valid,
+  Changed, Unknown}` که علتِ «تلاش نشد» را تأمین می‌کند؛ هماهنگ‌کننده آن را لاگ می‌کند و به
+  کاربر همان دو جمله را می‌گوید («focus moved» / «destination unknown»).
+* [`state/coordinator.rs`](../../voice-ptt/src/state/coordinator.rs) — `KeptRecord` و
+  `recover_from` که متنِ نرسیده را برای اقدامِ کاربر نگه می‌دارد.
+
+طرحِ زیر **پیشنهاد است، نه گزارشِ پیشرفت** (قاعدهٔ ۲ِ بند ۱۲): `InjectRequest`،
+`NotAttemptedReason` و علتِ نوع‌دار هنوز ساخته نشده‌اند. مادامی که ساخته نشده‌اند،
+شکلِ بالا قراردادِ اجراشده است.
 
 ```rust
 pub struct InjectRequest {
@@ -624,3 +639,50 @@ pub enum RecoveryOutcome { RetrySucceeded, RetryFailed, Discarded, Expired, NotA
 **امضا:** این بند با ۷ تست تازه ادغام شد (همه در `review_panel.rs`، کنار ۸ تستِ پیشینِ همان
 پنل) — ۲۰۲۶-۱۰-۰۶؛ `cargo test --all-targets` = **۸۲۶ پاس / ۰ شکست / ۱۱ نادیده** و
 `clippy --all-targets -D warnings` صفر. اجرای زندهٔ پنجره انجام نشده (قفل تک‌نسخه).
+
+---
+
+## ۱۴. ادغام نهایی (I5) — تاریخ: ۲۰۲۶-۱۰-۰۶
+
+یافته‌های [Q1](Q1-review.md) که در این ادغام رفع یا تعیین تکلیف شدند، و قاعده‌هایی که از
+آن‌ها بیرون آمد.
+
+### تصمیم‌های قطعی
+
+1. **پنجرهٔ فرعی از روی نمایشگر موقعیت می‌گیرد، نه از روی خودش.**
+   `window_shape::position_in_screen(screen, win, bottom_margin)` تنها راهِ گذاشتنِ یک
+   پنجرهٔ فرعی است؛ صفحه را هم `true_screen_size_px()` می‌دهد (`overlay::screen_size_pt`).
+   دلیلِ قاعده: `ctx.screen_rect()` مستطیلِ **همان پنجره** است با مبدأ `(0,0)`
+   (`egui-winit-0.28.1` آن را از `window.inner_size()` می‌سازد) و پنجرهٔ ریشهٔ این برنامه
+   کپسول است — گرفتنِ موقعیت از آن، پنجرهٔ بازبینی و پنجرهٔ اجازهٔ ابر را از گوشهٔ
+   بالا-چپِ دسکتاپ بیرون می‌زد (Q1-1). داشبورد و کارتِ رونوشت قبلاً همین را کرده بودند؛
+   این بند آن را از استثنا به قاعده تبدیل می‌کند. تستِ `a_placed_window_stays_inside_the_screen_it_was_given`
+   همین را قفل می‌کند. محدودیتِ ثبت‌شده: `SM_CXSCREEN` فقط نمایشگر اول را می‌شناسد، پس
+   چند-نمایشگره هنوز اندازه‌گیری نشده.
+2. **شمارندهٔ پنجرهٔ بازبینی، باقی‌مانده را می‌گوید و با همان عددی شمرده می‌شود که
+   حلقه پیش‌نویس‌ها را با آن منقضی می‌کند.** `gui.draft_ttl_secs` یک منبع دارد، از همان‌جا
+   هم خوانده می‌شود؛ متنِ قدیمی زمانِ **سپری‌شده** را در جمله‌ای که مهلت می‌خواند می‌گذاشت و
+   در هر لحظه اشتباه بود (Q1-2). تستِ `the_countdown_says_what_is_left_not_what_has_passed`.
+3. **بند ۳ اصلاح شد، نه بازنویسی.** سطرِ وضعیتِ آن به `InjectOutcome` + `TargetValidity`
+   درست شد و سطرِ طرح (`InjectRequest`/`NotAttemptedReason`) برچسبِ «پیشنهاد» گرفت —
+   این همان «هر تغییرِ قرارداد = یک بندِ تازه با تاریخ» است که خودِ این بند ادا می‌کند
+   (Q1-3).
+4. **رفتارِ fallback در ناحیهٔ کلیک عوض نشد؛ فقط مستند به کد نزدیک شد.** `click_region_px`
+   که `None` برمی‌گرداند `apply_click_region` زودتر برمی‌گردد و ناحیهٔ قبلی می‌ماند، نه
+   `Full`. هیچ‌کس این حالت را در عمل ندیده و هیچ‌کدام از دو گزینه آشکارا درست نیست
+   (سقوط به `Full` یعنی کلِ مستطیل کلیکِ دسکتاپ را می‌گیرد) — پس تا آزمونِ زنده، نه رفتار
+   عوض می‌شود نه ادعا (Q1-4، تأییدنشده).
+5. **یک تستِ سرگردان ثبت شد، نه تضعیف.** `a_secret_survives_a_real_round_trip_and_can_be_deleted`
+   دو بار در اجرای کامل و یک‌بار شکست (پیام: `NotFound` هنگامِ حذف، درست پس از یک
+   `load` موفق) و در ۱۵ اجرای تنها و ۸ اجرای کاملِ دیگر سبز بود. علت شناسایی نشد؛ نه
+   sleep اضافه شد نه assert باز. اگر دوباره دیده شد، باید کدِ Win32 را با خودِ شکست بیاورد.
+
+### مصرف‌کنندگان
+
+`window_shape` (می‌سازد) → `overlay` و `review_panel`؛ `config/settings` (یک مقدارِ deadline) →
+`review_panel`. هیچ سیمِ تازه‌ای بین پنل و حلقه ساخته نشد.
+
+**امضا:** این بند با ۳ تست تازه ادغام شد (۲ در `window_shape`، ۱ در `review_panel`) —
+۲۰۲۶-۱۰-۰۶؛ `cargo test --all-targets` = **۸۲۹ پاس / ۰ شکست / ۱۱ نادیده** و
+`clippy --all-targets -D warnings` صفر. **اجرای زنده همچنان انجام نشده** و تأییدِ نهاییِ
+محصول طبق [برنامه](../AGENT-EXECUTION-PLAN.md) پس از بازبینیِ تغییراتِ تازه است.
