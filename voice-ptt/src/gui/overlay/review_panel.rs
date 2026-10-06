@@ -20,7 +20,7 @@
 //!   double-click is a stale answer rather than a second insert.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -31,6 +31,174 @@ use super::theme::{
 };
 use crate::state::review::{DraftKind, PendingDraft, ReviewCommand};
 use crate::state::ReviewChannel;
+
+/// What put this version of the text in the box.
+///
+/// The history is of versions **and** of the user's actions: a line of text
+/// with no account of how it got there cannot answer "what did I just undo?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// The box was built from a draft (or rebuilt for a newer one).
+    Loaded,
+    /// The user typed it.
+    Edited,
+    /// Restored by undo.
+    Undone,
+    /// Restored by redo.
+    Redone,
+}
+
+/// One version of the box: the text, and the action that put it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    pub text: String,
+    pub action: Action,
+}
+
+/// The box's way back: where the text came from, where it is, and where an
+/// undo or a redo could take it.
+///
+/// Lives in the panel rather than in the store on purpose — U1's rule:
+/// the draft in [`crate::state::review::DraftStore`] is immutable, so undoing
+/// is a change to *this box only*. It never crosses
+/// [`crate::state::ReviewChannel`], never resolves a draft, and never reaches
+/// a session: the three things it must not destroy are the way back, the
+/// session, and a newer dictation's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditHistory {
+    /// Versions older than the current one, newest last.
+    past: Vec<Version>,
+    /// What the box holds now.
+    current: Version,
+    /// Versions undo took the box away from, for redo.
+    future: Vec<Version>,
+    /// When the text last changed, so a typing run can be one undo step.
+    last_change: Option<Instant>,
+}
+
+impl Default for EditHistory {
+    fn default() -> Self {
+        Self {
+            past: Vec::new(),
+            current: Version {
+                text: String::new(),
+                action: Action::Loaded,
+            },
+            future: Vec::new(),
+            last_change: None,
+        }
+    }
+}
+
+impl EditHistory {
+    /// Two changes closer together than this are one typing run, and undo
+    /// takes back the run rather than one letter of it.
+    const BURST: Duration = Duration::from_millis(1200);
+
+    /// How many versions are kept before the oldest is dropped. A bound, so a
+    /// long editing session cannot grow the window without limit; the dropped
+    /// end is the oldest text, which the draft in the store still holds.
+    const CAP: usize = 100;
+
+    /// Starts the history at the text a draft put in the box.
+    pub fn loaded(text: &str) -> Self {
+        Self {
+            current: Version {
+                text: text.to_string(),
+                action: Action::Loaded,
+            },
+            ..Self::default()
+        }
+    }
+
+    /// The text the box should show.
+    pub fn text(&self) -> &str {
+        &self.current.text
+    }
+
+    /// The action that produced the version on screen — what a hover on the
+    /// undo button can honestly claim the next click will do.
+    pub fn action(&self) -> Action {
+        self.current.action
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.past.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.future.is_empty()
+    }
+
+    /// Takes whatever the box now holds as a version.
+    ///
+    /// A change inside a run replaces the running version: a pause is what
+    /// ends a version, not every keystroke, or undo would walk backwards one
+    /// letter at a time. A change after a quiet period closes the previous
+    /// version and opens a new one — and drops what redo had left, because a
+    /// linear history is the one a user can predict.
+    pub fn observe(&mut self, live: &str, now: Instant) {
+        if live == self.current.text {
+            return;
+        }
+        let in_run = self
+            .last_change
+            .is_some_and(|at| now.saturating_duration_since(at) < Self::BURST);
+        if in_run {
+            self.current.text = live.to_string();
+            self.current.action = Action::Edited;
+        } else {
+            let left = std::mem::replace(
+                &mut self.current,
+                Version {
+                    text: live.to_string(),
+                    action: Action::Edited,
+                },
+            );
+            self.past.push(left);
+            if self.past.len() > Self::CAP {
+                self.past.remove(0);
+            }
+            self.future.clear();
+        }
+        self.last_change = Some(now);
+    }
+
+    /// One step back. False means there is nowhere to go, and the box is
+    /// left exactly as it was.
+    pub fn undo(&mut self) -> bool {
+        let Some(previous) = self.past.pop() else {
+            return false;
+        };
+        let left = std::mem::replace(
+            &mut self.current,
+            Version {
+                text: previous.text,
+                action: Action::Undone,
+            },
+        );
+        self.future.push(left);
+        self.last_change = None;
+        true
+    }
+
+    /// One step forward again. False means redo has nothing left.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.future.pop() else {
+            return false;
+        };
+        let left = std::mem::replace(
+            &mut self.current,
+            Version {
+                text: next.text,
+                action: Action::Redone,
+            },
+        );
+        self.past.push(left);
+        self.last_change = None;
+        true
+    }
+}
 
 /// The window's own state: the editable text and which draft it belongs to.
 ///
@@ -43,6 +211,8 @@ pub struct ReviewPanelState {
     editing: Option<u64>,
     /// The editable text.
     text: String,
+    /// How the text got here and how to step back through it.
+    history: EditHistory,
     /// The snapshot revision the box was built from.
     ///
     /// A plain "not equal" check would also fire when a draft was resolved and
@@ -80,6 +250,10 @@ pub fn render(ctx: &egui::Context, channel: &Arc<ReviewChannel>, state: &mut Rev
     if needs_reload {
         state.editing = latest.as_ref().map(|d| d.id);
         state.text = latest.as_ref().map(|d| d.text.clone()).unwrap_or_default();
+        // A new draft starts a new history. Without this, undo would be able
+        // to bring back a *previous* dictation's text over the one the user is
+        // looking at — the "do not destroy new text" rule, as a reset.
+        state.history = EditHistory::loaded(&state.text);
         state.built_from = snapshot.revision;
         state.opened = latest.as_ref().map(|_| Instant::now());
     }
@@ -89,6 +263,7 @@ pub fn render(ctx: &egui::Context, channel: &Arc<ReviewChannel>, state: &mut Rev
         // box it would be a dialog the user has to dismiss to get back to work.
         state.editing = None;
         state.text.clear();
+        state.history = EditHistory::default();
         state.opened = None;
         return;
     };
@@ -96,6 +271,7 @@ pub fn render(ctx: &egui::Context, channel: &Arc<ReviewChannel>, state: &mut Rev
         // The store moved on under a box we could not reload (only reachable
         // while the loop is answering another draft). Draw the store's text.
         state.text = draft.text.clone();
+        state.history = EditHistory::loaded(&state.text);
     }
 
     let (win_w, win_h) = (win_w(), win_h());
@@ -215,6 +391,46 @@ fn render_body(
                 .desired_rows(5)
                 .hint_text("متن خالی است"),
         );
+    });
+
+    // Whatever the user did to the box in this frame becomes a version —
+    // after the widget, so it is the edited text that is observed.
+    state.history.observe(&state.text, Instant::now());
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        // What is on screen now, in the words of the history itself: the
+        // button says what the *next* click does, and this says what it does
+        // it to.
+        let now_showing = match state.history.action() {
+            Action::Loaded => "the text as the dictation produced it",
+            Action::Edited => "edited by you",
+            Action::Undone => "restored by بازگردانی",
+            Action::Redone => "restored by بازانجام",
+        };
+        let undoing = ui
+            .add_enabled(
+                state.history.can_undo(),
+                egui::Button::new(format_persian_display("بازگردانی")),
+            )
+            .on_hover_text(format!(
+                "step the text back to the version before your last change.\n\
+                 On screen now: {now_showing}.\n\
+                 It only edits this box — nothing is typed, no draft is answered,\n\
+                 and a newer dictation's text is never touched."
+            ));
+        if undoing.clicked() && state.history.undo() {
+            state.text = state.history.text().to_string();
+        }
+        let redoing = ui
+            .add_enabled(
+                state.history.can_redo(),
+                egui::Button::new(format_persian_display("بازانجام")),
+            )
+            .on_hover_text("put back what بازگردانی just took away.");
+        if redoing.clicked() && state.history.redo() {
+            state.text = state.history.text().to_string();
+        }
     });
 
     ui.add_space(10.0);
@@ -341,6 +557,7 @@ mod tests {
         let state = ReviewPanelState {
             editing: Some(7),
             text: "متن".into(),
+            history: EditHistory::loaded("متن"),
             built_from: 3,
             opened: None,
         };
@@ -367,6 +584,180 @@ mod tests {
         let state = ReviewPanelState::default();
         assert_eq!(state.editing_id(), None);
         assert!(state.text.is_empty());
+    }
+
+    // ── U1: stepping back through the box ────────────────────────────────
+
+    /// A typing run is one undo step, or undo would walk back one letter at
+    /// a time — history is of versions and of what the user *did*, not of
+    /// keystrokes.
+    #[test]
+    fn undo_takes_back_a_whole_typing_run_not_one_letter() {
+        let t0 = Instant::now();
+        let mut h = EditHistory::loaded("سلام");
+        assert_eq!(h.action(), Action::Loaded);
+
+        h.observe("سلا", t0 + Duration::from_millis(120));
+        h.observe("سلام د", t0 + Duration::from_millis(400));
+        h.observe("سلام دنیا", t0 + Duration::from_millis(900));
+        assert_eq!(h.action(), Action::Edited);
+
+        assert!(h.can_undo());
+        assert!(h.undo(), "the run is one step back");
+        assert_eq!(h.text(), "سلام");
+        assert_eq!(h.action(), Action::Undone);
+        assert!(
+            !h.can_undo(),
+            "the text the draft put in the box is the end of the way back"
+        );
+        assert!(h.can_redo());
+        assert!(h.redo());
+        assert_eq!(h.text(), "سلام دنیا", "redo puts the whole run back");
+        assert_eq!(h.action(), Action::Redone);
+    }
+
+    /// A pause is what ends a version: two runs apart in time are two steps.
+    #[test]
+    fn a_pause_starts_a_new_version() {
+        let t0 = Instant::now();
+        let mut h = EditHistory::loaded("");
+        h.observe("یک", t0);
+        h.observe("یک دو", t0 + EditHistory::BURST * 3);
+
+        assert!(h.undo());
+        assert_eq!(h.text(), "یک", "the second run is its own version");
+        assert!(h.undo());
+        assert_eq!(h.text(), "");
+        assert!(!h.undo(), "and that is all of it");
+    }
+
+    /// Undo and redo are inert rather than surprising when there is nothing
+    /// to do — the box must not move under the user.
+    #[test]
+    fn stepping_with_nowhere_to_go_changes_nothing() {
+        let mut h = EditHistory::loaded("سلام");
+        assert!(!h.undo());
+        assert!(!h.redo());
+        assert_eq!(h.text(), "سلام");
+
+        h.observe("سلام دنیا", Instant::now());
+        assert!(h.undo());
+        assert!(h.redo());
+        assert!(!h.redo(), "redo ends at the newest version");
+        assert_eq!(h.text(), "سلام دنیا");
+    }
+
+    /// Typing again after an undo drops redo: a linear history is the one a
+    /// user can predict, and the alternative silently branches.
+    #[test]
+    fn editing_after_an_undo_drops_redo_instead_of_branching() {
+        let t0 = Instant::now();
+        let mut h = EditHistory::loaded("");
+        h.observe("اول", t0);
+        assert!(h.undo());
+        assert!(h.can_redo());
+
+        h.observe("دوم", t0 + EditHistory::BURST * 3);
+        assert!(!h.can_redo(), "what redo held was replaced on purpose");
+        assert!(h.undo());
+        assert_eq!(h.text(), "");
+    }
+
+    /// The history belongs to one draft. A newer dictation replaces the box
+    /// *and* its history, so undo can never bring an older dictation's text
+    /// back over the newer one.
+    #[test]
+    fn history_does_not_cross_drafts() {
+        let channel = ReviewChannel::new();
+        let mut state = ReviewPanelState::default();
+
+        channel.raise(draft(0, "اول"));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+        state.text = "اول ویرایش‌شده".into();
+        state.history.observe(&state.text, Instant::now());
+        assert!(state.history.can_undo());
+
+        // A second dictation arrives while the first is still in the box.
+        channel.raise(draft(1, "دوم"));
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+        assert_eq!(state.text, "دوم");
+        assert!(
+            !state.history.can_undo(),
+            "the new draft starts with no way back to the old one's text"
+        );
+        assert!(!state.history.undo());
+        assert_eq!(state.text, "دوم");
+    }
+
+    /// Undo is a change to the box, and only to the box: it sends no answer,
+    /// resolves no draft, and bumps no revision — the store and the session
+    /// behind it are untouched.
+    #[test]
+    fn undo_answers_nothing_and_touches_no_session() {
+        let channel = ReviewChannel::new();
+        let mut state = ReviewPanelState::default();
+        channel.raise(draft(0, "سلام"));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+        let before = channel.snapshot();
+
+        state.text = "سلام ویرایش".into();
+        state.history.observe(&state.text, Instant::now());
+        assert!(state.history.undo());
+        state.text = state.history.text().to_string();
+        assert_eq!(state.text, "سلام");
+
+        let after = channel.snapshot();
+        assert_eq!(after.revision, before.revision, "undo is not an answer");
+        assert_eq!(
+            after.drafts.len(),
+            before.drafts.len(),
+            "undo resolves nothing"
+        );
+        assert_eq!(after.drafts[0].text, "سلام", "the draft keeps its original");
+    }
+
+    /// What undo restores is what «درج» types, and the destination the draft
+    /// was raised with still carries it — undoing must leave the window able
+    /// to do its job, not strand it.
+    #[test]
+    fn undo_then_insert_types_the_restored_text_into_the_original_destination() {
+        let channel = ReviewChannel::new();
+        let mut state = ReviewPanelState::default();
+        let destination = crate::output::target::TargetIdentity {
+            hwnd: 5,
+            pid: 9,
+            exe_path: None,
+            title_at_capture: "سند".into(),
+        };
+        let mut d = draft(0, "سلام");
+        d.destination = Some(destination.clone());
+        channel.raise(d);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state));
+
+        // The user edits, then takes the edit back.
+        state.text = "سلام!".into();
+        state.history.observe(&state.text, Instant::now());
+        assert!(state.history.undo());
+        state.text = state.history.text().to_string();
+        assert_eq!(state.text, "سلام");
+
+        let outcome = channel.resolve(ReviewCommand::Insert {
+            id: state.editing_id().expect("a draft is loaded"),
+            text: state.text.clone(),
+        });
+        assert_eq!(
+            outcome,
+            crate::state::review::ReviewOutcome::Insert {
+                text: "سلام".into(),
+                destination: Some(destination),
+            },
+            "the restored text, into the window it was dictated to"
+        );
     }
 
     /// The window body is the one part of this package no loop scenario
