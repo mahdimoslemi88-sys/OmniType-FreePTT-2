@@ -100,12 +100,20 @@ pub struct TextSettings {
     /// to the historical behaviour instead of failing to load the whole file:
     /// see [`TextSettings::mode`].
     pub mode: String,
+    /// Recognise spoken commands ("خط جدید", "ویرگول", …).
+    ///
+    /// **Off by default**, and deliberately not part of the mode: an app whose
+    /// job is writing into somebody else's document must not turn a spoken
+    /// sentence into a line break until the user has asked it to. See
+    /// [`crate::processing::commands`] for the two shapes a command may take.
+    pub commands: bool,
 }
 
 impl Default for TextSettings {
     fn default() -> Self {
         Self {
             mode: "standard".into(),
+            commands: false,
         }
     }
 }
@@ -124,7 +132,7 @@ impl TextSettings {
 
     /// The pipeline options this section describes.
     pub fn options(&self) -> crate::processing::ProcessingOptions {
-        crate::processing::ProcessingOptions::new(self.mode())
+        crate::processing::ProcessingOptions::new(self.mode()).with_commands(self.commands)
     }
 }
 

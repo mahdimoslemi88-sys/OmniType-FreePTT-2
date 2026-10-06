@@ -154,6 +154,7 @@ impl EffectPreview {
 pub(crate) fn preview_effect(
     sample: &str,
     general_mode: TextMode,
+    commands: bool,
     normalizer: &Normalizer,
     dictionary: &Dictionary,
     overrides: &Overrides,
@@ -163,12 +164,14 @@ pub(crate) fn preview_effect(
         sample,
         TextRules {
             mode: general_mode,
+            commands,
             normalizer,
             dictionary,
             corrections: &[],
         },
         TextRules {
             mode,
+            commands,
             normalizer,
             dictionary,
             corrections: &overrides.corrections,
@@ -857,6 +860,7 @@ pub(crate) fn render(
                                     Ok(dict) => preview_effect(
                                         &state.preview_sample,
                                         general_mode,
+                                        draft.text.commands,
                                         &state.normalizer,
                                         &dict,
                                         &edited.overrides,
@@ -1162,6 +1166,7 @@ mod tests {
         let effect = preview_effect(
             DEFAULT_SAMPLE,
             TextMode::Standard,
+            false,
             &Normalizer::new(),
             &Dictionary::with_defaults(),
             &Overrides::default(),
@@ -1185,6 +1190,7 @@ mod tests {
         let effect = preview_effect(
             DEFAULT_SAMPLE,
             TextMode::Standard,
+            false,
             &Normalizer::new(),
             &Dictionary::with_defaults(),
             &Overrides::default(),
@@ -1202,6 +1208,7 @@ mod tests {
         let effect = preview_effect(
             DEFAULT_SAMPLE,
             TextMode::Standard,
+            false,
             &Normalizer::new(),
             &Dictionary::with_defaults(),
             &Overrides {
@@ -1233,6 +1240,7 @@ mod tests {
         let effect = preview_effect(
             DEFAULT_SAMPLE,
             TextMode::Standard,
+            false,
             &Normalizer::new(),
             &dictionary,
             &Overrides {
@@ -1269,6 +1277,7 @@ mod tests {
         let effect = preview_effect(
             DEFAULT_SAMPLE,
             TextMode::Standard,
+            false,
             &Normalizer::new(),
             &dictionary,
             &Overrides::default(),

@@ -116,6 +116,16 @@ seam_backspace = true     # also delete a word fragment the cut left behind
 seam_max_words = 6        # at most this many repeated head words per chunk
 seam_fuzzy = true         # tolerate ZWNJ/diacritics/one recognition slip
 
+# How much the pipeline may change what the recogniser said, and whether a
+# spoken phrase may be an instruction rather than words.
+[text]
+mode = "standard"         # standard | conservative | raw
+commands = false          # "خط جدید" / "ویرگول" insert a break or punctuation
+# Fires only when the whole sentence IS the phrase, or after the word "دستور" —
+# a sentence that merely mentions one is typed exactly as spoken. A newline is
+# sent as the Enter key, never as a character. Independent of `mode`: raw text
+# plus commands is a supported combination.
+
 [gui]
 show_overlay = true
 theme = "dark"

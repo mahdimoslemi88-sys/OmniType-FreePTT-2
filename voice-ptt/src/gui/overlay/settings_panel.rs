@@ -453,6 +453,19 @@ pub(crate) fn render(
                             .on_hover_text(
                                 "show the finished text before it is typed, so it can be edited, inserted, copied or dropped.\nOff by default: direct typing is what makes a dictation feel like talking.\nThis does not affect recovery — text whose insert failed is always offered.",
                             );
+                            ui.add_space(4.0);
+                            // Off by default, and the tooltip says both what
+                            // makes it fire and what deliberately does not:
+                            // a feature that turns a spoken sentence into a
+                            // line break has to be asked for, and it has to be
+                            // obvious why mentioning the phrase did nothing.
+                            ui.checkbox(
+                                &mut state.draft.text.commands,
+                                format_persian_display("فرمان‌های گفتاری"),
+                            )
+                            .on_hover_text(
+                                "say \"خط جدید\" or \"ویرگول\" to insert a line break or punctuation.\nIt fires when the whole sentence is the phrase, or after the word \"دستور\" —\na sentence that merely mentions one is typed exactly as spoken.\nOff by default: a spoken sentence must not become a line break until you ask.",
+                            );
                         });
 
                         ui.add_space(8.0);

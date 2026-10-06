@@ -211,6 +211,7 @@ fn compute(
         normalizer: &state.normalizer,
         dictionary,
         corrections: own_rules,
+        commands: draft.text.commands,
     };
 
     let widened_general;
@@ -223,6 +224,7 @@ fn compute(
                 normalizer: &state.normalizer,
                 dictionary: &widened_general,
                 corrections: own_rules,
+                commands: draft.text.commands,
             }
         }
         Some(_) => {
@@ -232,6 +234,7 @@ fn compute(
                 normalizer: &state.normalizer,
                 dictionary,
                 corrections: &widened_own,
+                commands: draft.text.commands,
             }
         }
     };

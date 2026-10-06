@@ -148,8 +148,15 @@ where
     let mut sent_any = false;
 
     for (index, unit) in units.iter().enumerate() {
-        group.push(make_unicode_input(*unit, false));
-        group.push(make_unicode_input(*unit, true));
+        if *unit == b'\n' as u16 {
+            // Same rule as the burst path, at the same place in the batch: a
+            // newline is Enter, and it costs the two events the unit was
+            // already counted for.
+            group.extend(enter_inputs());
+        } else {
+            group.push(make_unicode_input(*unit, false));
+            group.push(make_unicode_input(*unit, true));
+        }
 
         // The step closes on a **unit** boundary, so a surrogate pair is never
         // split across two sends.
@@ -191,6 +198,25 @@ pub fn inject_text_with<F: FnMut(&[INPUT]) -> usize>(text: &str, mut sender: F) 
     let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
 
     for unit in text.encode_utf16() {
+        // A newline is a keystroke, not a character: `KEYEVENTF_UNICODE` for
+        // U+000A types a control code that most applications swallow, so the
+        // caret never moves and the line break a speech command asked for
+        // silently does nothing. Enter is what a newline means everywhere.
+        if unit == b'\n' as u16 {
+            if !inputs.is_empty() {
+                flush_with(&mut inputs, &mut report, &mut sender);
+                if report.stopped.is_some() {
+                    return report;
+                }
+            }
+            inputs.extend(enter_inputs());
+            flush_with(&mut inputs, &mut report, &mut sender);
+            if report.stopped.is_some() {
+                return report;
+            }
+            continue;
+        }
+
         // Down
         inputs.push(make_unicode_input(unit, false));
         // Up
@@ -262,21 +288,33 @@ pub fn inject_backspaces_with<F: FnMut(&[INPUT]) -> usize>(
     report
 }
 
-/// Injects a plain `\n` as the Enter key (keystroke, not a Unicode char).
-pub fn press_enter() -> Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+/// The two `INPUT` records for one Enter press.
+///
+/// Two events, exactly like one UTF-16 unit of text — which is what keeps
+/// [`Injection::total_events`], computed from the text's units before anything
+/// is sent, equal to what a newline actually costs.
+fn enter_inputs() -> [INPUT; 2] {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_RETURN,
+    };
     let down = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: VK_RETURN,
-                dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+                dwFlags: KEYBD_EVENT_FLAGS(0),
                 ..Default::default()
             },
         },
     };
     let mut up = down;
     up.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+    [down, up]
+}
+
+/// Injects a plain `\n` as the Enter key (keystroke, not a Unicode char).
+pub fn press_enter() -> Result<()> {
+    let [down, up] = enter_inputs();
 
     unsafe {
         let sent = SendInput(&[down, up], std::mem::size_of::<INPUT>() as i32);
@@ -684,5 +722,89 @@ mod tests {
         assert_eq!(bs_report.attempted, 0);
         assert_eq!(bs_report.accepted, 0);
         assert!(bs_report.whole_pairs());
+    }
+
+    // ── newlines (C1) ─────────────────────────────────────────────────
+
+    /// Sends `text` and records `(virtual key, scan code, key-up)` for every
+    /// event the sender was handed.
+    fn send_and_record(text: &str, seen: &mut Vec<(u16, u16, bool)>) -> Injection {
+        inject_text_with(text, |batch: &[INPUT]| {
+            for input in batch {
+                let ki = unsafe { input.Anonymous.ki };
+                let up = ki.dwFlags.contains(KEYEVENTF_KEYUP);
+                seen.push((ki.wVk.0, ki.wScan, up));
+            }
+            batch.len()
+        })
+    }
+
+    /// A newline must leave the caret on the next line. Typing U+000A as a
+    /// Unicode character does not do that in most applications, so the send
+    /// has to be the Enter *key* — and it must land between the two halves of
+    /// the text, not at either end.
+    #[test]
+    fn a_newline_is_typed_as_enter_between_the_two_halves() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+
+        let mut events = Vec::new();
+        let report = send_and_record("a\nb", &mut events);
+        assert_eq!(
+            events,
+            vec![
+                (0, 'a' as u16, false),
+                (0, 'a' as u16, true),
+                (VK_RETURN.0, 0, false),
+                (VK_RETURN.0, 0, true),
+                (0, 'b' as u16, false),
+                (0, 'b' as u16, true),
+            ],
+            "the newline must be an Enter press, in the middle"
+        );
+        // Enter costs exactly the two events the unit was counted for, so the
+        // report still describes the whole text honestly.
+        assert_eq!(report.total_events, 6);
+        assert_eq!(report.accepted, 6);
+        assert!(report.whole_pairs(), "{:?}", report.stopped);
+    }
+
+    #[test]
+    fn a_leading_and_trailing_newline_each_send_one_enter() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+
+        let mut events = Vec::new();
+        let report = send_and_record("\na\n", &mut events);
+        let enters = events
+            .iter()
+            .filter(|&&(vk, scan, up)| vk == VK_RETURN.0 && scan == 0 && !up)
+            .count();
+        assert_eq!(enters, 2, "one Enter per newline, at each end: {events:?}");
+        assert!(report.whole_pairs());
+    }
+
+    /// Pacing must agree with the burst: same events, same total, only the
+    /// grouping differs. A newline that one path typed and the other swallowed
+    /// would be a document that changes shape when the user turns pacing on.
+    #[test]
+    fn paced_delivery_sends_the_same_newline_as_the_burst() {
+        let mut burst_sizes = Vec::new();
+        let burst = inject_text_with("سلا\nم", |batch: &[INPUT]| {
+            burst_sizes.push(batch.len());
+            batch.len()
+        });
+        let mut paced_sizes = Vec::new();
+        let paced = inject_text_paced_with("سلا\nم", 2, Duration::from_millis(1), |batch: &[INPUT]| {
+            paced_sizes.push(batch.len());
+            batch.len()
+        }, || {});
+
+        assert_eq!(burst.total_events, paced.total_events);
+        assert_eq!(burst.accepted, paced.accepted);
+        assert_eq!(
+            burst_sizes.iter().sum::<usize>(),
+            paced_sizes.iter().sum::<usize>(),
+            "every event the burst moved, the paced send moved too"
+        );
+        assert!(burst.whole_pairs() && paced.whole_pairs());
     }
 }

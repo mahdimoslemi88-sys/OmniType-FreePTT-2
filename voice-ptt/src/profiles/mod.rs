@@ -281,13 +281,22 @@ impl ProfileSet {
 pub struct GeneralRules {
     pub mode: TextMode,
     pub review_before_insert: bool,
+    /// Whether spoken commands are recognised at all.
+    ///
+    /// General-only on purpose: a profile says how one application's *text* is
+    /// shaped, and "is a phrase an instruction" is a statement about the whole
+    /// app — letting a profile turn commands on would mean the same sentence
+    /// became a line break in one window and words in the next, with nothing
+    /// on screen to say why.
+    pub commands: bool,
 }
 
 impl GeneralRules {
-    pub fn new(mode: TextMode, review_before_insert: bool) -> Self {
+    pub fn new(mode: TextMode, review_before_insert: bool, commands: bool) -> Self {
         Self {
             mode,
             review_before_insert,
+            commands,
         }
     }
 }
@@ -297,6 +306,7 @@ impl From<&crate::config::settings::Settings> for GeneralRules {
         Self {
             mode: settings.text.mode(),
             review_before_insert: settings.gui.review_before_insert,
+            commands: settings.text.commands,
         }
     }
 }
@@ -314,6 +324,9 @@ pub struct EffectiveRules {
     pub mode: TextMode,
     /// Whether to hold the text for review, after the override or the fallback.
     pub review_before_insert: bool,
+    /// Whether spoken commands are recognised — always the general setting,
+    /// never overridden. See [`GeneralRules::commands`].
+    pub commands: bool,
     /// Extra dictionary rules from the matched profile, if any.
     pub corrections: Vec<Correction>,
     /// The name of the profile that matched, or `None` for the general rules.
@@ -346,6 +359,7 @@ pub fn effective(
         return EffectiveRules {
             mode: general.mode,
             review_before_insert: general.review_before_insert,
+            commands: general.commands,
             corrections: Vec::new(),
             profile: None,
         };
@@ -357,6 +371,7 @@ pub fn effective(
             .overrides
             .review_before_insert
             .unwrap_or(general.review_before_insert),
+        commands: general.commands,
         corrections: profile.overrides.corrections.clone(),
         profile: Some(profile_label(profile)),
     }
@@ -482,7 +497,7 @@ mod tests {
     }
 
     fn general() -> GeneralRules {
-        GeneralRules::new(TextMode::Standard, false)
+        GeneralRules::new(TextMode::Standard, false, false)
     }
 
     // ── criterion 1: general fallback ──────────────────────────────────────
@@ -504,7 +519,7 @@ mod tests {
     #[test]
     fn the_general_values_are_passed_through_verbatim() {
         let set = ProfileSet::default();
-        let g = GeneralRules::new(TextMode::Conservative, true);
+        let g = GeneralRules::new(TextMode::Conservative, true, false);
         let rules = effective(&set, Some(&exe("C:/x/other.exe")), g);
         assert_eq!(rules.mode, TextMode::Conservative);
         assert!(rules.review_before_insert);
@@ -553,7 +568,7 @@ mod tests {
             },
         )]);
 
-        let g = GeneralRules::new(TextMode::Standard, true);
+        let g = GeneralRules::new(TextMode::Standard, true, false);
         let rules = effective(&set, Some(&exe("C:/x/wt.exe")), g);
         assert_eq!(rules.mode, TextMode::Raw, "the override must apply");
         assert!(
@@ -570,7 +585,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let g = GeneralRules::new(TextMode::Standard, true);
+        let g = GeneralRules::new(TextMode::Standard, true, false);
         let rules = effective(&set, Some(&exe("C:/x/slack.exe")), g);
         assert_eq!(rules.mode, TextMode::Standard, "mode must stay general");
         assert!(
@@ -615,7 +630,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let g = GeneralRules::new(TextMode::Conservative, false);
+        let g = GeneralRules::new(TextMode::Conservative, false, false);
         let rules = effective(&set, Some(&exe("C:/x/code.exe")), g);
         assert_eq!(
             rules.mode,
@@ -657,7 +672,7 @@ mod tests {
     fn mode_for_agrees_with_the_resolver() {
         let set = ProfileSet::new(vec![profile("Terminal", "wt.exe", raw_mode())]);
         for general_mode in [TextMode::Raw, TextMode::Conservative, TextMode::Standard] {
-            let g = GeneralRules::new(general_mode, false);
+            let g = GeneralRules::new(general_mode, false, false);
             let via_resolver = effective(&set, Some(&exe("C:/x/wt.exe")), g).mode;
             assert_eq!(
                 via_resolver,

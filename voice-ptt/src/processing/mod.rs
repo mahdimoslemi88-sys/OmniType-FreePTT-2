@@ -1,8 +1,11 @@
 //! Post-processing pipeline: normalization → dictionary correction, plus the
 //! chunk-seam stitcher (`seam`) that keeps a long, chunked dictation reading as
-//! one continuous piece of text.
+//! one continuous piece of text, and the speech-command recogniser
+//! (`commands`) that decides whether a phrase is an instruction instead of
+//! words — last, so nothing downstream can undo the decision.
 
 pub mod boundary;
+pub mod commands;
 pub mod dictionary;
 pub mod normalizer;
 pub mod quickfix;
@@ -70,11 +73,29 @@ impl TextMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessingOptions {
     pub mode: TextMode,
+    /// Whether spoken commands ("خط جدید", "ویرگول", …) are recognised.
+    ///
+    /// Separate from the mode on purpose: a mode says how much the *pipeline*
+    /// may change the text, and this says whether a phrase is an **instruction**
+    /// at all. It applies in every mode — including `Raw`, which is exactly
+    /// what "عبور خام مطابق گزینهٔ فرمان" asks for — because a user who turned
+    /// commands on wants the line break whether or not they also asked for
+    /// their words verbatim.
+    pub commands: bool,
 }
 
 impl ProcessingOptions {
     pub fn new(mode: TextMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            commands: false,
+        }
+    }
+
+    /// Sets the command switch; the rest is unchanged.
+    pub fn with_commands(mut self, commands: bool) -> Self {
+        self.commands = commands;
+        self
     }
 
     pub fn raw() -> Self {
@@ -118,6 +139,11 @@ pub struct TextRules<'a> {
     /// and **regardless of the mode** — they are the user's explicit
     /// instruction for that application, not part of the automatic pipeline.
     pub corrections: &'a [Correction],
+    /// Whether spoken commands are recognised — the general setting, carried
+    /// here so the quick-fix and profile previews run the same value the
+    /// coordinator will. A preview that left the switch out would show text
+    /// that is not what gets typed.
+    pub commands: bool,
 }
 
 impl TextRules<'_> {
@@ -127,7 +153,7 @@ impl TextRules<'_> {
             text,
             self.normalizer,
             self.dictionary,
-            ProcessingOptions::new(self.mode),
+            ProcessingOptions::new(self.mode).with_commands(self.commands),
         );
         if self.corrections.is_empty() {
             return processed;
@@ -150,11 +176,15 @@ pub fn process_text_with(
     dictionary: &Dictionary,
     options: ProcessingOptions,
 ) -> String {
-    match options.mode {
+    let processed = match options.mode {
         TextMode::Raw => text.to_string(),
         TextMode::Conservative => dictionary.correct(&normalizer.normalize_conservative(text)),
         TextMode::Standard => dictionary.correct(&normalizer.normalize(text)),
-    }
+    };
+    // Last, after the mode and the general dictionary: the marker a command
+    // becomes must survive the whitespace pass, and no rule gets to rewrite a
+    // phrase before it is recognised. See `commands` for the whole contract.
+    commands::apply(&processed, options.commands)
 }
 
 #[cfg(test)]
@@ -442,5 +472,92 @@ mod tests {
             out, raw_input,
             "Raw mode must not touch text with Persian normalizer or dictionary"
         );
+    }
+
+    // ── commands (C1) through the real pipeline ────────────────────────
+
+    /// Off is the default, in every mode, and it means the phrase is text.
+    #[test]
+    fn commands_are_off_by_default_in_every_mode() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        for options in [
+            ProcessingOptions::standard(),
+            ProcessingOptions::conservative(),
+            ProcessingOptions::raw(),
+        ] {
+            assert!(!options.commands);
+            for input in ["خط جدید", "یک خط جدید بزن"] {
+                assert_eq!(
+                    process_text_with(input, &n, &d, options),
+                    input,
+                    "{input:?} changed with commands off under {options:?}"
+                );
+            }
+        }
+    }
+
+    /// The marker is produced **after** the mode pipeline, so the whitespace
+    /// pass cannot eat it: a newline is the whole output.
+    #[test]
+    fn a_command_survives_the_mode_pipeline_as_a_marker() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        assert_eq!(
+            process_text_with(
+                "خط جدید",
+                &n,
+                &d,
+                ProcessingOptions::standard().with_commands(true)
+            ),
+            "\n"
+        );
+        assert_eq!(
+            process_text_with(
+                "پاراگراف جدید",
+                &n,
+                &d,
+                ProcessingOptions::conservative().with_commands(true)
+            ),
+            "\n\n"
+        );
+    }
+
+    /// Acceptance from the plan: the raw pass-through follows the command
+    /// switch, not the mode. Raw keeps the Arabic yeh exactly as heard — and
+    /// the command still fires, because recognition folds the spelling.
+    #[test]
+    fn raw_passes_text_through_and_still_recognises_commands() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        let heard = "خط جديد";
+        assert_eq!(
+            process_text_with(heard, &n, &d, ProcessingOptions::raw()),
+            heard
+        );
+        assert_eq!(
+            process_text_with(
+                heard,
+                &n,
+                &d,
+                ProcessingOptions::raw().with_commands(true)
+            ),
+            "\n"
+        );
+    }
+
+    /// Text around a command still goes through the normalizer and the
+    /// dictionary — the switch does not turn the pipeline off.
+    #[test]
+    fn text_around_a_command_is_still_processed() {
+        let n = Normalizer::new();
+        let d = Dictionary::with_defaults();
+        let out = process_text_with(
+            "دستور كلينت نقطه",
+            &n,
+            &d,
+            ProcessingOptions::standard().with_commands(true)
+        );
+        assert_eq!(out, "کلینت.", "the word was normalized, the command acted");
     }
 }
