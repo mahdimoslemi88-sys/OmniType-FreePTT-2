@@ -39,6 +39,7 @@
 | **[GUI-WINDOW-ARTIFACT-REPORT.md](GUI-WINDOW-ARTIFACT-REPORT.md)** (۵۷۹+ خط) | گزارش اصلی آرتیفکت پنجره. بخش ۱–۱۵ تاریخچهٔ کامل، بخش ۱۶ وضعیت فعلی هالهٔ سفید. |
 | [GUI-BUGFIX-PLAN.md](GUI-BUGFIX-PLAN.md) | پلن‌های اصلاح GUI |
 | [HANDOFF.md](HANDOFF.md) | تحویل کار به نفر بعد |
+| **[INSTALLER-AUDIT.md](INSTALLER-AUDIT.md)** | ممیزی نصب‌کننده (۲۰۲۶-۱۰-۰۶): دو AppId و حذفِ اسکریپت قدیمی، باگِ حذفِ نصب که `dictionary.toml` را می‌پراند (اندازه‌گیری قبل/بعد)، فهرست ادعاهای اصلاح‌شده، و آنچه هنوز باقی مانده. |
 | [TESTING-guide.md](TESTING-guide.md) | راهنمای تست |
 | [ui-audit-and-design-options.md](ui-audit-and-design-options.md) · [ui-overhaul-design.md](ui-overhaul-design.md) | طراحی رابط |
 | [light-theme-tuning.md](light-theme-tuning.md) | تنظیم تم روشن |
@@ -114,15 +115,16 @@
 
 ```
 v-2/
-├── voice-ptt/          crate اصلی (src/)
+├── voice-ptt/          crate اصلی (src/) + نصب‌کننده (voice-ptt/installer/)
 ├── voice-ptt-dist/     خروجی نصب‌شده — gitignored
-├── installer/          Inno Setup
 ├── docs/               همین پوشه
 ├── third_party/        وام‌گرفته‌ها، دست‌نخورده
 └── .agents/skills/
 ```
 
-`installer/Output/` و `voice-ptt-dist/` در `.gitignore` هستند؛ آرتیفکت فقط از راه release منتقل می‌شود.
+`voice-ptt/installer/Output/` و `voice-ptt-dist/` در `.gitignore` هستند؛ آرتیفکت فقط از راه release منتقل می‌شود.
+
+یک اسکریپت نصب بیشتر نیست: `voice-ptt/installer/build-installer.sh` (نسخه را از `Cargo.toml` می‌خواند) تنها منبعِ نصب‌کنندهٔ منتشرشده است. اسکریپت قدیمیِ `installer/installer.iss` با AppId متفاوت و نسخهٔ ۰.۳.۰ ثابت، در ۲۰۲۶-۱۰-۰۶ حذف شد — جزئیات و شواهد در [INSTALLER-AUDIT.md](INSTALLER-AUDIT.md).
 
 ریموت: `origin` = `https://github.com/mahdimoslemi88-sys/OmniType-FreePTT-2.git` — شاخهٔ `main`.
 

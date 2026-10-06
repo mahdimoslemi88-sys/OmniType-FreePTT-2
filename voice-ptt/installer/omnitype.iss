@@ -8,9 +8,12 @@
 ; release the updater cannot compare — `is_newer_version` reads the tag, and the
 ; banner links to a file named after a different number.
 ;
-; The installer ships ONLY the exe. Config, dictionary, models and history live
-; in %AppData% and are untouched by an upgrade, so reinstalling never costs the
-; user a dictionary or a downloaded model.
+; The installer ships ONLY the exe. Everything else the app owns is created on
+; first launch: the whisper and VAD models are downloaded, and `dictionary.toml`
+; and `config.toml` are written next to the exe (resolution is exe-dir first —
+; see src/paths.rs), falling back to %APPDATA%\voice-ptt only when that folder
+; is not writable. They are therefore NOT in %AppData% on a normal install,
+; which is precisely why the uninstaller below may not delete {app} wholesale.
 
 #define AppName "OmniType FreePTT"
 #define AppExeName "voice-ptt.exe"

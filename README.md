@@ -30,51 +30,60 @@ The v1 Python implementation is intentionally **not** part of this repository.
 ## Install with the setup wizard
 
 For end users there is a step-by-step Windows installer (no admin rights
-needed — it installs for the current user only, like VS Code's user setup):
+needed — it installs for the current user only, like VS Code's user setup).
+One script builds it, and it is the same one every release is published from:
 
-```powershell
-cd installer
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss   # output → installer\Output\OmniType-FreePTT-<ver>-setup.exe
+```bash
+bash voice-ptt/installer/build-installer.sh
+# → voice-ptt/installer/Output/OmniType-FreePTT-<ver>-setup.exe
 ```
+
+The version is read from `Cargo.toml` and checked to look like a version
+before Inno Setup ever runs, so the file name, the tag and the version inside
+the binary cannot drift apart.
 
 ### چه چیزی نصب می‌شود
 
-ستاپ **سبک** است (~۲۲MB — فقط اپ) و مدل whisper داخلش باندل **نمی‌شود**. در
-میان ویزارد، صفحهٔ «Which Whisper model?» با سه گزینه:
+ستاپ **سبک** است (~۱۰٫۵ مگابایت) و **فقط `voice-ptt.exe` را** می‌گذارد. بقیه در
+**اولین اجرا** ساخته یا دانلود می‌شوند:
 
-| گزینه | چیزی که می‌شود |
+| چیز | از کجا می‌آید |
 |---|---|
-| **Whisper base (~141 MB)** — پیش‌فرض | دانلود داخل ویزارد با نوار پیشرفت + صحت‌سنجی SHA-256 |
-| **Whisper large-v3-turbo (~1.5 GB)** | همان، برای بالاترین دقت |
-| **None now** | هیچ دانلودی در نصب؛ اپ در اولین اجرا خودش مدل را دانلود می‌کند |
-
-همیشه نصب می‌شود: اپ + `DirectML.dll` + مدل Silero VAD + دیکشنری پیش‌فرض.
-برای نصب آفلاین (بدون اینترنت)، پوشهٔ `voice-ptt-dist` را مستقیم کپی کنید.
+| `voice-ptt.exe` | همان `target\release\voice-ptt.exe` که `cargo build --release` ساخته |
+| مدل whisper (۱۴۱MB تا ~۱٫۵GB) | دانلود در **پس‌زمینهٔ اولین اجرا**، بعد بارگذاری داغ |
+| مدل Silero VAD (~۲MB) | دانلود در اولین اجرا، پیش از بالا آمدن ترای |
+| `dictionary.toml` | در اولین اجرا، با قواعد پیش‌فرض نوشته می‌شود |
+| `config.toml` | در اولین اجرا |
 
 نکات مهم:
 
-- مدل‌ها دقیقاً از همان URLهای رسمی و با همان SHA-256 فایل‌های HuggingFace
-  دانلود می‌شوند که دانلودر خود اپ استفاده می‌کند — نتیجه بایت‌به‌بایت یکی است.
-- در دانلود مدل بزرگ، موقتاً تا ~۲× حجم مدل فضای دیسک لازم است (موقت + مقصد).
-- دانلود ناموفق؟ نصب ادامه می‌یابد — گزینهٔ «None» را انتخاب کنید و اپ را
-  در اولین اجرا بگذارید دانلود کند (همان مکانیزم داخلی اپ).
+- **اولین اجرا به اینترنت نیاز دارد** — بدون مدل محلی و بدون موتور ابری، دیکته‌ای
+  ساخته نمی‌شود. دانلود همراه نوار پیشرفت است و شکستش فقط موتور محلی را خاموش
+  می‌گذارد؛ خودِ برنامه بالا می‌ماند.
+- مدل‌ها از همان URLهای رسمی و با همان SHA-256 دانلود می‌شوند که دانلودر خودِ اپ
+  استفاده می‌کند — و در دانلودِ مدل بزرگ موقتاً تا ~۲× حجمِ آن فضای دیسک لازم است.
 - **آپگرید**: اجرای setup روی نصب موجود، اپ را در‌جا به‌روز می‌کند و
   `dictionary.toml` شما دست‌نخورده می‌ماند.
-- **حذف نصب** مدل‌های دانلودشده را هم پاک می‌کند (تا ~1.7 GB واقعاً آزاد شود).
+- **حذف نصب** (از **۰.۶.۱** به بعد) فایل‌های شما را نگه می‌دارد و فقط `models\` را
+  پاک می‌کند تا ~۱٫۷GB واقعاً آزاد شود. در **۰.۴.۰ تا ۰.۶.۰** باگی بود که
+  `dictionary.toml` را هم پاک می‌کرد؛ پیش از حذفِ نصب حتماً ارتقا بدهید
+  ([یادداشت ۰.۶.۱](release-notes-0.6.1.md)).
+- **محل داده‌ها** (per-user، پوشهٔ قابل‌نوشتن): اولویت **exe-first** است، یعنی
+  `config.toml`، `dictionary.toml` و `models\` کنار اپ نشسته‌اند و فقط وقتی آن
+  پوشه قابل‌نوشتن نباشد به `%APPDATA%\voice-ptt` می‌روند. لاگ‌ها همیشه در
+  `%APPDATA%\voice-ptt\logs`.
 - **دستهٔ راه‌اندازی با ویندوز** (اختیاری): کپسول push-to-talk بعد از لاگین
   در دسترس باشد.
-- **محل داده‌ها در نصب معمولی** (per-user، پوشهٔ قابل‌نوشتن):
-  تنظیمات و دیکشنری کنار اپ (`config.toml` در اولین اجرا ساخته می‌شود)،
-  مدل‌ها در `models\` همان پوشه، و لاگ‌ها در `%APPDATA%\voice-ptt`.
-  (اگر پوشهٔ نصب قابل‌نوشتن نباشد، تنظیمات/دیکشنری هم به `%APPDATA%\voice-ptt`
-  منتقل می‌شوند — اولویت exe-first در کد.)
+- **نصبِ آفلاین**: این ستاپ مدلی باندل نمی‌کند. برای ماشینِ بی‌اینترنت، پوشهٔ
+  `voice-ptt-dist` را مستقیم کپی کنید و یک مدل whisper را دستی در `models\` بگذارید —
+  اولین جایی که اپ دنبالش می‌گردد همان‌جا است.
 
 ## Build & test
 
 ```powershell
 cd voice-ptt
 cargo build --release      # produces target/release/voice-ptt.exe
-cargo test                 # 97 tests (add --features light-theme to test that build too)
+cargo test                 # 788 tests (add --features light-theme to test that build too)
 cargo clippy --all-targets # zero warnings expected
 ```
 
