@@ -21,6 +21,16 @@
 //! written to `config.toml` by this panel's save button through the same
 //! validated path. That is deliberate: two drafts would mean two truths about
 //! `config.toml`, and the second one to be saved would silently undo the first.
+//!
+//! # The live preview
+//!
+//! The editor shows what the profile being edited does to one sentence, beside
+//! what the same application would get without it. Both lines come from
+//! [`TextRules`], the value the coordinator applies to a real dictation, and the
+//! general line borrows the **live** dictionary — so the difference between the
+//! two is exactly what the profile is for, down to a rule that was saved a
+//! moment ago. This is not the panel resolving a destination: which application
+//! is in front stays [`crate::profiles`]' business.
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -29,11 +39,21 @@ use std::time::Instant;
 use eframe::egui;
 use egui_phosphor::regular as ic;
 
-use super::text::format_persian_display;
+use super::text::{format_persian_display, persian_text_edit_layouter};
 use super::theme::*;
 use crate::config::settings::Settings;
-use crate::processing::TextMode;
-use crate::profiles::{binding_key, AppProfile, Overrides, ProfileSet};
+use crate::processing::quickfix;
+use crate::processing::{Dictionary, Normalizer, TextMode, TextRules};
+use crate::profiles::{binding_key, mode_for, AppProfile, Overrides, ProfileSet};
+
+/// The sentence the live preview runs on when the panel first opens.
+///
+/// Written **without** the half-space between `می` and `کنم`, and with `پاتون`
+/// rather than `پایتون`, on purpose: the ordinary modes insert the half-space
+/// and the general dictionary corrects that word, so the built-in sample is one
+/// the pipeline visibly does something to. A sample both lines left alone would
+/// make the feature look broken the first time it was opened.
+pub(crate) const DEFAULT_SAMPLE: &str = concat!("من با پاتون کار می", "کنم");
 
 /// The profile panel's own UI state.
 ///
@@ -41,7 +61,6 @@ use crate::profiles::{binding_key, AppProfile, Overrides, ProfileSet};
 /// new-correction fields, and the feedback line. Keeping it out of [`Settings`]
 /// is what lets the panel be closed and reopened without inventing a config key
 /// for "the row the user last clicked".
-#[derive(Default)]
 pub(crate) struct ProfilesPanelState {
     /// The entry the editor below the list is open on, by index into the set.
     ///
@@ -52,9 +71,31 @@ pub(crate) struct ProfilesPanelState {
     /// Half-typed correction, in the order the fields are drawn.
     pub(crate) rule_from: String,
     pub(crate) rule_to: String,
+    /// The sentence the live preview runs on, as the user last wrote it.
+    pub(crate) preview_sample: String,
     /// Transient feedback (saved / refused), auto-expiring like the settings
     /// tab's, so a message cannot outlive the state it describes.
     pub(crate) msg: Option<(String, Instant)>,
+    /// Built once with the state rather than per frame: the preview runs the
+    /// real pipeline, and rebuilding the normalizer's tables sixty times a
+    /// second for a panel that is usually not even open is work nobody asked
+    /// for.
+    normalizer: Normalizer,
+}
+
+impl Default for ProfilesPanelState {
+    fn default() -> Self {
+        Self {
+            selected: None,
+            rule_from: String::new(),
+            rule_to: String::new(),
+            // Seeded, not hinted: a preview that opened empty would look like a
+            // panel with nothing to say rather than one waiting for a sentence.
+            preview_sample: DEFAULT_SAMPLE.to_string(),
+            msg: None,
+            normalizer: Normalizer::new(),
+        }
+    }
 }
 
 impl ProfilesPanelState {
@@ -74,6 +115,69 @@ impl ProfilesPanelState {
             Some(_) if len > 0 => Some(len - 1),
             _ => None,
         };
+    }
+}
+
+/// What the pipeline does to one sentence under a profile, against what the same
+/// application would get without it.
+///
+/// Both texts are produced by [`TextRules`] — the value the coordinator applies
+/// to a real dictation — so neither line is a paraphrase of the product. The
+/// general side is deliberately *not* the profile with its overrides stripped:
+/// it is the plain general pipeline, because that is the thing a user is
+/// comparing against when they ask what a profile is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectPreview {
+    /// What an application without a profile gets, mode and dictionary alike.
+    pub general: String,
+    /// What this application gets, with the profile as it is being edited.
+    pub profile: String,
+    /// The mode the profile runs under. Shown because `raw` is the override that
+    /// explains an otherwise puzzling "it ignored my rule".
+    pub mode: TextMode,
+}
+
+impl EffectPreview {
+    /// Whether the profile changes this sentence at all.
+    pub(crate) fn changes_anything(&self) -> bool {
+        self.general != self.profile
+    }
+}
+
+/// Runs `sample` through the general pipeline and through `overrides`.
+///
+/// The dictionary is **borrowed, never rebuilt**: it is the same compiled value
+/// the coordinator matches against, so a rule saved a second ago is already in
+/// the preview rather than after the next restart. The profile's own rules are
+/// compiled per call inside [`TextRules::apply`], which is what that type was
+/// built for — a profile holds a handful of rules.
+pub(crate) fn preview_effect(
+    sample: &str,
+    general_mode: TextMode,
+    normalizer: &Normalizer,
+    dictionary: &Dictionary,
+    overrides: &Overrides,
+) -> EffectPreview {
+    let mode = mode_for(overrides, general_mode);
+    let seen = quickfix::preview(
+        sample,
+        TextRules {
+            mode: general_mode,
+            normalizer,
+            dictionary,
+            corrections: &[],
+        },
+        TextRules {
+            mode,
+            normalizer,
+            dictionary,
+            corrections: &overrides.corrections,
+        },
+    );
+    EffectPreview {
+        general: seen.before,
+        profile: seen.after,
+        mode,
     }
 }
 
@@ -222,8 +326,15 @@ pub(crate) fn render(
     draft: &mut Settings,
     settings: &Arc<RwLock<Settings>>,
     config_path: &Path,
+    dictionary: &Arc<RwLock<Dictionary>>,
 ) {
     state.clamp(draft.profiles.len());
+
+    // The sample box holds edited Persian, so it goes through the same shaper the
+    // quick fix uses: without it, a sentence typed here would draw as
+    // disconnected letters in the wrong order.
+    let mut persian_layouter =
+        |ui: &egui::Ui, text: &str, w: f32| persian_text_edit_layouter(ui, text, w);
 
     manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
@@ -710,6 +821,97 @@ pub(crate) fn render(
                                     );
                                 }
                             }
+                            // ── what this profile does to a sentence ──────────
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format_persian_display(
+                                    "اثر این پروفایل روی یک جمله",
+                                ))
+                                .size(10.5)
+                                .color(palette::TEXT_LABEL),
+                            );
+                            ui.label(
+                                egui::RichText::new(format_persian_display(
+                                    "هر دو خط با همان مسیر واقعی پردازش ساخته می‌شوند؛ تفاوتشان همان چیزی است که این برنامه از پروفایل می‌گیرد.",
+                                ))
+                                .size(9.5)
+                                .color(palette::TEXT_MUTED),
+                            );
+                            ui.add_space(3.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.preview_sample)
+                                    .hint_text(format_persian_display(DEFAULT_SAMPLE))
+                                    .desired_width(f32::INFINITY)
+                                    .layouter(&mut persian_layouter),
+                            );
+                            ui.add_space(4.0);
+
+                            // Computed from the values on screen right now,
+                            // including the edits not yet applied — which is the
+                            // whole point of a live preview.
+                            let effect = {
+                                let general_mode = draft.text.mode();
+                                match dictionary.read() {
+                                    Ok(dict) => preview_effect(
+                                        &state.preview_sample,
+                                        general_mode,
+                                        &state.normalizer,
+                                        &dict,
+                                        &edited.overrides,
+                                    ),
+                                    // A poisoned lock is not a reason to draw a
+                                    // wrong answer: two identical lines are the
+                                    // honest thing to show when nothing can be
+                                    // computed at all.
+                                    Err(_) => EffectPreview {
+                                        general: state.preview_sample.clone(),
+                                        profile: state.preview_sample.clone(),
+                                        mode: general_mode,
+                                    },
+                                }
+                            };
+                            // Reversed on purpose, like the quick fix's: Persian
+                            // reads right to left, so the line without the
+                            // profile is the one on the right.
+                            preview_line(
+                                ui,
+                                "بدون پروفایل",
+                                &effect.general,
+                                palette::TEXT_SECONDARY,
+                            );
+                            preview_line(
+                                ui,
+                                "با این پروفایل",
+                                &effect.profile,
+                                if effect.changes_anything() {
+                                    palette::SUCCESS
+                                } else {
+                                    palette::TEXT_MUTED
+                                },
+                            );
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}: {}",
+                                    format_persian_display("حالت این برنامه"),
+                                    format_persian_display(mode_label(effect.mode)),
+                                ))
+                                .size(9.5)
+                                .color(palette::TEXT_FAINT),
+                            );
+                            if !effect.changes_anything() {
+                                ui.add_space(3.0);
+                                callout(
+                                    ui,
+                                    CalloutKind::Info,
+                                    &format_persian_display(
+                                        "این پروفایل این جمله را تغییر نمی‌دهد؛ یا قاعده‌ای نگرفته و حالتش هم مثل مقدار عمومی است، یا واژه‌های این جمله در آن نیستند.",
+                                    ),
+                                );
+                            }
+
                             ui.add_space(6.0);
 
                             ui.horizontal(|ui| {
@@ -945,5 +1147,133 @@ mod tests {
         };
         state.clamp(3);
         assert_eq!(state.selected, Some(1));
+    }
+
+    // ── the live preview ──────────────────────────────────────────────────
+
+    // The lines the panel draws are two calls to `preview_line`, so what is
+    // worth testing is the text they are handed: `preview_effect`.
+
+    /// The built-in sample is one the pipeline actually touches: the ordinary
+    /// modes insert the half-space, so the very first open shows the machine
+    /// doing something rather than two identical lines that read as a fault.
+    #[test]
+    fn the_built_in_sample_is_one_the_pipeline_changes() {
+        let effect = preview_effect(
+            DEFAULT_SAMPLE,
+            TextMode::Standard,
+            &Normalizer::new(),
+            &Dictionary::with_defaults(),
+            &Overrides::default(),
+        );
+        assert!(
+            effect.general.contains("می\u{200c}کنم"),
+            "the ordinary modes insert the half-space: {effect:?}"
+        );
+        assert_ne!(
+            effect.general, DEFAULT_SAMPLE,
+            "a sample nothing happens to would leave both lines identical"
+        );
+    }
+
+    /// A profile that overrides nothing produces the same sentence on both
+    /// lines, and the preview says so instead of inventing a difference. This is
+    /// also the case that keeps the mode from being shown as anything but the
+    /// general value.
+    #[test]
+    fn a_profile_that_overrides_nothing_changes_nothing() {
+        let effect = preview_effect(
+            DEFAULT_SAMPLE,
+            TextMode::Standard,
+            &Normalizer::new(),
+            &Dictionary::with_defaults(),
+            &Overrides::default(),
+        );
+        assert!(!effect.changes_anything(), "{effect:?}");
+        assert_eq!(effect.mode, TextMode::Standard);
+        assert_eq!(effect.general, effect.profile);
+    }
+
+    /// `raw` is the override users meet by surprise — the one that makes a
+    /// correct-looking rule do nothing — so the preview has to make it
+    /// impossible to miss.
+    #[test]
+    fn a_raw_profile_leaves_the_sample_untouched() {
+        let effect = preview_effect(
+            DEFAULT_SAMPLE,
+            TextMode::Standard,
+            &Normalizer::new(),
+            &Dictionary::with_defaults(),
+            &Overrides {
+                text_mode: Some("raw".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(effect.mode, TextMode::Raw);
+        assert_eq!(
+            effect.profile, DEFAULT_SAMPLE,
+            "raw types the sentence exactly as it was heard"
+        );
+        assert!(effect.changes_anything(), "{effect:?}");
+    }
+
+    /// A profile's own rules run **on top of** the general pipeline rather than
+    /// instead of it. A preview that showed only the profile's rule would teach
+    /// the user that giving an application a profile costs it the shared
+    /// dictionary.
+    #[test]
+    fn a_profiles_own_rule_runs_on_top_of_the_general_rules() {
+        // Both rule sets spelled out, so this asserts the *order* rather than
+        // whatever the shipped dictionary happens to contain today.
+        let dictionary = Dictionary::new(vec![Correction {
+            from: "پاتون".into(),
+            to: "PY".into(),
+            category: None,
+        }]);
+        let effect = preview_effect(
+            DEFAULT_SAMPLE,
+            TextMode::Standard,
+            &Normalizer::new(),
+            &dictionary,
+            &Overrides {
+                corrections: vec![Correction {
+                    from: "کار".into(),
+                    to: "Job".into(),
+                    category: None,
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(effect.profile.contains("Job"), "{effect:?}");
+        assert!(
+            effect.profile.contains("PY"),
+            "the general dictionary must still run under a profile: {effect:?}"
+        );
+        assert!(effect.general.contains("PY"), "{effect:?}");
+        assert!(
+            !effect.general.contains("Job"),
+            "the profile's own rule must not appear without the profile: {effect:?}"
+        );
+        assert!(effect.changes_anything());
+    }
+
+    /// The dictionary is the **live** one, not a fresh read of the file: a rule
+    /// that is matching dictations right now is already in both lines.
+    #[test]
+    fn the_preview_reads_the_dictionary_it_is_given() {
+        let dictionary = Dictionary::new(vec![Correction {
+            from: "پاتون".into(),
+            to: "PY".into(),
+            category: None,
+        }]);
+        let effect = preview_effect(
+            DEFAULT_SAMPLE,
+            TextMode::Standard,
+            &Normalizer::new(),
+            &dictionary,
+            &Overrides::default(),
+        );
+        assert!(effect.general.contains("PY"), "{effect:?}");
+        assert_eq!(effect.general, effect.profile);
     }
 }

@@ -30,6 +30,7 @@ pub(crate) fn app() -> OverlayApp {
         last_text: None,
         vad_engine: "silero",
         partial: None,
+        profile: None,
         latched: false,
         chunk_busy: false,
     });

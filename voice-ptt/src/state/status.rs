@@ -26,6 +26,20 @@ pub struct AppStatus {
     /// Live partial transcript published by a streaming engine (Antigravity).
     /// Only populated while `state == Processing`; cleared when we leave it.
     pub partial: Option<String>,
+    /// The application profile in force for the dictation being recorded, by
+    /// name, or `None` when the general rules apply.
+    ///
+    /// Published once, when the microphone opens, from the *same* resolution the
+    /// conversion will use — [`crate::state::coordinator::rules_for`] against the
+    /// destination captured at that moment — so the orb can name the rules that
+    /// are shaping the text the user is about to get. A profile is a property of
+    /// the dictation, not of the instant, which is why this is decided at the
+    /// start and carried rather than recomputed while the user talks.
+    ///
+    /// Cleared when the dictation ends (see [`StatusChannel::set_state`]).
+    /// `None` draws nothing at all — a user with no profiles sees no new UI, and
+    /// "عمومی" over every window would be noise on the orb.
+    pub profile: Option<String>,
     /// True while the recording is latched hands-free (two quick presses of the
     /// record key). Only meaningful while `state == Recording`.
     pub latched: bool,
@@ -55,6 +69,7 @@ impl StatusChannel {
             last_text: None,
             vad_engine,
             partial: None,
+            profile: None,
             latched: false,
             chunk_busy: false,
         });
@@ -88,6 +103,19 @@ impl StatusChannel {
                 s.partial = None;
                 changed = true;
             }
+            // The profile badge belongs to the dictation, not to the app: it
+            // goes up when the microphone opens and comes down when that
+            // dictation ends, so the next one cannot inherit the name of a
+            // window the user has since left.
+            if s.profile.is_some()
+                && !matches!(
+                    state,
+                    AppState::Recording | AppState::Processing | AppState::Typing
+                )
+            {
+                s.profile = None;
+                changed = true;
+            }
             changed
         });
         tracing::debug!(?state, "state");
@@ -101,6 +129,21 @@ impl StatusChannel {
                 return false;
             }
             s.partial = Some(text.to_string());
+            true
+        });
+    }
+
+    /// Publishes the application profile in force for the recording that is
+    /// starting.
+    ///
+    /// `None` is how a window with no profile announces itself, and it is not a
+    /// label: the orb draws nothing rather than drawing "general".
+    pub(crate) fn set_profile(&self, profile: Option<String>) {
+        let _ = self.tx.send_if_modified(|s| {
+            if s.profile == profile {
+                return false;
+            }
+            s.profile = profile;
             true
         });
     }
@@ -260,6 +303,67 @@ mod tests {
         ch.set_chunk_busy(false);
         assert!(notified(&mut rx));
         assert!(!ch.snapshot().chunk_busy);
+    }
+
+    /// The badge belongs to one dictation: it must survive the
+    /// recording → processing → typing walk and be gone once the text is in.
+    /// Clearing it any earlier would blink the label off mid-dictation; leaving
+    /// it up would name the previous window during the next one.
+    #[test]
+    fn a_profile_survives_its_dictation_and_is_cleared_afterwards() {
+        let (ch, mut rx) = pair();
+        ch.set_state(AppState::Recording);
+        ch.set_profile(Some("کروم".into()));
+        assert!(notified(&mut rx));
+        assert_eq!(ch.snapshot().profile.as_deref(), Some("کروم"));
+
+        // A mid-session chunk is the same dictation: the label must not
+        // flicker on every chunk boundary.
+        ch.set_chunk_busy(true);
+        let _ = rx.borrow_and_update();
+        assert_eq!(ch.snapshot().profile.as_deref(), Some("کروم"));
+
+        ch.set_state(AppState::Processing);
+        assert_eq!(ch.snapshot().profile.as_deref(), Some("کروم"));
+        ch.set_state(AppState::Typing);
+        assert_eq!(ch.snapshot().profile.as_deref(), Some("کروم"));
+
+        ch.set_state(AppState::Idle);
+        assert!(notified(&mut rx));
+        assert_eq!(ch.snapshot().profile, None);
+    }
+
+    #[test]
+    fn an_unchanged_profile_does_not_notify_and_an_error_clears_it() {
+        let (ch, mut rx) = pair();
+        ch.set_state(AppState::Recording);
+        ch.set_profile(Some("vim".into()));
+        assert!(notified(&mut rx));
+        ch.set_profile(Some("vim".into()));
+        assert!(
+            !notified(&mut rx),
+            "the same profile again must stay quiet"
+        );
+
+        ch.set_state(AppState::Error("capture start failed".into()));
+        assert!(notified(&mut rx));
+        assert_eq!(
+            ch.snapshot().profile,
+            None,
+            "a failed dictation must not leave a stale label on the orb"
+        );
+    }
+
+    /// A window with no profile publishes `None`, which is not a badge: it must
+    /// not wake the UI on its own.
+    #[test]
+    fn no_profile_is_silence_rather_than_a_label() {
+        let (ch, mut rx) = pair();
+        ch.set_state(AppState::Recording);
+        let _ = rx.borrow_and_update();
+        ch.set_profile(None);
+        assert!(!notified(&mut rx));
+        assert_eq!(ch.snapshot().profile, None);
     }
 
     #[test]

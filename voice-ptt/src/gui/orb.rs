@@ -90,6 +90,36 @@ mod reach {
     /// the painted circle travels as well.
     pub(super) const SHAKE: f32 = super::SHAKE_EXTENT;
 
+    /// Height of the application-profile pill, in points.
+    pub(super) const PILL_H: f32 = 17.0;
+    /// Gap between the orb's painted edge while recording and that pill.
+    pub(super) const PILL_GAP: f32 = 5.0;
+    /// Corner rounding of the pill: half its height, so it reads as a capsule.
+    pub(super) const PILL_CORNER: f32 = PILL_H * 0.5;
+    /// Horizontal padding inside the pill, on each side of the text.
+    pub(super) const PILL_PAD: f32 = 6.0;
+    /// The pill's font size.
+    pub(super) const PILL_FONT: f32 = 9.5;
+    /// Breathing room between the pill and the canvas edge, so a bar at its
+    /// widest is never clipped by the window it is drawn in.
+    pub(super) const PILL_MARGIN: f32 = 4.0;
+    /// The extra room the canvas has to keep below the orb for the pill.
+    ///
+    /// *Added* to the canvas rather than taken from it. The pill hangs off the
+    /// size the orb settles to while recording, which is smaller than the max
+    /// reach the canvas is derived from — but that difference shrinks with the
+    /// user's size setting (at 60 % it is 18 pt, less than a legible pill
+    /// needs), so deriving the pill's room from it would work at 100 % and clip
+    /// the label at 60 %.
+    pub(super) const PILL_SPACE: f32 = PILL_GAP + PILL_H;
+
+    /// The pill must be able to hold its own text: a font taller than the bar is
+    /// a label with its top shaved off, which no rendering step would report.
+    const _: () = assert!(
+        PILL_FONT + 2.0 <= PILL_H,
+        "the profile pill is shorter than its own font"
+    );
+
     /// The two facts about the terms above that used to be tests, checked at
     /// compile time instead: the success burst really is the furthest thing the
     /// painter draws, and `ART` really is the maximum of the four terms.
@@ -350,10 +380,26 @@ impl Orb {
     /// current one would clip a later enlargement, and resizing a layered
     /// window strands the pixels the old rect covered.
     pub fn max_canvas_points_for(user_scale: f32) -> f32 {
-        painted_reach_pt(max_reachable_scale() * user_scale, true) * 2.0
+        // Plus the pill: the canvas is a **square** centred on the orb, so the
+        // room reserved below the orb is mirrored above it and the orb's centre
+        // stays the window's centre — which is what lets the pointer target, the
+        // region's circle and the placement maths all go on meaning "centred on
+        // the window" without an offset to keep in step.
+        painted_reach_pt(max_reachable_scale() * user_scale, true) * 2.0 + reach::PILL_SPACE * 2.0
     }
 
-    pub fn show(&mut self, ctx: &eframe::egui::Context, requested: OrbMode) -> OrbOutput {
+    /// Draws one frame of the orb.
+    ///
+    /// `profile` is the application profile in force, by name, or `None` when
+    /// the general rules are running — it becomes the bar under the orb while a
+    /// dictation is being recorded, and the window's click region grows to
+    /// contain it.
+    pub fn show(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        requested: OrbMode,
+        profile: Option<&str>,
+    ) -> OrbOutput {
         let now = ctx.input(|i| i.time);
         let dt = match self.last_time {
             Some(prev) => ((now - prev) as f32).clamp(0.0, 0.1),
@@ -377,6 +423,13 @@ impl Orb {
 
         let ppp = ctx.pixels_per_point();
         let mut out = OrbOutput::default();
+        // One number for the window, the pill's layout and the region's frame of
+        // reference. Read once rather than in each of the three places that need
+        // it: three copies is how a region and a drawing drift apart.
+        let side_pt = Self::max_canvas_points();
+        // The bar's rectangle in window-relative points, once it has been
+        // painted. The region has to contain exactly these pixels.
+        let mut pill_pt: Option<Rect> = None;
 
         eframe::egui::Area::new(Id::new("omnitype_orb_floating_area"))
             .fixed_pos(Pos2::ZERO)
@@ -432,6 +485,12 @@ impl Orb {
                 }
 
                 self.paint(ui.painter(), center, radius, mode);
+
+                // The profile bar, last, so the recording wave and the success
+                // burst travel behind the label rather than across it.
+                if let Some(label) = profile {
+                    pill_pt = self.paint_profile_pill(ui, center, side_pt, label);
+                }
             });
 
         if self.home_needs_clamp {
@@ -446,17 +505,27 @@ impl Orb {
         // centred on the orb, in the exact rows the larger window used to own).
         // The orb animates inside a fixed, fully transparent canvas; only a drag
         // moves the window.
-        let side_pt = Self::max_canvas_points();
         let side_px = (side_pt * ppp).ceil() as i32;
         // The window is a square and the orb is a circle in the middle of it,
         // so every click outside the orb's painted reach is a click this window
         // takes from whatever is underneath. `interaction_radius_pt` is that
         // reach — and the same number sizes the pointer target, so the region
         // and the hit test cannot drift apart. See `ClickRegion`.
-        let region_radius_px =
-            (interaction_radius_pt(self.draw_scale(), mode.shakes()) * ppp).ceil() as i32;
-        self.window
-            .place(self.anim.current_position, side_px, region_radius_px, ppp);
+        //
+        // Rounded to whole device pixels here and divided back out, rather than
+        // handed over as a raw point value: the pointer target is the un-rounded
+        // reach, and the pixel grid is the only place the two can be equal
+        // rather than nearly equal. A `ppp` of 1.0 smuggled in instead is how a
+        // radius ends up 1.25x too small on a scaled display and quietly crops
+        // the glow.
+        let radius_pt = (interaction_radius_pt(self.draw_scale(), mode.shakes()) * ppp).ceil() / ppp;
+        self.window.place(
+            self.anim.current_position,
+            side_px,
+            radius_pt,
+            pill_pt.map(|rect| [rect.min.x, rect.min.y, rect.max.x, rect.max.y]),
+            ppp,
+        );
         // phase 1: only resize when the canvas actually changed.
         if self.sent_side_pt != Some(side_pt) {
             self.sent_side_pt = Some(side_pt);
@@ -711,6 +780,66 @@ impl Orb {
 
         paint_body(painter, center, r, &pal);
         self.paint_eyes(painter, center, r, &pal, mode);
+    }
+
+    /// Draws the bar that names the application profile in force, and answers
+    /// its rectangle in **window-relative** points — the caller needs it to
+    /// widen the window region to exactly these pixels.
+    ///
+    /// `None` when there is nothing to say: no label, a blank one, or a canvas
+    /// too small to hold a readable bar. Silence is a real answer here, because
+    /// every alternative is either a label nobody asked for or one nobody can
+    /// read.
+    ///
+    /// Painted *after* the orb so the recording wave and the success burst
+    /// travel behind the label rather than across it. The rectangle is snapped
+    /// to whole device pixels — the same grid the region is rounded to — so "the
+    /// region contains exactly what was painted" stays true to the pixel rather
+    /// than to within half of one.
+    fn paint_profile_pill(
+        &self,
+        ui: &eframe::egui::Ui,
+        center: Pos2,
+        canvas_pt: f32,
+        label: &str,
+    ) -> Option<Rect> {
+        let label = label.trim();
+        if label.is_empty() {
+            return None;
+        }
+        let max_width = pill_max_width_pt(canvas_pt, self.user_scale);
+        let text_width = max_width - 2.0 * reach::PILL_PAD;
+        if text_width <= 1.0 {
+            return None;
+        }
+
+        let pal = self.anim.palette();
+        let galley = profile_galley(ui.ctx(), label, text_width, pal.highlight);
+        let width = (galley.size().x + 2.0 * reach::PILL_PAD).min(max_width);
+
+        let ppp = ui.ctx().pixels_per_point();
+        let snap = |v: f32| (v * ppp).round() / ppp;
+        let rel = profile_pill_rect(canvas_pt, width, self.user_scale);
+        let rel = Rect::from_min_max(
+            Pos2::new(snap(rel.min.x), snap(rel.min.y)),
+            Pos2::new(snap(rel.max.x), snap(rel.max.y)),
+        );
+        let origin = Vec2::new(center.x - canvas_pt * 0.5, center.y - canvas_pt * 0.5);
+        let on_screen = rel.translate(origin);
+
+        let painter = ui.painter();
+        painter.rect(
+            on_screen,
+            eframe::egui::Rounding::same(reach::PILL_CORNER),
+            with_alpha(pal.rim, 0.90),
+            Stroke::new(1.0_f32, with_alpha(pal.accent, 0.55)),
+        );
+        painter.galley(
+            on_screen.center() - galley.size() * 0.5,
+            galley,
+            pal.highlight,
+        );
+        Some(rel)
     }
 
     fn paint_eyes(&self, painter: &Painter, c: Pos2, r: f32, pal: &OrbPalette, mode: OrbMode) {
@@ -1059,10 +1188,22 @@ mod win {
             (self.raw != 0).then_some(HWND(self.raw as *mut c_void))
         }
 
-        /// Center the (square) window on `center`, physical pixels, and clip
-        /// its click region to a circle of `region_radius_px`. No-op if neither
-        /// changed.
-        pub fn place(&mut self, center: Pos2, side_px: i32, region_radius_px: i32, ppp: f32) {
+        /// Center the (square) window on `center`, physical pixels, and clip its
+        /// click region to the orb's circle — plus, when `pill_pt` is given, the
+        /// application-profile bar below it. No-op if neither changed.
+        ///
+        /// `radius_pt` and `pill_pt` are both in **window-relative points**, and
+        /// `pill_pt` is the bar's rectangle exactly as it was painted, which is
+        /// what keeps the region from cutting the label in half or claiming
+        /// desktop clicks next to it.
+        pub fn place(
+            &mut self,
+            center: Pos2,
+            side_px: i32,
+            radius_pt: f32,
+            pill_pt: Option<[f32; 4]>,
+            ppp: f32,
+        ) {
             let ppp = if ppp.is_finite() && ppp > 0.0 {
                 ppp
             } else {
@@ -1105,17 +1246,18 @@ mod win {
                 }
             }
             // Runs whether or not the window moved: the orb animates, so the
-            // region grows and shrinks under a window that never does.
-            //
-            // `ClickRegion` is denominated in points, so the pixel radius is
-            // divided back out here rather than smuggled in as a `ppp` of 1.0 —
-            // that "harmless" shortcut is how a radius ends up 1.25x too small
-            // on a scaled display and quietly crops the glow.
+            // region grows and shrinks under a window that never does, and the
+            // profile bar comes and goes with the dictation.
             #[cfg(windows)]
             crate::gui::window_shape::apply_click_region(
                 hwnd.0 as isize,
-                crate::gui::window_shape::ClickRegion::Circle {
-                    radius_pt: region_radius_px as f32 / ppp,
+                match pill_pt {
+                    Some(pill) => crate::gui::window_shape::ClickRegion::CircleWithPill {
+                        radius_pt,
+                        pill_pt: pill,
+                        pill_radius_pt: super::reach::PILL_CORNER,
+                    },
+                    None => crate::gui::window_shape::ClickRegion::Circle { radius_pt },
                 },
                 [side as f32 / ppp, side as f32 / ppp],
                 ppp,
@@ -1300,6 +1442,105 @@ pub(crate) fn interaction_radius_pt_for_test(scale: f32, with_shake: bool) -> f3
     interaction_radius_pt(scale, with_shake)
 }
 
+/// The widest the application-profile pill may be, in points.
+///
+/// The orb's own width while recording, floored so a short name stays readable
+/// at the smallest orb size the user can choose, and capped by the canvas so the
+/// bar always fits inside the window it is drawn in: a bar wider than its window
+/// is a label with both ends cut off.
+fn pill_max_width_pt(canvas_pt: f32, user_scale: f32) -> f32 {
+    /// Below this the label is unreadable whatever the size setting says. The
+    /// pill answers "which profile is in force", and a name that cannot be read
+    /// is not an answer.
+    const MIN_READABLE_PT: f32 = 88.0;
+    let orb_width = BASE_DIAMETER * OrbMode::Recording.target_scale() * user_scale;
+    orb_width
+        .max(MIN_READABLE_PT)
+        .min(canvas_pt - 2.0 * reach::PILL_MARGIN)
+}
+
+/// Where the profile pill sits inside the orb's canvas, in window-relative
+/// points, for a bar `width_pt` wide.
+///
+/// One function for the painter and for the click region, because the region has
+/// to contain exactly the pixels the bar paints: a bar painted outside it is
+/// clipped by the window region, and a region bigger than the bar is a strip
+/// that eats clicks meant for the desktop behind it.
+///
+/// Anchored to the size the orb settles to while **recording**, not to the
+/// radius of the current frame — hanging the label off the animated radius would
+/// make it bob up and down with the orb's breathing.
+fn profile_pill_rect(canvas_pt: f32, width_pt: f32, user_scale: f32) -> Rect {
+    let center = canvas_pt * 0.5;
+    // Held inside the canvas as well as below the orb. The canvas is a fixed
+    // size while the orb's painted reach follows the user's size setting, so
+    // past roughly 130 % there is no longer room under the orb: the bar is
+    // pushed up over the orb's lower glow rather than being cut in half by the
+    // window region, which is the one failure a clamp can prevent and a painter
+    // cannot.
+    let below_the_orb =
+        center + painted_reach_pt(OrbMode::Recording.target_scale() * user_scale, false) + reach::PILL_GAP;
+    let top = below_the_orb.min(canvas_pt - reach::PILL_MARGIN - reach::PILL_H);
+    Rect::from_min_size(
+        Pos2::new(center - width_pt * 0.5, top),
+        Vec2::new(width_pt, reach::PILL_H),
+    )
+}
+
+/// [`profile_pill_rect`] for the tests of other modules — the region tests in
+/// `window_shape` have to describe the bar the orb actually paints, and a second
+/// copy of this geometry over there is the drift this module keeps fixing.
+#[cfg(test)]
+pub(crate) fn profile_pill_rect_for_test(canvas_pt: f32, width_pt: f32, user_scale: f32) -> Rect {
+    profile_pill_rect(canvas_pt, width_pt, user_scale)
+}
+
+#[cfg(test)]
+pub(crate) fn pill_max_width_pt_for_test(canvas_pt: f32, user_scale: f32) -> f32 {
+    pill_max_width_pt(canvas_pt, user_scale)
+}
+
+/// [`reach::PILL_CORNER`] for the tests of other modules: the region has to be
+/// drawn with the same rounding the bar is painted with, or the pixels of the
+/// label nearest its ends would fall outside the capsule the region claims.
+#[cfg(test)]
+pub(crate) fn pill_corner_pt_for_test() -> f32 {
+    reach::PILL_CORNER
+}
+
+/// Lays the profile name out for the pill: one line, ellipsised rather than
+/// clipped.
+///
+/// The name goes through the same [`format_persian_display`] the panels use,
+/// because egui lays out left-to-right with no script awareness — a Persian name
+/// handed to it raw comes out as disconnected letters in the wrong order.
+///
+/// [`format_persian_display`]: crate::gui::overlay::text::format_persian_display
+fn profile_galley(
+    ctx: &eframe::egui::Context,
+    label: &str,
+    max_width_pt: f32,
+    color: Color32,
+) -> std::sync::Arc<eframe::egui::Galley> {
+    let mut job = eframe::egui::text::LayoutJob::default();
+    job.append(
+        &crate::gui::overlay::text::format_persian_display(label),
+        0.0,
+        eframe::egui::TextFormat {
+            font_id: eframe::egui::FontId::proportional(reach::PILL_FONT),
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = eframe::egui::text::TextWrapping {
+        max_width: max_width_pt.max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ctx.fonts(|f| f.layout_job(job))
+}
+
 #[cfg(test)]
 mod tests {
     /// The pointer diagnostic used to subtract the Win32 cursor — absolute
@@ -1393,6 +1634,207 @@ mod tests {
             }
             scale += 0.01;
         }
+    }
+
+    /// The profile bar hangs below the orb's painted edge and stays inside the
+    /// canvas at every size the user can choose.
+    ///
+    /// Both halves matter, for different reasons. Below the orb: a label across
+    /// the orb's face is unreadable against its own glow. Inside the canvas: the
+    /// canvas *is* the window, and the window's region clips rendering, so a bar
+    /// past its edge is a label cut in half by a mechanism that reports nothing.
+    ///
+    /// The window carries one canvas — the 1.0 one, which is what `show` places
+    /// — while the orb's painted reach follows the size setting. So the bar's
+    /// room *shrinks* as the user enlarges the orb, and that is the direction
+    /// this sweeps.
+    #[test]
+    fn the_profile_pill_hangs_below_the_orb_and_stays_inside_the_canvas() {
+        let canvas = Orb::max_canvas_points();
+        for user_scale in [0.6, 0.8, 1.0, 1.25, 1.5, 2.0] {
+            let width = pill_max_width_pt_for_test(canvas, user_scale);
+            let pill = profile_pill_rect_for_test(canvas, width, user_scale);
+            assert!(
+                (pill.center().x - canvas * 0.5).abs() < 0.01,
+                "the bar is off-centre at {user_scale}x: {pill:?}"
+            );
+            assert!(
+                pill.min.y >= canvas * 0.5,
+                "the bar covers the orb's centre at {user_scale}x: {pill:?}"
+            );
+            assert!(
+                pill.max.y <= canvas - reach::PILL_MARGIN + 0.001,
+                "the bar runs past the canvas at {user_scale}x: {pill:?} vs {canvas}"
+            );
+            // Until the orb is too big for the canvas to hold both — the clamp's
+            // territory, and the orb is already overflowing there anyway.
+            let orb_edge = canvas * 0.5
+                + painted_reach_pt(OrbMode::Recording.target_scale() * user_scale, false);
+            if orb_edge + reach::PILL_H + reach::PILL_GAP <= canvas - reach::PILL_MARGIN {
+                assert!(
+                    pill.min.y > orb_edge,
+                    "the bar overlaps the orb at {user_scale}x: {pill:?}"
+                );
+            }
+        }
+    }
+
+    /// The bar's width: as wide as the orb while recording, floored so a short
+    /// name is still readable at 60 %, and capped so it can never be wider than
+    /// the canvas that has to contain it.
+    #[test]
+    fn the_pill_width_is_readable_at_sixty_percent_and_never_wider_than_the_canvas() {
+        let canvas = Orb::max_canvas_points();
+        for user_scale in [0.6, 0.8, 1.0, 1.25, 1.5, 2.0] {
+            let width = pill_max_width_pt_for_test(canvas, user_scale);
+            assert!(
+                width >= 88.0,
+                "a name nobody can read at {user_scale}x: {width} pt"
+            );
+            assert!(
+                width <= canvas - 2.0 * reach::PILL_MARGIN + 0.001,
+                "the bar could be wider than its window at {user_scale}x: {width} pt"
+            );
+        }
+        // At 100 % the orb's own width decides, so the bar is exactly as wide as
+        // the disc it hangs from…
+        assert!((pill_max_width_pt_for_test(canvas, 1.0) - 100.0).abs() < 0.01);
+        // …and at 60 % the floor does, so it is deliberately wider than the orb:
+        // a legible label beats a proportionate one.
+        assert!(pill_max_width_pt_for_test(canvas, 0.6) > 60.0);
+    }
+
+    /// A name too long for the bar is ellipsised, not clipped.
+    ///
+    /// A label cut off mid-letter reads as a rendering fault, and the user's
+    /// next question is about the drawing rather than about their profiles. An
+    /// ellipsis says "this name did not fit", which is true and actionable.
+    #[test]
+    fn a_long_profile_name_is_ellipsised_rather_than_clipped() {
+        let ctx = eframe::egui::Context::default();
+        // `Context::fonts` is only valid once a frame has run (it panics
+        // otherwise), which is the same warm-up the card's own layout tests do.
+        let _ = ctx.run(eframe::egui::RawInput::default(), |_| {});
+        let long = "مدیر پنجرهٔ ترمینال ویندوز سرور نسخهٔ بسیار طولانی";
+        let galley = profile_galley(&ctx, long, 60.0, Color32::WHITE);
+        assert!(
+            galley.size().x <= 60.5,
+            "the bar's text ran past the box it was given: {} pt",
+            galley.size().x
+        );
+        // …on one line, and the mark is really there: a name that silently stops
+        // at the box edge is the failure this is about. `galley.text()` returns
+        // the job's *source* text, so the check has to be the drawn glyphs.
+        assert_eq!(galley.rows.len(), 1, "the bar is a single line");
+        let drawn: Vec<char> = galley
+            .rows
+            .iter()
+            .flat_map(|row| row.glyphs.iter().map(|g| g.chr))
+            .collect();
+        assert!(
+            drawn.contains(&'…'),
+            "a name that does not fit ends without an ellipsis: {drawn:?}"
+        );
+        assert!(
+            drawn.len() < long.chars().count(),
+            "the whole name was laid out in a box too small for it"
+        );
+        // The same name in a box that is wide enough is left alone: the ellipsis
+        // has to mean "it did not fit", not "this is how the bar always looks".
+        let roomy = profile_galley(&ctx, long, 600.0, Color32::WHITE);
+        let roomy_drawn: Vec<char> = roomy
+            .rows
+            .iter()
+            .flat_map(|row| row.glyphs.iter().map(|g| g.chr))
+            .collect();
+        assert!(!roomy_drawn.contains(&'…'));
+        assert!(roomy.size().x > 60.0);
+    }
+
+    /// One real frame with a name in it, headless: the layout, the painting and
+    /// the region all happen inside a single `show`, so only running it proves
+    /// they happen together — with a Persian name (the shaped path), with a
+    /// blank one (no bar, no region change) and with none at all.
+    ///
+    /// What this cannot see is the pixels. The geometry is pinned by the tests
+    /// above and the drawing by eye, on a real window.
+    #[test]
+    fn a_frame_with_a_profile_name_paints_without_panicking() {
+        let ctx = eframe::egui::Context::default();
+        let mut orb = Orb::new("omnitype-orb-test", Some((40, 40)));
+        let cases: [(Option<&str>, OrbMode); 5] = [
+            (Some("کروم"), OrbMode::Recording),
+            (Some("مدیر پنجرهٔ ترمینال ویندوز"), OrbMode::Recording),
+            (Some("   "), OrbMode::Recording),
+            (None, OrbMode::Recording),
+            (Some("کروم"), OrbMode::Processing),
+        ];
+        for (label, mode) in cases {
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(320.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                let _ = orb.show(ctx, mode, label);
+            });
+        }
+    }
+
+    /// The bar is not only where the region says it is: it is *painted* there,
+    /// and nothing else is. `SetWindowRgn` clips rendering as much as it clips
+    /// clicks, so a bar painted even a hairline outside the region would be a
+    /// label with its edge shaved off by the window's own shape.
+    ///
+    /// Pixels are not read — that would need a GPU — but the frame's own
+    /// tessellated geometry is, in the very points the region is built from. The
+    /// comparison is against a frame with no label at all, so "nothing paints
+    /// there" is measured rather than assumed: the orb's own reach while
+    /// recording stops a gap short of the bar.
+    #[test]
+    fn the_label_is_painted_inside_the_bar_the_region_claims() {
+        let canvas = Orb::max_canvas_points();
+        let bar = profile_pill_rect_for_test(canvas, pill_max_width_pt_for_test(canvas, 1.0), 1.0);
+
+        let vertices_in_bar = |label: Option<&str>| -> usize {
+            let ctx = eframe::egui::Context::default();
+            // The application's own fonts: the default set has no Persian
+            // coverage, so a bare context would lay the name out as nothing and
+            // this test would pass for the wrong reason.
+            ctx.set_fonts(crate::gui::bootstrap::ui_fonts());
+            let mut orb = Orb::new("omnitype-orb-pill-test", Some((40, 40)));
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(canvas))),
+                ..Default::default()
+            };
+            // Two passes, and the second one is the frame that matters: a
+            // context's first pass only ever produces `Noop` shapes, and a test
+            // that read it would be measuring nothing at all.
+            let mut last = None;
+            for _ in 0..2 {
+                last = Some(ctx.run(input.clone(), |ctx| {
+                    let _ = orb.show(ctx, OrbMode::Recording, label);
+                }));
+            }
+            let out = last.expect("two passes");
+            let ppp = ctx.pixels_per_point();
+            ctx.tessellate(out.shapes, ppp)
+                .iter()
+                .filter_map(|clipped| match &clipped.primitive {
+                    eframe::egui::epaint::Primitive::Mesh(mesh) => Some(mesh),
+                    eframe::egui::epaint::Primitive::Callback(_) => None,
+                })
+                .flat_map(|mesh| mesh.vertices.iter())
+                .filter(|vertex| bar.contains(vertex.pos))
+                .count()
+        };
+
+        let with_label = vertices_in_bar(Some("کروم"));
+        let without_label = vertices_in_bar(None);
+        assert!(
+            with_label > without_label,
+            "the bar adds no painted geometry: {with_label} vertices inside {bar:?} \
+             against {without_label} with no label at all"
+        );
     }
 
     /// The sizes themselves, as a table: what `radius * 1.1` used to claim,
@@ -1599,17 +2041,22 @@ mod tests {
     }
 
     /// The whole point of deriving the canvas: it is *exactly* twice the worst
-    /// painted reach, with no factor and no padding left over.
+    /// painted reach plus the profile bar's room, with no factor and no padding
+    /// left over.
     ///
     /// A slack factor is how the old `CANVAS_FACTOR = 1.90` plus
     /// `CANVAS_PADDING = 24` came to be right by accident — `1.90 * diameter`
     /// alone was too small, and the 48 pt of padding hid it. A test that only
     /// checks the canvas is big enough cannot see that; this one fails if anyone
     /// re-introduces a round number.
+    ///
+    /// The bar's room is named here rather than folded into the assertion, so
+    /// that "the canvas grew" is a diff a reader can see and judge: it is the
+    /// one term in this sum that is not about the orb's own drawing.
     #[test]
-    fn the_canvas_is_exactly_the_painted_reach_and_no_more() {
+    fn the_canvas_is_exactly_the_painted_reach_and_the_pill_and_no_more() {
         let side = Orb::max_canvas_points();
-        let needed = painted_reach_pt(max_reachable_scale(), true) * 2.0;
+        let needed = painted_reach_pt(max_reachable_scale(), true) * 2.0 + reach::PILL_SPACE * 2.0;
         assert!(
             (side - needed).abs() < 0.001,
             "canvas is {side} pt but the worst painted reach needs {needed} pt"
@@ -1617,8 +2064,9 @@ mod tests {
         // Sanity on the size itself, so a change to the drawing that makes the
         // orb much bigger or smaller shows up as a visible diff.
         assert!(
-            (side - 237.0).abs() < 8.0,
-            "canvas moved to {side} pt (it was 238 pt before the derivation)"
+            (side - 281.0).abs() < 8.0,
+            "canvas moved to {side} pt (it was 238 pt before the derivation, \
+             and 281 pt once the bar's room was added to it)"
         );
     }
 

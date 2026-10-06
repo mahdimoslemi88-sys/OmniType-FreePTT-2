@@ -10,6 +10,7 @@ use eframe::egui;
 use egui_phosphor::regular as ic;
 
 use super::text::format_persian_display;
+use crate::processing::TextMode;
 
 /// OmniType UI palette. Two complete themes behind identical role names,
 /// selected at compile time: `dark` (default) and `light`
@@ -393,6 +394,40 @@ pub(crate) fn callout(ui: &mut egui::Ui, kind: CalloutKind, body: &str) {
                 );
             });
         });
+}
+
+/// The Persian name of a text mode, for the panels that have to show which one
+/// is in force.
+///
+/// One mapping rather than one per panel: the Dictionary tab's quick fix and the
+/// Profiles tab both name the mode, and two matches would eventually disagree
+/// about what `raw` is called.
+pub(crate) fn mode_label(mode: TextMode) -> &'static str {
+    match mode {
+        TextMode::Raw => "خام",
+        TextMode::Conservative => "محافظه‌کارانه",
+        TextMode::Standard => "استاندارد",
+    }
+}
+
+/// One line of a preview: its name, and the text it produced.
+///
+/// Shared by both previews — the quick fix's, and the profile's — because the
+/// two have to read as the same kind of evidence, and a second copy would drift
+/// into looking like a different feature.
+pub(crate) fn preview_line(ui: &mut egui::Ui, label: &str, text: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format_persian_display(label))
+                .size(9.5)
+                .color(palette::TEXT_FAINT),
+        );
+        ui.label(
+            egui::RichText::new(format_persian_display(text))
+                .size(11.0)
+                .color(color),
+        );
+    });
 }
 
 /// Renders a single right-to-left form row without `egui::Grid` (because `Grid`

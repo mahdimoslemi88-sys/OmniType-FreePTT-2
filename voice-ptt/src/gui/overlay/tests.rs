@@ -10,6 +10,7 @@
 use super::*;
 
 use crate::config::Settings;
+use crate::profiles::{AppProfile, Overrides, ProfileSet};
 
 #[test]
 fn validate_rejects_unparseable_hotkey() {
@@ -130,6 +131,35 @@ fn test_dictionary_quick_fix_renders_a_seeded_fix() {
     });
 }
 
+/// The Profiles tab's live preview, with a profile selected.
+///
+/// The sweep above renders the tab with an empty set, which stops at "pick one
+/// from the list" and never builds the editor — so neither of the preview's two
+/// endings is reached. Both are here: a profile the built-in sample does not
+/// change under (the two lines match, so the explaining callout is drawn), and
+/// one that does (they differ, so it is not).
+#[test]
+fn test_profiles_preview_renders_a_selected_profile() {
+    for overrides in [
+        Overrides::default(),
+        Overrides {
+            text_mode: Some("raw".into()),
+            ..Default::default()
+        },
+    ] {
+        testutil::sweep(|app, ctx| {
+            app.dashboard_tab = DashboardTab::Profiles;
+            app.settings_tab.draft.profiles = ProfileSet::new(vec![AppProfile::new(
+                "Editor",
+                "code.exe",
+                overrides.clone(),
+            )]);
+            app.profiles_tab.selected = Some(0);
+            app.render_dashboard(ctx);
+        });
+    }
+}
+
 #[tokio::test]
 async fn status_client_sees_updates() {
     let (tx, rx) = tokio::sync::watch::channel(AppStatus {
@@ -137,6 +167,7 @@ async fn status_client_sees_updates() {
         last_text: None,
         vad_engine: "silero",
         partial: None,
+        profile: None,
         latched: false,
         chunk_busy: false,
     });
@@ -147,6 +178,7 @@ async fn status_client_sees_updates() {
         last_text: None,
         vad_engine: "silero",
         partial: None,
+        profile: None,
         latched: false,
         chunk_busy: false,
     })

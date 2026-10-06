@@ -950,6 +950,14 @@ impl<P: Port> Coordinator<P> {
                             target = target.as_ref().map(|id| id.hwnd),
                             "recording started"
                         );
+                        // The profile this dictation runs under, resolved by the
+                        // same function the conversion uses and against the very
+                        // destination captured above — so the orb's label cannot
+                        // name a profile other than the one that will shape the
+                        // text. Published before the state change, so the first
+                        // Recording frame already carries it.
+                        let profile = rules_for(&self.speech.settings, target.as_ref()).profile;
+                        self.status.set_profile(profile);
                         self.status.set_state(AppState::Recording);
                     }
                 },

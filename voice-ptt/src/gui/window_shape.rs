@@ -74,8 +74,16 @@ const RDW_FORCE_REPAINT: u32 = 0x0001 /* INVALIDATE */
 extern "system" {
     fn CreateEllipticRgn(l: i32, t: i32, r: i32, b: i32, f: i32) -> isize;
     fn CreateRoundRectRgn(l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> isize;
+    fn CombineRgn(dst: isize, src1: isize, src2: isize, mode: i32) -> i32;
     fn DeleteObject(ho: *mut std::ffi::c_void) -> i32;
 }
+
+/// `RGN_OR` from `wingdi.h`: the union of the two source regions.
+#[cfg(windows)]
+const RGN_OR: i32 = 2;
+/// `ERROR`, the value `wingdi.h` gives `CombineRgn` for "could not build it".
+#[cfg(windows)]
+const RGN_ERROR: i32 = 0;
 
 #[cfg(windows)]
 #[link(name = "dwmapi")]
@@ -307,6 +315,20 @@ pub enum ClickRegion {
     Circle { radius_pt: f32 },
     /// A rounded rectangle. `rect_pt` is `[left, top, right, bottom]`.
     RoundedRect { rect_pt: [f32; 4], radius_pt: f32 },
+    /// A circle centred on the window, with a rounded bar hanging below it.
+    ///
+    /// The orb's shape while it names the application profile in force. Two
+    /// shapes OR'd together rather than one tall rounded rectangle, because the
+    /// rectangle would also claim the two crescents beside the circle's lower
+    /// half — pixels that paint nothing and would swallow clicks meant for the
+    /// desktop, which is the same defect the circle itself was introduced to
+    /// remove.
+    CircleWithPill {
+        radius_pt: f32,
+        /// The bar, `[left, top, right, bottom]`, window-relative points.
+        pill_pt: [f32; 4],
+        pill_radius_pt: f32,
+    },
 }
 
 /// Converts a region to physical pixels against a window of `window_pt`.
@@ -331,42 +353,84 @@ pub fn click_region_px(region: ClickRegion, window_pt: [f32; 2], ppp: f32) -> Op
     }
     match region {
         ClickRegion::Full => Some(ClickRegion::Full),
-        ClickRegion::Circle { radius_pt } => {
-            let radius_px = (radius_pt * ppp).round() as i32;
-            // The region has to fit inside the window, or it is clipped to the
-            // window anyway and the shape bought nothing.
-            let max_px = ((window_w.min(window_h) * ppp) * 0.5).round() as i32;
-            let radius_px = radius_px.clamp(1, max_px.max(1));
-            Some(ClickRegion::Circle {
-                radius_pt: radius_px as f32 / ppp,
-            })
-        }
+        ClickRegion::Circle { radius_pt } => Some(ClickRegion::Circle {
+            radius_pt: clamp_circle_radius_pt(radius_pt, window_pt, ppp),
+        }),
         ClickRegion::RoundedRect { rect_pt, radius_pt } => {
-            let mut left = (rect_pt[0] * ppp).round() as i32;
-            let mut top = (rect_pt[1] * ppp).round() as i32;
-            let mut right = (rect_pt[2] * ppp).round() as i32;
-            let mut bottom = (rect_pt[3] * ppp).round() as i32;
-            left = left.clamp(0, (window_w * ppp).round() as i32);
-            top = top.clamp(0, (window_h * ppp).round() as i32);
-            right = right.clamp(0, (window_w * ppp).round() as i32);
-            bottom = bottom.clamp(0, (window_h * ppp).round() as i32);
-            if right - left < 2 || bottom - top < 2 {
-                return None;
+            clamp_rect_px(rect_pt, radius_pt, window_pt, ppp)
+                .map(|(rect_pt, radius_pt)| ClickRegion::RoundedRect { rect_pt, radius_pt })
+        }
+        ClickRegion::CircleWithPill {
+            radius_pt,
+            pill_pt,
+            pill_radius_pt,
+        } => {
+            let radius_pt = clamp_circle_radius_pt(radius_pt, window_pt, ppp);
+            match clamp_rect_px(pill_pt, pill_radius_pt, window_pt, ppp) {
+                Some((pill_pt, pill_radius_pt)) => Some(ClickRegion::CircleWithPill {
+                    radius_pt,
+                    pill_pt,
+                    pill_radius_pt,
+                }),
+                // A bar with no area is not a reason to give up the circle that
+                // still describes the orb — and `Full` would hand the whole
+                // transparent canvas back to the desktop's clicks.
+                None => Some(ClickRegion::Circle { radius_pt }),
             }
-            let corner = (radius_pt * ppp).round().max(0.0) as i32;
-            let max_corner = ((right - left) / 2).min((bottom - top) / 2);
-            let corner = corner.min(max_corner.max(0));
-            Some(ClickRegion::RoundedRect {
-                rect_pt: [
-                    left as f32 / ppp,
-                    top as f32 / ppp,
-                    right as f32 / ppp,
-                    bottom as f32 / ppp,
-                ],
-                radius_pt: corner as f32 / ppp,
-            })
         }
     }
+}
+
+/// The circle's radius after rounding to whole pixels and clamping it to the
+/// window, in points.
+///
+/// One function for the two shapes that carry a circle — the orb alone and the
+/// orb with its profile pill — so the "the region has to fit inside the window,
+/// or it is clipped to the window anyway and the shape bought nothing" rule
+/// cannot be honoured in one place and forgotten in the other.
+#[cfg(windows)]
+fn clamp_circle_radius_pt(radius_pt: f32, window_pt: [f32; 2], ppp: f32) -> f32 {
+    let radius_px = (radius_pt * ppp).round() as i32;
+    let max_px = ((window_pt[0].min(window_pt[1]) * ppp) * 0.5).round() as i32;
+    radius_px.clamp(1, max_px.max(1)) as f32 / ppp
+}
+
+/// A rectangle after rounding to whole pixels and clamping it — corners
+/// included — to the window, or `None` when what is left has no area.
+///
+/// `None` rather than a zero-size region because `SetWindowRgn` fails on an
+/// empty region and, handed one that degenerates at runtime, leaves a window
+/// nobody can see and everybody can click.
+#[cfg(windows)]
+fn clamp_rect_px(
+    rect_pt: [f32; 4],
+    radius_pt: f32,
+    window_pt: [f32; 2],
+    ppp: f32,
+) -> Option<([f32; 4], f32)> {
+    let mut left = (rect_pt[0] * ppp).round() as i32;
+    let mut top = (rect_pt[1] * ppp).round() as i32;
+    let mut right = (rect_pt[2] * ppp).round() as i32;
+    let mut bottom = (rect_pt[3] * ppp).round() as i32;
+    left = left.clamp(0, (window_pt[0] * ppp).round() as i32);
+    top = top.clamp(0, (window_pt[1] * ppp).round() as i32);
+    right = right.clamp(0, (window_pt[0] * ppp).round() as i32);
+    bottom = bottom.clamp(0, (window_pt[1] * ppp).round() as i32);
+    if right - left < 2 || bottom - top < 2 {
+        return None;
+    }
+    let corner = (radius_pt * ppp).round().max(0.0) as i32;
+    let max_corner = ((right - left) / 2).min((bottom - top) / 2);
+    let corner = corner.min(max_corner.max(0));
+    Some((
+        [
+            left as f32 / ppp,
+            top as f32 / ppp,
+            right as f32 / ppp,
+            bottom as f32 / ppp,
+        ],
+        corner as f32 / ppp,
+    ))
 }
 
 /// The box, in window-relative pixels, that giving `px` to a window of
@@ -397,6 +461,22 @@ fn expected_region_box(px: ClickRegion, side_px: [i32; 2], ppp: f32) -> Option<[
             (rect_pt[2] * ppp).round() as i32,
             (rect_pt[3] * ppp).round() as i32,
         ]),
+        // The union's bounding box is the union of the two bounding boxes, and
+        // each half is derived from the very coordinates its own GDI call gets.
+        ClickRegion::CircleWithPill {
+            radius_pt,
+            pill_pt,
+            ..
+        } => {
+            let r = (radius_pt * ppp).round() as i32;
+            let (cx, cy) = (side_w / 2, side_h / 2);
+            Some([
+                (cx - r).min((pill_pt[0] * ppp).round() as i32),
+                (cy - r).min((pill_pt[1] * ppp).round() as i32),
+                (cx + r + 1).max((pill_pt[2] * ppp).round() as i32),
+                (cy + r + 1).max((pill_pt[3] * ppp).round() as i32),
+            ])
+        }
     }
 }
 
@@ -517,6 +597,47 @@ pub fn apply_click_region(hwnd: isize, region: ClickRegion, window_pt: [f32; 2],
             let b = (rect_pt[3] * ppp).round() as i32;
             let c = (radius_pt * ppp).round() as i32;
             unsafe { CreateRoundRectRgn(l, t, r, b, c * 2, c * 2) }
+        }
+        ClickRegion::CircleWithPill {
+            radius_pt,
+            pill_pt,
+            pill_radius_pt,
+        } => {
+            let r = (radius_pt * ppp).round() as i32;
+            let (cx, cy) = (side_w / 2, side_h / 2);
+            let circle = unsafe { CreateEllipticRgn(cx - r, cy - r, cx + r + 1, cy + r + 1, 1) };
+            let l = (pill_pt[0] * ppp).round() as i32;
+            let t = (pill_pt[1] * ppp).round() as i32;
+            let rr = (pill_pt[2] * ppp).round() as i32;
+            let b = (pill_pt[3] * ppp).round() as i32;
+            let c = (pill_radius_pt * ppp).round() as i32;
+            let pill = unsafe { CreateRoundRectRgn(l, t, rr, b, c * 2, c * 2) };
+            if circle == 0 || pill == 0 {
+                // Neither handle may be leaked, and neither is safe to hand to
+                // the window: a half-built region would carve the orb's own
+                // clicks away.
+                unsafe {
+                    if circle != 0 {
+                        DeleteObject(circle as *mut std::ffi::c_void);
+                    }
+                    if pill != 0 {
+                        DeleteObject(pill as *mut std::ffi::c_void);
+                    }
+                }
+                tracing::debug!(hwnd, "could not build one half of the orb region");
+                return;
+            }
+            // The union is written into the destination, so the circle is the
+            // handle that survives this and the bar is handed back — `SetWindowRgn`
+            // takes ownership of exactly one region and the system deletes it.
+            let kind = unsafe { CombineRgn(circle, circle, pill, RGN_OR) };
+            unsafe { DeleteObject(pill as *mut std::ffi::c_void) };
+            if kind == RGN_ERROR {
+                unsafe { DeleteObject(circle as *mut std::ffi::c_void) };
+                tracing::debug!(hwnd, "could not union the orb region");
+                return;
+            }
+            circle
         }
     };
 
@@ -1277,6 +1398,8 @@ mod tests {
         click_region_px, expected_region_box, invalidate_click_region, region_is_current,
         transparency_mode_from, ClickRegion, TransparencyMode,
     };
+    use super::super::orb::{self, Orb};
+    use super::super::orb_animation::OrbMode;
 
     /// The transparency default is the one thing here a user can only verify by
     /// looking at the screen, so pin the mapping: an unset/unknown env var must
@@ -1569,5 +1692,242 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+    // ── the application-profile bar ─────────────────────────────────────
+    //
+    // While a dictation runs under a named profile the orb paints a bar below
+    // itself naming that profile, and the click region has to grow to cover it.
+    // Getting that wrong is visible in both directions: a region that misses the
+    // bar clips the very label the user is meant to read, and a region wider than
+    // the bar is a strip of nothing that swallows clicks meant for the desktop —
+    // the defect the circle itself exists to remove.
+
+    /// The shape the orb asks for while a profile is in force, in points.
+    ///
+    /// Assembled from the orb's own accessors rather than re-derived here,
+    /// because a second copy of that geometry would only be asserting against
+    /// itself: what these tests are about is the *region*, not the bar.
+    fn orb_profile_region(canvas_pt: f32, user_scale: f32) -> ClickRegion {
+        let width_pt = orb::pill_max_width_pt_for_test(canvas_pt, user_scale);
+        let bar = orb::profile_pill_rect_for_test(canvas_pt, width_pt, user_scale);
+        ClickRegion::CircleWithPill {
+            radius_pt: orb::interaction_radius_pt_for_test(
+                OrbMode::Recording.target_scale() * user_scale,
+                false,
+            ),
+            pill_pt: [bar.min.x, bar.min.y, bar.max.x, bar.max.y],
+            pill_radius_pt: orb::pill_corner_pt_for_test(),
+        }
+    }
+
+    /// A region's bar as window-relative pixels, so the assertions below read in
+    /// the same units the region is applied in.
+    fn bar_px(region: ClickRegion, ppp: f32) -> [f32; 4] {
+        match region {
+            ClickRegion::CircleWithPill { pill_pt, .. } => [
+                pill_pt[0] * ppp,
+                pill_pt[1] * ppp,
+                pill_pt[2] * ppp,
+                pill_pt[3] * ppp,
+            ],
+            other => panic!("expected a bar, got {other:?}"),
+        }
+    }
+
+    /// The region is the orb's circle **plus** the bar, and it grows in exactly
+    /// one direction: down. Sideways and upwards the bar lives inside the orb's
+    /// own reach, so the region must not widen or rise there — those pixels are
+    /// transparent and belong to the desktop underneath.
+    #[test]
+    fn the_profile_bar_extends_the_region_below_the_orb() {
+        let canvas = Orb::max_canvas_points();
+        let ppp = 1.0;
+        let side_px = [(canvas * ppp).round() as i32; 2];
+
+        let px = click_region_px(orb_profile_region(canvas, 1.0), [canvas, canvas], ppp)
+            .expect("a bar inside the orb's own canvas is always usable");
+        let ClickRegion::CircleWithPill { radius_pt, .. } = px else {
+            panic!("a profile region must not collapse to {px:?}");
+        };
+        let union = expected_region_box(px, side_px, ppp).expect("the union has a box");
+        let circle = expected_region_box(ClickRegion::Circle { radius_pt }, side_px, ppp)
+            .expect("the circle has a box");
+
+        assert!(
+            union[3] > circle[3],
+            "the bar must reach below the orb: {union:?} vs {circle:?}"
+        );
+        assert_eq!(union[0], circle[0], "the bar must not widen the region");
+        assert_eq!(union[1], circle[1], "the bar must not raise the region");
+        assert_eq!(union[2], circle[2], "the bar must not widen the region");
+
+        // And every pixel of the bar is inside what the region claims, so no row
+        // or column of the label can be cut away by the window's shape.
+        let bar = bar_px(px, ppp);
+        for (edge, value) in [
+            ("left", bar[0] >= union[0] as f32),
+            ("top", bar[1] >= union[1] as f32),
+            ("right", bar[2] <= union[2] as f32),
+            ("bottom", bar[3] <= union[3] as f32),
+        ] {
+            assert!(value, "the bar's {edge} ({bar:?}) is outside the region {union:?}");
+        }
+    }
+
+    /// The box handed to the read-back check has to be the union of the two
+    /// shapes' boxes, element by element. It is computed by one piece of code and
+    /// compared against what GDI built from two calls, so this is the comparison
+    /// that keeps those from drifting: a box too small would have the region
+    /// reapplied every frame, and one too large would hide a window that left the
+    /// bar unclipped when it should not have.
+    #[test]
+    fn the_expected_box_is_the_union_of_the_circle_and_the_bar() {
+        let side_px = [300, 300];
+        let ppp = 1.25;
+        let circle = expected_region_box(ClickRegion::Circle { radius_pt: 60.0 }, side_px, ppp)
+            .expect("a circle has a box");
+        let bar = expected_region_box(
+            ClickRegion::RoundedRect {
+                rect_pt: [90.0, 96.0, 210.0, 240.0],
+                radius_pt: 8.5,
+            },
+            side_px,
+            ppp,
+        )
+        .expect("a rounded rect has a box");
+        let union = expected_region_box(
+            ClickRegion::CircleWithPill {
+                radius_pt: 60.0,
+                pill_pt: [90.0, 96.0, 210.0, 240.0],
+                pill_radius_pt: 8.5,
+            },
+            side_px,
+            ppp,
+        )
+        .expect("the union has a box");
+
+        assert_eq!(
+            union,
+            [
+                circle[0].min(bar[0]),
+                circle[1].min(bar[1]),
+                circle[2].max(bar[2]),
+                circle[3].max(bar[3]),
+            ],
+            "the union must be the two boxes' union: circle {circle:?}, bar {bar:?}"
+        );
+        // The bar's far side is the one that has to widen the box, otherwise this
+        // test would pass against a box that ignored the bar entirely.
+        assert!(bar[2] > circle[2] && bar[3] > circle[3], "{bar:?} vs {circle:?}");
+    }
+
+    /// The bar is laid out inside the canvas at every size the user can pick, so
+    /// `click_region_px` never has to move it. A bar the clamp had to trim would
+    /// be a label with both ends cut off — and the clamp would be hiding layout
+    /// that no longer fits.
+    #[test]
+    fn the_bar_fits_its_window_at_every_size_the_user_can_choose() {
+        let canvas = Orb::max_canvas_points();
+        for user_scale in [0.6f32, 0.8, 1.0, 1.25, 1.5, 2.0] {
+            for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+                let asked = orb_profile_region(canvas, user_scale);
+                let px = click_region_px(asked, [canvas, canvas], ppp)
+                    .expect("the orb's own canvas is always usable");
+                assert!(
+                    matches!(px, ClickRegion::CircleWithPill { .. }),
+                    "{user_scale} @ {ppp}x: the profile region collapsed to {px:?}"
+                );
+                let want = bar_px(asked, ppp);
+                let got = bar_px(px, ppp);
+                for i in 0..4 {
+                    assert!(
+                        (got[i] - want[i]).abs() <= 0.5,
+                        "{user_scale} @ {ppp}x: the window moved the bar \
+                         ({got:?} against the painted {want:?})"
+                    );
+                }
+                let side = (canvas * ppp).round();
+                assert!(
+                    got[0] >= 0.0 && got[1] >= 0.0 && got[2] <= side && got[3] <= side,
+                    "{user_scale} @ {ppp}x: the bar {got:?} is outside its {side} px window"
+                );
+            }
+        }
+    }
+
+    /// A bar with no area is not a reason to lose the orb. The circle that still
+    /// describes the window survives it; `Full`, which would hand the whole
+    /// transparent square back to the desktop's clicks, is what the fallback must
+    /// not become.
+    #[test]
+    fn a_bar_with_no_area_leaves_the_orb_its_own_circle() {
+        let window_pt = [300.0, 300.0];
+        let ppp = 1.25;
+        let plain = click_region_px(ClickRegion::Circle { radius_pt: 60.0 }, window_pt, ppp);
+        // Zero width, zero height, entirely right of the window, and entirely
+        // below it: each of these clamps down to nothing.
+        for pill in [
+            [100.0f32, 150.0, 100.0, 167.0],
+            [100.0, 150.0, 200.0, 150.0],
+            [400.0, 150.0, 500.0, 167.0],
+            [100.0, 400.0, 200.0, 420.0],
+        ] {
+            let got = click_region_px(
+                ClickRegion::CircleWithPill {
+                    radius_pt: 60.0,
+                    pill_pt: pill,
+                    pill_radius_pt: 8.5,
+                },
+                window_pt,
+                ppp,
+            );
+            assert_eq!(
+                got, plain,
+                "a bar {pill:?} with no area must leave the orb its own circle"
+            );
+        }
+    }
+
+    /// The bar does not have to be the widest thing in the union for the region
+    /// to be honest: the pixels beside the bar's ends — inside the union's own
+    /// bounding box, outside both shapes — must stay click-through.
+    ///
+    /// That is the whole reason the orb asks for a circle OR'd with a bar instead
+    /// of one rounded rectangle over the union: such a rectangle's corners would
+    /// claim exactly these pixels, and they paint nothing.
+    #[test]
+    fn the_crescents_beside_the_bar_are_not_part_of_the_region() {
+        let canvas = Orb::max_canvas_points();
+        let ppp = 1.0;
+        let side_px = [(canvas * ppp).round() as i32; 2];
+        let px = click_region_px(orb_profile_region(canvas, 1.0), [canvas, canvas], ppp)
+            .expect("usable");
+        let ClickRegion::CircleWithPill { radius_pt, .. } = px else {
+            panic!("{px:?}");
+        };
+        let union = expected_region_box(px, side_px, ppp).expect("the union has a box");
+        let bar = bar_px(px, ppp);
+
+        // A pixel just past the bar's left end and just above its top: inside
+        // the union's box, below the circle's lower edge, outside the bar.
+        let probe = [bar[0] - 3.0, bar[1] - 4.0];
+        assert!(
+            probe[0] > union[0] as f32
+                && probe[0] < union[2] as f32
+                && probe[1] > union[1] as f32
+                && probe[1] < union[3] as f32,
+            "the probe {probe:?} has to sit inside the union's box to mean anything"
+        );
+        let (cx, cy) = (side_px[0] as f32 * 0.5, side_px[1] as f32 * 0.5);
+        let r = radius_pt * ppp;
+        let in_circle = (probe[0] - cx).powi(2) + (probe[1] - cy).powi(2) <= r * r;
+        let in_bar = probe[0] >= bar[0] && probe[0] <= bar[2] && probe[1] >= bar[1] && probe[1] <= bar[3];
+        assert!(
+            !in_circle && !in_bar,
+            "the probe {probe:?} is inside the region after all (circle {in_circle}, bar {in_bar})"
+        );
+        // ...and the bar is the shape the region grew for, so this is not a test
+        // that would pass with no bar at all.
+        assert!(bar[3] > cy + r, "the bar has to hang below the circle: {bar:?}");
     }
 }

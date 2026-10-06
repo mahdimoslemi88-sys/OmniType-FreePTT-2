@@ -32,7 +32,10 @@ mod settings_panel;
 mod tests;
 #[cfg(test)]
 mod testutil;
-mod text;
+// `pub(crate)` for one caller outside this module: the orb reshapes the
+// application-profile name it draws under itself with the same function the
+// panels use, so a Persian name cannot be the one place that skips shaping.
+pub(crate) mod text;
 mod theme;
 mod toast;
 
@@ -612,6 +615,10 @@ impl OverlayApp {
             &mut self.settings_tab.draft,
             &self.settings,
             &self.config_path,
+            // The live dictionary, so the preview's two lines are the pipeline
+            // the coordinator would actually run rather than a reading of the
+            // file at startup.
+            &self.dictionary,
         );
     }
 
@@ -1568,7 +1575,14 @@ impl eframe::App for OverlayApp {
                 }
             }
 
-            let orb_out = self.orb.show(ctx, OrbMode::from(&status.state));
+            // The profile in force, straight off the status packet: the orb
+            // draws it while a dictation is in flight and says nothing when the
+            // status carries none.
+            let orb_out = self.orb.show(
+                ctx,
+                OrbMode::from(&status.state),
+                status.profile.as_deref(),
+            );
             self.last_ppp = ctx.pixels_per_point();
             if let Some((x, y)) = orb_out.moved_to {
                 self.persist_orb_position(x, y);

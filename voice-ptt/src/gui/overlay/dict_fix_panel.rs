@@ -679,26 +679,6 @@ fn save_profile_fix(
     live.save(config_path).map_err(|e| e.to_string())
 }
 
-/// Persian for a text mode, so the panel can say which pipeline is in force.
-fn mode_label(mode: TextMode) -> &'static str {
-    match mode {
-        TextMode::Raw => "خام",
-        TextMode::Conservative => "محافظه‌کارانه",
-        TextMode::Standard => "استاندارد",
-    }
-}
-
-/// One line of the preview: its name, and the text it produced.
-fn preview_line(ui: &mut egui::Ui, label: &str, text: &str, color: egui::Color32) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format_persian_display(label))
-                .size(9.5)
-                .color(palette::TEXT_FAINT),
-        );
-        ui.label(egui::RichText::new(format_persian_display(text)).size(11.0).color(color));
-    });
-}
 
 #[cfg(test)]
 mod tests {
