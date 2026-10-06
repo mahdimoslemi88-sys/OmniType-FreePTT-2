@@ -85,10 +85,20 @@ Filename: "{app}\{#AppExeName}"; Description: "اجرای {#AppName}"; \
   Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Never delete user data. An uninstall that took the dictionary or the config
-; with it would be a data-loss bug disguised as tidiness. The uninstaller only
-; removes what this installer wrote.
-Type: filesandordirs; Name: "{app}"
+; Re-downloadable weights only — never the directory itself.
+;
+; `{app}` used to be listed here as `filesandordirs`, and that deleted the whole
+; install folder, including files this installer never wrote. `dictionary.toml`
+; lives next to the exe (file resolution is exe-dir first) and so does
+; `config.toml` on a fresh install, so an uninstall took the user's corrections
+; with it — while the comment above this line promised the opposite. Measured,
+; not assumed: a file planted in the target dir after a silent install was
+; gone after a silent uninstall, and the directory with it.
+;
+; Inno Setup removes what it installed on its own. What is left is the user's,
+; plus the weights — those are re-downloadable, and freeing the ~1.7 GB they
+; take is the one thing an uninstall should still do.
+Type: filesandordirs; Name: "{app}\models"
 
 [Code]
 function InitializeSetup(): Boolean;
