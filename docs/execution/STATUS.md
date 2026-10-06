@@ -1213,15 +1213,18 @@ assertion `left == right` failed: "این نیست" was rewritten by a rule that
 
 ### ۱) اسکن پوشش رودمپ — [roadmap-coverage-scan.sh](../roadmap-coverage-scan.sh)
 
-**۹۹ بررسی، ۰ گمشده** (`ALL COVERED`). برای هر بندِ [رودمپ](../PRODUCT-DEVELOPMENT-ROADMAP.md)
+**۱۵۵ بررسی، ۰ گمشده** (`ALL COVERED`). برای هر بندِ [رودمپ](../PRODUCT-DEVELOPMENT-ROADMAP.md)
 و هر معیارِ پذیرشش، همان فایل و همان نمونهٔ کدی پرسیده می‌شود که باید حملش کند. فقط متن است
 — نه build، نه دیوایس — پس هر چند بار قابل تکرار است و با «تست سبز» قاطی نمی‌شود. دو بررسیِ
 `gone` هم دارد: کلیدِ نگه‌داری صدا نباید وجود داشته باشد (تصمیم قطعی `§5.4`/`§11`).
 
-اجرای اول **۱۲ «گمشده»** داد و آن‌ها نمونهٔ کهنه بودند، نه شکاف: هر الگو با خواندنِ کدِ واقعی
-درست شد، نه با شل‌کردنش؛ (مثلاً `fn parse(mode` وجود ندارد و امضای واقعی
-`pub fn parse(value: &str) -> Self` است). اجرای دوم و سوم — آخری پس از همهٔ اصلاح‌های این نوبت
-— **۹۹/۹۹** و `SCAN_EXIT=0`.
+تاریخِ اجراها: اجرای اول ۹۹ بررسی و **۱۲ «گمشده»** — همه نمونهٔ کهنه، نه شکاف — و هر الگو با
+خواندنِ کدِ واقعی درست شد، نه با شل‌کردنش (مثلاً `fn parse(mode` وجود ندارد؛ امضای واقعی
+`pub fn parse(value: &str) -> Self` است). سپس پاسِ سوم اضافه شد — **هر مسیر
+`voice-ptt/src/....rs` که در اسناد نام برده شده باید وجود داشته باشد** — و ۵ مسیر مرده پیدا
+کرد: چهار تای آن‌ها در جدولِ «پیشنهاد محل ثبت» بند ۰ بودند (ادعای وجود نیستند و در فهرستِ
+صریحِ فقط-پیشنهاد نشستند) و یکی لینکِ واقعاً مرده در [GUI-BUGFIX-PLAN](../GUI-BUGFIX-PLAN.md)
+بود که هم مسیرش و هم ادعای آن سطر اصلاح شد. سه اجرای پایانی: **۱۵۵/۱۵۵**، `SCAN_EXIT=0`.
 
 ### ۲) بازبینیِ دوم — [Q1-review-2.md](Q1-review-2.md)
 
@@ -1250,7 +1253,7 @@ assertion `left == right` failed: "این نیست" was rewritten by a rule that
 | `cargo test --all-targets` | `TEST_EXIT=0` — **۸۳۱ پاس / ۰ شکست / ۱۱ نادیده** (پیش‌تر ۸۲۹؛ +۲) |
 | تست‌های تازه | `a_mark_inside_a_latin_token_is_not_a_clause_boundary` (۹ نمونه)، `the_space_run_before_a_mark_is_absorbed_whole` (۵ مرز)، ۴ نمونهٔ تازه در جدولِ `formal.rs`، ردیفِ `T0-018` با هر سه حالت |
 | `clippy --all-targets -D warnings` | `CLIPPY_EXIT=0` — صفر خطا، صفر هشدار |
-| `bash docs/roadmap-coverage-scan.sh` | `SCAN_EXIT=0` — ۹۹/۹۹ |
+| `bash docs/roadmap-coverage-scan.sh` | `SCAN_EXIT=0` — ۱۵۵/۱۵۵ (سه اجرای پیاپی، پس از آخرین تغییرِ کد) |
 
 ### آنچه آزموده نشده
 
