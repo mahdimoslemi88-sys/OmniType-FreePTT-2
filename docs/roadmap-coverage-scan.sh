@@ -195,7 +195,13 @@ gone "no audio retention key in the settings file either" 'retain_audio|archive_
 # file is still there. A dangling path in a report is a stale claim, and stale
 # claims are what this whole file exists to catch.
 section "pass 3: doc → code paths (a report may not point at a file that moved)"
-paths=$(grep -rhoE 'voice-ptt/src/[A-Za-z0-9_/.-]+\.rs' docs/*.md docs/execution/*.md 2>/dev/null | sort -u)
+# Scope: the documents that describe the product as it *is* — the top level and
+# `execution/`. `docs/reaserch/` and `docs/upstream/` are archives of what was
+# read at the time, so a path inside them is a record, not a claim.
+#
+# The component pattern deliberately rejects `..`, so a placeholder written as
+# `voice-ptt/src/....rs` is not mistaken for a path.
+paths=$(grep -rhoE 'voice-ptt/src/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*\.rs' docs/*.md docs/execution/*.md 2>/dev/null | sort -u)
 
 # Named as a *proposal*, not as a claim that the file is there. CONTRACTS band 0's
 # table is titled «پیشنهاد محل ثبت» and the execution plan says new file names

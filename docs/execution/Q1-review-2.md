@@ -49,7 +49,7 @@ build، بدون دیوایس، بدون پنجره) تا هر چند بار ق�
 | مسیر | حکم |
 |---|---|
 | `voice-ptt/src/state/draft.rs` · `state/recovery.rs` · `processing/options.rs` · `output/boundary.rs` | **پیشنهاد** — جدولِ بند ۰ قرارداد عنوانش «پیشنهاد محل ثبت» است و طرح می‌گوید نام فایل‌های تازه ادعای وجود نیستند (سه‌تای اول با نام دیگر ساخته شدند: `processing/boundary.rs`، `state/review.rs`، و `ProcessingOptions` داخل `processing/mod.rs`) |
-| `voice-ptt/src/asr/antigravity.rs` | **لینکِ مردهٔ واقعی** در [GUI-BUGFIX-PLAN.md](../GUI-BUGFIX-PLAN.md) — ماژول به پوشه رفته و ادعای همان سطر (پروبِ دائمی Antigravity) هم از آن زمان رفع شده؛ هر دو درست شدند |
+| `asr/antigravity.rs` (نامِ پیش از انتقال؛ با پیشوندِ `voice-ptt/src/` دیگر نوشته نمی‌شود تا ادعایِ وجود نباشد) | **لینکِ مردهٔ واقعی** در [GUI-BUGFIX-PLAN.md](../GUI-BUGFIX-PLAN.md) — ماژول به پوشه رفته و ادعای همان سطر (پروبِ دائمی Antigravity) هم از آن زمان رفع شده؛ هر دو درست شدند |
 
 برای چهار پیشنهاد، اسکریپت یک فهرستِ صریحِ «فقط-پیشنهاد» دارد تا استثنا دیده شود و چک
 شل نشود.
