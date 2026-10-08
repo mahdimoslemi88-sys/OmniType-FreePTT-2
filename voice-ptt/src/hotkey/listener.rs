@@ -21,6 +21,8 @@ use crate::hotkey::diagnostics::{resolve_or_default, HotkeyProblem, HotkeyRole, 
 /// Events produced by the hotkey listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
+    /// Mouse recording: first click starts, second click stops.
+    OrbToggle,
     /// Record key pressed (hold to talk).
     RecordDown,
     /// Record key released.

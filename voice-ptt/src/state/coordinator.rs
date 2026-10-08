@@ -26,7 +26,7 @@
 //! microphone in the app and against a scripted fake in the tests at the bottom
 //! of this file. There is no second implementation: the tests drive *this* loop.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -44,10 +44,10 @@ use crate::output::target::{TargetIdentity, TargetValidity};
 use crate::output::Injection;
 use crate::processing::boundary::BoundaryTracker;
 use crate::processing::seam::{SeamMerge, SeamOptions, SeamStitcher};
-use crate::state::review::{self, DraftKind, PendingDraft, ReviewCommand, ReviewOutcome};
-use crate::state::review_channel::ReviewChannel;
 use crate::processing::{Dictionary, Normalizer};
 use crate::profiles::{effective, EffectiveRules, GeneralRules};
+use crate::state::review::{self, DraftKind, PendingDraft, ReviewCommand, ReviewOutcome};
+use crate::state::review_channel::ReviewChannel;
 use crate::state::session::{ChunkId, Effect, SessionDriver, SessionId};
 use crate::state::status::{AppState, StatusChannel};
 use crate::state::utterance::{
@@ -152,17 +152,80 @@ pub(crate) trait TargetPort: Send + Sync {
     fn capture(&self) -> Option<TargetIdentity>;
     /// Whether `expected` is still the window in front of the user.
     fn check(&self, expected: &TargetIdentity) -> TargetValidity;
+    /// Samples the window in front, so the *next* dictation can still name a
+    /// destination when this program's own window is the one in front.
+    ///
+    /// Called from the loop's tick rather than from [`Self::capture`] on
+    /// purpose: by the time a dictation starts, the orb the user just clicked
+    /// may already be the window in front, and a sample taken then would have
+    /// learned nothing about where they came from.
+    fn observe_foreground(&self) {}
+    fn inserted(&self, _expected: &TargetIdentity) {}
+    fn invalidate_caret(&self, _expected: &TargetIdentity) {}
 }
 
 /// The real question, asked of Windows: three calls, no decision of its own.
 pub(crate) struct WindowTargets;
 
+impl WindowTargets {
+    /// The last window the user was in before this program's own.
+    ///
+    /// Logged when it is used, because "the destination came from memory, not
+    /// from the window in front" is the difference between a dictation that
+    /// types and one that is refused, and the log is the only place that
+    /// distinction could be seen after the fact.
+    fn last_external(&self) -> Option<TargetIdentity> {
+        let id = crate::output::remembered_target()?;
+        tracing::info!(
+            hwnd = id.hwnd,
+            "no destination in front; using the last window the user was in"
+        );
+        Some(id)
+    }
+}
+
 impl TargetPort for WindowTargets {
     fn capture(&self) -> Option<TargetIdentity> {
-        crate::output::capture_target().ok()
+        // A window of *this* process is never a destination. Clicking the orb
+        // used to make the overlay window itself the window in front, so the
+        // dictation was aimed at the app's own canvas: the text was then refused
+        // ("focus moved") and the user saw an error with nothing typed. The orb
+        // does not take the foreground on a click any more; this is the belt to
+        // that braces — our own UI is not a document, and must never be typed
+        // into.
+        //
+        // When our own window *is* in front — the orb was clicked while this
+        // program was already the front window, or the dashboard is up and the
+        // user reached for the orb — the dictation still needs a destination,
+        // and the one the user came from is the window this program saw them in
+        // last (see `remember_foreground`). Without it the text was refused
+        // with `validity=Unknown` and the user watched a dictation produce
+        // nothing at all, four times in a row in their log.
+        let target = crate::output::capture_target().ok()?;
+        if crate::output::owns_window(target.hwnd) {
+            tracing::warn!(
+                hwnd = target.hwnd,
+                "the window in front belongs to this program; no destination captured"
+            );
+            return self.last_external();
+        }
+        Some(target)
+    }
+    fn observe_foreground(&self) {
+        crate::output::remember_foreground();
     }
     fn check(&self, expected: &TargetIdentity) -> TargetValidity {
-        crate::output::validate_target(expected)
+        crate::output::target::restore_target(expected)
+    }
+    fn inserted(&self, expected: &TargetIdentity) {
+        if let Some(element) = &expected.focus_element {
+            crate::output::focus::inserted(element);
+        }
+    }
+    fn invalidate_caret(&self, expected: &TargetIdentity) {
+        if let Some(element) = &expected.focus_element {
+            crate::output::focus::invalidate_caret(element);
+        }
     }
 }
 
@@ -186,6 +249,8 @@ pub(crate) enum PollOutcome {
 
 /// The hardware side, as the coordinator needs it.
 pub(crate) trait Port: Send {
+    /// Persistent mouse sessions chunk audio instead of stopping on silence.
+    fn set_mouse_recording(&self, _enabled: bool) {}
     /// Opens the microphone. `None` is success; `Some(reason)` is a device that
     /// refused, which is a fact the session rules need to hear rather than an
     /// error to raise.
@@ -469,6 +534,18 @@ pub(crate) struct KeptRecord {
 
 #[allow(dead_code)]
 impl KeptRecord {
+    /// What this record *is*, for removing it again.
+    ///
+    /// The same triple the record was created with, so "retire the record this
+    /// draft came from" can be exact instead of a blanket clear.
+    pub fn identity(&self) -> review::RecordIdentity {
+        review::RecordIdentity {
+            session: self.session,
+            chunk: self.chunk,
+            seq: self.seq,
+        }
+    }
+
     /// Whether the text was entirely unaccepted by the platform from the standpoint of text delivery.
     ///
     /// For [`InjectOutcome::NotAttempted`] and [`InjectOutcome::Failed`], 0 keystroke
@@ -560,6 +637,73 @@ impl KeptRecord {
     }
 }
 
+/// What to say when the retention budget has filled up.
+///
+/// A **state**, not a refusal: nothing was just lost, and what the user needs to
+/// know is that nothing more will be kept until they free room — and that
+/// nothing they already have was deleted to make room. Counts only, never a
+/// dictation.
+fn capacity_full_message(held: usize, cap: usize) -> String {
+    format!(
+        "uninserted-text limit reached ({held} of {cap}); no new text will be kept until you delete or restore one. Nothing already held has been deleted."
+    )
+}
+
+/// What to tell the user when a dictation is **refused** at that limit.
+///
+/// Counts only — never a dictation, never a key. The two variants differ because
+/// the truth differs: a *fresh* text refused at the budget was never typed and is
+/// stored nowhere, while a refused **re-offer** still exists as a recovery record,
+/// which is where the user will find it. Saying "not kept" for the second case
+/// would be a lie, and saying "kept" for the first would be a worse one.
+fn capacity_message(held: usize, cap: usize, record_kept: bool) -> String {
+    if record_kept {
+        format!(
+            "uninserted-text limit reached ({held} of {cap}); nothing was typed. The text is still held in its recovery record — delete or restore an archived text, then try again."
+        )
+    } else {
+        format!(
+            "uninserted-text limit reached ({held} of {cap}); this dictation was NOT typed and NOT kept. Delete or restore an archived text, then dictate again."
+        )
+    }
+}
+
+/// What a claimed capacity slot belongs to.
+///
+/// The slot is claimed when work is **accepted** — a recording that has opened
+/// its microphone, a chunk that has been handed to the queue — and it is spent
+/// by the text that work produces. Keying it by holder is what makes "release
+/// exactly once" checkable instead of hoped for: a cancel, a failure, a
+/// successful insert and a late answer all name the same holder, and the second
+/// one to arrive finds nothing left to give back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SlotHolder {
+    /// A recording session, for the text its final piece will produce. Moved to
+    /// the job when that piece is enqueued, so one piece never holds two slots.
+    Session(SessionId),
+    /// One accepted piece of work, by its order number.
+    Job(u64),
+}
+
+/// What to tell the user when a dictation is refused **before it starts**.
+///
+/// The distinction from [`capacity_message`] is the whole point of admitting
+/// work early: nothing was recorded, nothing was converted, and therefore
+/// nothing was lost. A message that said "not kept" here would describe a loss
+/// that did not happen.
+fn capacity_refused_start_message(held: usize, cap: usize) -> String {
+    format!(
+        "uninserted-text limit reached ({held} of {cap}); the dictation was not started, so nothing was recorded and nothing was lost. Delete, restore or insert an uninserted text, then dictate again. Nothing already held has been deleted."
+    )
+}
+
+/// The same refusal, for a recording that was already running.
+fn capacity_stopped_recording_message(held: usize, cap: usize) -> String {
+    format!(
+        "uninserted-text limit reached ({held} of {cap}); the recording was stopped. Everything already accepted for it is still held; the piece that could not be admitted was not converted. Free room, then dictate again."
+    )
+}
+
 /// The coordinator: event stream in, keystrokes out.
 pub(crate) struct Coordinator<P: Port> {
     port: P,
@@ -593,6 +737,11 @@ pub(crate) struct Coordinator<P: Port> {
     /// not drop these records, so an insert refused or broken late in the turn
     /// is not lost. Explicit cancel drops records for that session only.
     kept: Arc<Mutex<Vec<KeptRecord>>>,
+    /// Mints the `seq` half of a record's identity for records created outside
+    /// the job pipeline — an approved insert that failed. Starts far above any
+    /// plausible job sequence so a review-path record can never share an
+    /// identity with a pipeline one.
+    kept_seq: std::sync::atomic::AtomicU64,
     /// Continuity and spacing policy across chunks and continued sessions.
     boundary: Mutex<BoundaryTracker>,
     status: Arc<StatusChannel>,
@@ -621,6 +770,10 @@ pub(crate) struct Coordinator<P: Port> {
     /// them; otherwise the next real answer waits forever for a number that is
     /// never coming — the very stall the queue must not have.
     skipped: BTreeSet<u64>,
+    /// The capacity slots this loop has claimed and not yet spent or given
+    /// back, by holder. Mirrors the store's own counter exactly: one entry per
+    /// promise, so a slot can neither leak (never released) nor be spent twice.
+    slots: HashSet<SlotHolder>,
     /// Work waiting for its turn. One conversion runs at a time, so a cancel
     /// still has unstarted audio it can set aside.
     queue: VecDeque<Job>,
@@ -646,6 +799,15 @@ pub(crate) struct Coordinator<P: Port> {
     /// confused with the "the user is talking" path: one of them may type and
     /// the other must not.
     answers: tokio::sync::mpsc::UnboundedReceiver<ReviewCommand>,
+    /// Whether the "the app is holding as much text as it will hold" problem has
+    /// already been said.
+    ///
+    /// A `Cell` rather than an atomic: it is read and written only from this
+    /// loop's own `&self` methods, and an atomic would imply a second thread this
+    /// field deliberately has none of. It exists so the capacity report is
+    /// **edge-triggered** — said when the budget fills, not on every turn it
+    /// stays full, which is the repeat the F3 finding named.
+    capacity_notice: std::cell::Cell<bool>,
 }
 
 impl<P: Port> Coordinator<P> {
@@ -681,6 +843,7 @@ impl<P: Port> Coordinator<P> {
             seams: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
             kept: Arc::new(Mutex::new(Vec::new())),
+            kept_seq: std::sync::atomic::AtomicU64::new(0),
             boundary: Mutex::new(BoundaryTracker::new()),
             status,
             sink,
@@ -691,6 +854,7 @@ impl<P: Port> Coordinator<P> {
             pending: BTreeMap::new(),
             apply_next: 0,
             skipped: BTreeSet::new(),
+            slots: HashSet::new(),
             queue: VecDeque::new(),
             in_flight: None,
             windows: Vec::new(),
@@ -698,6 +862,7 @@ impl<P: Port> Coordinator<P> {
             clock,
             review,
             answers,
+            capacity_notice: std::cell::Cell::new(false),
         }
     }
 
@@ -860,6 +1025,13 @@ impl<P: Port> Coordinator<P> {
             "coordinator stopping: dropping queued audio; awaiting the in-flight conversion, which will not be typed"
         );
         self.queue.clear();
+        // Nothing that never ran will produce text, so nothing it reserved is
+        // owed to anyone. The loop is stopping; the budget is left balanced
+        // rather than merely abandoned.
+        let outstanding = std::mem::take(&mut self.slots).len();
+        for _ in 0..outstanding {
+            self.review.release_reservation();
+        }
         if let Some(in_flight) = self.in_flight.take() {
             if let Err(e) = in_flight.handle.await {
                 tracing::error!(seq = in_flight.seq, error = %e, "task PANICKED");
@@ -878,6 +1050,7 @@ impl<P: Port> Coordinator<P> {
         let now = self.clock.now();
         let effects = match ev {
             HotkeyEvent::RecordDown => self.with_session(|s| s.on_record_down(now)),
+            HotkeyEvent::OrbToggle => self.with_session(|s| s.on_orb_toggle()),
             HotkeyEvent::RecordUp => self.with_session(|s| s.on_record_up(now)),
             HotkeyEvent::Cancel => {
                 self.forget_boundary();
@@ -891,6 +1064,10 @@ impl<P: Port> Coordinator<P> {
 
     async fn on_tick(&mut self) -> Result<()> {
         let now = self.clock.now();
+        // One cheap read of the foreground window per tick, before anything can
+        // make this program's own window the one in front: the target a
+        // dictation falls back to (see `TargetPort::observe_foreground`).
+        self.desktop.observe_foreground();
         let effects = self.with_session(|s| s.on_tick(now));
         self.perform(effects).await
     }
@@ -911,96 +1088,115 @@ impl<P: Port> Coordinator<P> {
     /// write per turn, with the rules' final answer rather than a mid-batch
     /// guess.
     async fn perform(&mut self, effects: Vec<Effect>) -> Result<()> {
+        // A recording that could not be admitted any more. Set inside the batch
+        // and acted on after it, because closing the microphone is its own
+        // effect (`Effect::DiscardSession`) and re-entering `perform` from inside
+        // its own loop is how one effect's bookkeeping gets applied twice.
+        let mut stop_recording: Option<Option<SessionId>> = None;
         for effect in effects {
             match effect {
-                Effect::BeginRecording => match self.port.begin().await {
-                    Some(reason) => self
-                        .status
-                        .set_state(AppState::Error(format!("capture start failed: {reason}"))),
-                    None => {
-                        // Nothing to reset here: the seam lives per session, so
-                        // a fresh dictation starts from an empty stitcher by
-                        // construction — and starting it cannot touch the seam
-                        // an older dictation still needs.
-                        //
-                        // The id is handed out here, once the microphone really
-                        // opened. A dictation with no id could not be asked
-                        // "is your text still wanted?" later — which is exactly
-                        // what a cancel does.
-                        let session = self.with_session(|s| s.began_recording(true));
-                        // The window the user is dictating into is read here,
-                        // at the moment the microphone really opened, and kept
-                        // **by session id**. A capture that failed is not an
-                        // error: the dictation is real, and its insert will be
-                        // refused later with a reason.
-                        let target = self.desktop.capture();
-                        match &target {
-                            Some(id) => self.remember_target(session, id.clone()),
-                            None => tracing::warn!(
-                                session = session.map(|id| id.0),
-                                "no foreground window to capture; the insert will be refused"
-                            ),
-                        }
-                        // The kind is in the log because it is the difference
-                        // between "held the key" and "tapped twice and walked
-                        // away", and a bug report about the wrong one is
-                        // otherwise unreadable.
-                        let kind = session.and_then(|id| self.with_session(|s| s.kind_of(id)));
-                        tracing::info!(
-                            ?session,
-                            ?kind,
-                            target = target.as_ref().map(|id| id.hwnd),
-                            "recording started"
+                Effect::BeginRecording => {
+                    // Checked **before the microphone opens**: a dictation whose
+                    // text the app has nowhere to keep must not start at all.
+                    // This is the promise the whole admission path relies on —
+                    // every live session holds a slot for its final text.
+                    if self.review.retention_room() == 0 {
+                        let held = self.review.retention_len();
+                        let cap = review::DraftStore::RETENTION_CAP;
+                        tracing::warn!(
+                            held,
+                            cap,
+                            "recording refused before the microphone opened: the retention budget is full"
                         );
-                        // The profile this dictation runs under, resolved by the
-                        // same function the conversion uses and against the very
-                        // destination captured above — so the orb's label cannot
-                        // name a profile other than the one that will shape the
-                        // text. Published before the state change, so the first
-                        // Recording frame already carries it.
-                        let profile = rules_for(&self.speech.settings, target.as_ref()).profile;
-                        self.status.set_profile(profile);
-                        self.status.set_state(AppState::Recording);
+                        self.capacity_notice.set(true);
+                        self.show_error(capacity_refused_start_message(held, cap));
+                        self.with_session(|s| s.began_recording(false));
+                        continue;
                     }
-                },
+                    self.port
+                        .set_mouse_recording(self.with_session(|s| s.mouse_latched()));
+                    match self.port.begin().await {
+                        Some(reason) => {
+                            self.with_session(|s| s.began_recording(false));
+                            self.status.set_state(AppState::Error(format!(
+                                "capture start failed: {reason}"
+                            )));
+                        }
+                        None => {
+                            // Nothing to reset here: the seam lives per session, so
+                            // a fresh dictation starts from an empty stitcher by
+                            // construction — and starting it cannot touch the seam
+                            // an older dictation still needs.
+                            //
+                            // The id is handed out here, once the microphone really
+                            // opened. A dictation with no id could not be asked
+                            // "is your text still wanted?" later — which is exactly
+                            // what a cancel does.
+                            let session = self.with_session(|s| s.began_recording(true));
+                            // The window the user is dictating into is read here,
+                            // at the moment the microphone really opened, and kept
+                            // **by session id**. A capture that failed is not an
+                            // error: the dictation is real, and its insert will be
+                            // refused later with a reason.
+                            let target = self.desktop.capture();
+                            match &target {
+                                Some(id) => self.remember_target(session, id.clone()),
+                                None => tracing::warn!(
+                                    session = session.map(|id| id.0),
+                                    "no foreground window to capture; the insert will be refused"
+                                ),
+                            }
+                            // The kind is in the log because it is the difference
+                            // between "held the key" and "tapped twice and walked
+                            // away", and a bug report about the wrong one is
+                            // otherwise unreadable.
+                            let kind = session.and_then(|id| self.with_session(|s| s.kind_of(id)));
+                            tracing::info!(
+                                ?session,
+                                ?kind,
+                                target = target.as_ref().map(|id| id.hwnd),
+                                "recording started"
+                            );
+                            // The profile this dictation runs under, resolved by the
+                            // same function the conversion uses and against the very
+                            // destination captured above — so the orb's label cannot
+                            // name a profile other than the one that will shape the
+                            // text. Published before the state change, so the first
+                            // Recording frame already carries it.
+                            let profile = rules_for(&self.speech.settings, target.as_ref()).profile;
+                            self.status.set_profile(profile);
+                            self.status.set_state(AppState::Recording);
+                            // The slot the microphone opened under. Claimed here,
+                            // after the room was checked a moment ago and before any
+                            // other claimant can exist: this loop is the only thing
+                            // that claims capacity, and it is inside this call.
+                            if let Some(id) = session {
+                                let claimed = self.claim_slot(SlotHolder::Session(id));
+                                debug_assert!(
+                                    claimed,
+                                    "the room was checked immediately before the microphone opened"
+                                );
+                                if !claimed {
+                                    // Unreachable while the loop is the only
+                                    // claimant. Said out loud rather than assumed:
+                                    // the session's final text then goes through
+                                    // ordinary admission, which refuses with a
+                                    // message instead of dropping it.
+                                    tracing::error!(
+                                    session = id.0,
+                                    "the recording slot could not be claimed; its text will be admitted on its own"
+                                );
+                                }
+                            }
+                        }
+                    }
+                }
                 Effect::FinishSession => {
                     let audio = self.port.finish().await?;
                     let session = self.end_session();
                     self.end_conversion(session, audio);
                 }
-                Effect::DiscardSession(id) => {
-                    // Ownership is read *before* the session closes: the cancel
-                    // must take its own badge down, but must not take down a
-                    // newer recording's.
-                    let owned = self.owns_badge(id);
-                    self.port.discard().await?;
-                    tracing::info!(
-                        session = id.map(|id| id.0),
-                        "speech recording cancelled by user"
-                    );
-                    self.with_session(|s| s.cancelled(id));
-                    self.forget_seam(id);
-                    self.forget_target(id);
-                    self.forget_kept(id);
-                    // Drafts from the recording the user just threw away must
-                    // not stay on offer: a cancelled dictation that a window
-                    // still offers to insert is text the user deliberately
-                    // discarded.
-                    if let Some(id) = id {
-                        self.review.forget_session(id);
-                    }
-                    // Work of this session that never started is set aside, and
-                    // its audio is dropped rather than kept for a recovery that
-                    // will never happen.
-                    self.drop_queued(id);
-                    // The badge comes down **on the cancel**, not on the result
-                    // that follows it: a cancelled result changes nothing, so
-                    // it cannot be the thing that tidies up after one.
-                    if owned {
-                        self.status.set_chunk_busy(false);
-                        self.status.set_state(AppState::Idle);
-                    }
-                }
+                Effect::DiscardSession(id) => self.cancel_session(id).await?,
                 Effect::PollAudio => {
                     // The driver only ever asks for this while it believes a
                     // session is live, so pumping a buffer nobody owns would
@@ -1010,10 +1206,20 @@ impl<P: Port> Coordinator<P> {
                         PollOutcome::More => {}
                         PollOutcome::Chunk { audio } => {
                             let session = self.with_session(|s| s.current_session());
-                            // phase 3.2: a chunk boundary must not look like
-                            // the recording stopped and restarted.
-                            self.status.set_chunk_busy(true);
-                            self.enqueue(session, Some(audio), false);
+                            // Each chunk is admitted **before** it is queued: a
+                            // long dictation keeps producing pieces, and a check
+                            // made only when the microphone opened would have
+                            // admitted work long after the budget had filled.
+                            // A piece that cannot be admitted stops the
+                            // recording instead of being spoken into a void; the
+                            // pieces already accepted are untouched.
+                            if self.enqueue(session, Some(audio), false) {
+                                // phase 3.2: a chunk boundary must not look like
+                                // the recording stopped and restarted.
+                                self.status.set_chunk_busy(true);
+                            } else {
+                                stop_recording = Some(session);
+                            }
                         }
                         PollOutcome::Finished { audio } => {
                             let session = self.end_session();
@@ -1023,9 +1229,125 @@ impl<P: Port> Coordinator<P> {
                 }
             }
         }
+        // A recording that ran out of room mid-stream: the microphone closes
+        // through its **own** path, not the cancel path — the work this
+        // recording already had accepted is still wanted, and only a path that
+        // leaves the session valid can deliver it.
+        if let Some(id) = stop_recording {
+            self.stop_stream_for_capacity(id).await?
+        }
         // After the batch, always — including when the batch was empty, which is
         // the double-tap's own case.
         self.publish_latched();
+        Ok(())
+    }
+
+    /// Closes one recording because the **user** abandoned it.
+    ///
+    /// This is the cancel policy, and it is deliberately the whole of it: a
+    /// dictation the user threw away produces no text, so the slot it claimed,
+    /// the work it queued, the drafts it raised and the records it left are each
+    /// given back or forgotten here. A second release finds nothing, which is
+    /// what makes "cancel *and* the late answer it caused" cost one slot rather
+    /// than two.
+    ///
+    /// A recording stopped by the **budget** must not come through here — see
+    /// [`Self::stop_stream_for_capacity`]. The two look alike (both close a
+    /// microphone that is still open) and they are opposites in what they do
+    /// with the accepted work, which is why they are two functions rather than
+    /// one with a flag.
+    async fn cancel_session(&mut self, id: Option<SessionId>) -> Result<()> {
+        // Ownership is read *before* the session closes: the cancel must take its
+        // own badge down, but must not take down a newer recording's.
+        let owned = self.owns_badge(id);
+        self.port.discard().await?;
+        tracing::info!(
+            session = id.map(|id| id.0),
+            "speech recording cancelled by user"
+        );
+        self.with_session(|s| s.cancelled(id));
+        self.forget_seam(id);
+        self.forget_target(id);
+        self.forget_kept(id);
+        if let Some(id) = id {
+            // The slot the recording held for its final text. If that piece was
+            // already enqueued, the slot moved to the job and this finds nothing
+            // — right, because that job's fate is decided by its own result.
+            self.release_slot(SlotHolder::Session(id));
+            // Drafts from the recording the user just threw away must not stay
+            // on offer: a cancelled dictation that a window still offers to
+            // insert is text the user deliberately discarded.
+            self.review.forget_session(id);
+        }
+        // Work of this session that never started is set aside, and its audio is
+        // dropped rather than kept for a recovery that will never happen — and
+        // the slot it was admitted under goes back with it.
+        self.drop_queued(id);
+        // The badge comes down **on the cancel**, not on the result that follows
+        // it: a cancelled result changes nothing, so it cannot be the thing that
+        // tidies up after one.
+        if owned {
+            self.status.set_chunk_busy(false);
+            self.status.set_state(AppState::Idle);
+        }
+        Ok(())
+    }
+
+    /// Closes the recording half of a session whose next piece the budget could
+    /// not admit — **without** cancelling it.
+    ///
+    /// The microphone stops, and nothing new is taken from it; everything the
+    /// recording already had accepted keeps its promise. So the session stays
+    /// valid (`AwaitingResult`) and every piece already inside the engine or
+    /// waiting in the queue still lands, in order: `wanted_by` must keep saying
+    /// yes to it, or the results this path exists to preserve would be refused
+    /// as the late answers of a session nobody closed.
+    ///
+    /// What is given back here is only what was never spent: nothing of the
+    /// recording is forgotten, no draft is withdrawn, no queued job is set
+    /// aside. The one piece that is *not* preserved is the piece the budget
+    /// refused — it was never converted, and its audio goes with the buffer the
+    /// microphone was holding.
+    ///
+    /// The ordered closing event (`audio: None`) is enqueued here rather than
+    /// waiting for a key release: the microphone is closing on the app's own
+    /// decision, so nothing else will ever emit that ending. It takes its turn
+    /// behind the accepted pieces, which is what makes the session close *after*
+    /// they have settled — and it inherits the slot the recording claimed, so
+    /// that reservation is released when the ending settles rather than when the
+    /// microphone shut.
+    ///
+    /// The badge is deliberately **not** touched. `enqueue` put the explanation
+    /// there a moment ago, and it is the only thing on screen that tells the
+    /// user why their dictation stopped; putting the orb back to `Idle` here
+    /// would take the explanation away before it could be read.
+    async fn stop_stream_for_capacity(&mut self, id: Option<SessionId>) -> Result<()> {
+        self.port.discard().await?;
+        tracing::info!(
+            session = id.map(|id| id.0),
+            "recording stopped: the retention budget could not admit its next piece; \
+             work already accepted is still wanted"
+        );
+        if id.is_none() {
+            // No session to close and nothing that was ever accepted, so there
+            // is no ending to order behind anything.
+            return Ok(());
+        }
+        // The recording half closes; the session does not. `end_session` moves
+        // it to `AwaitingResult`, which is exactly the state the accepted pieces
+        // need in order to still be wanted.
+        let session = self.end_session();
+        debug_assert_eq!(
+            session, id,
+            "a stop must close the recording whose piece was refused"
+        );
+        // One ordered final event, with no sound: it carries the session's slot
+        // to its own account and cannot be refused.
+        let ordered = self.end_conversion(session, None);
+        debug_assert!(
+            ordered,
+            "the ordered closing event carries no audio, so it is never refused"
+        );
         Ok(())
     }
 
@@ -1047,24 +1369,66 @@ impl<P: Port> Coordinator<P> {
     /// that is still being converted cannot be refused afterwards as a "late
     /// result of a completed session". Refusing it was deleting text the user
     /// really spoke.
-    fn end_conversion(&mut self, session: Option<SessionId>, audio: Option<AudioUtterance>) {
+    fn end_conversion(
+        &mut self,
+        session: Option<SessionId>,
+        audio: Option<AudioUtterance>,
+    ) -> bool {
         if audio.is_none() {
             tracing::info!(
                 session = session.map(|id| id.0),
                 "utterance discarded: nothing worth transcribing"
             );
         }
-        self.enqueue(session, audio, true);
+        self.enqueue(session, audio, true)
     }
 
-    /// Puts one piece of work at the end of the queue and gives it its number.
+    /// Puts one piece of work at the end of the queue and gives it its number —
+    /// or refuses it before any engine is asked.
+    ///
+    /// This is the **admission point** of the program: every piece of speech that
+    /// will be converted passes through here, mid-session chunks and the final
+    /// piece alike, so a budget checked anywhere else would either miss work or
+    /// check it too late. A refused job is not numbered, not queued and not
+    /// converted, and the caller is told so it can stop a recording that has
+    /// nowhere to put its text instead of speaking into a full budget.
+    ///
+    /// The ordered `None` event needs no *new* slot on purpose: it carries no
+    /// sound and no text, and blocking it would block the very event that lets a
+    /// session close. It is never refused — but it still **inherits** the slot
+    /// the recording claimed, because the promise made when the microphone
+    /// opened was always for this ending. Leaving it where it was kept a
+    /// reservation alive for text that will never come, and moving it onto the
+    /// ending is what makes "a reservation is released only when the work it
+    /// was made for has settled" true for the quiet case too.
     fn enqueue(
         &mut self,
         session: Option<SessionId>,
         audio: Option<AudioUtterance>,
         is_final: bool,
-    ) {
+    ) -> bool {
         let seq = self.next_seq;
+        if audio.is_some() {
+            if !self.admit(session, is_final, seq) {
+                let held = self.review.retention_len();
+                let cap = review::DraftStore::RETENTION_CAP;
+                tracing::warn!(
+                    session = session.map(|id| id.0),
+                    is_final,
+                    held,
+                    cap,
+                    "work refused before conversion: the retention budget is full"
+                );
+                self.capacity_notice.set(true);
+                self.show_error(capacity_stopped_recording_message(held, cap));
+                return false;
+            }
+        } else if is_final {
+            // The ordered closing event carries no sound, so it is never
+            // refused — but it still takes over the session's slot, or the
+            // promise made when the microphone opened would never settle.
+            self.inherit_session_slot(session, seq);
+        }
         self.next_seq += 1;
         // The last piece of a streamed session sits on the same seam as the
         // mid-session ones, so it takes the next chunk id of the same session:
@@ -1088,6 +1452,7 @@ impl<P: Port> Coordinator<P> {
             audio,
             is_final,
         });
+        true
     }
 
     /// Starts the next queued conversion, once the previous one is done.
@@ -1231,6 +1596,11 @@ impl<P: Port> Coordinator<P> {
                 reason,
                 "result dropped"
             );
+            // The work was admitted, so it holds a slot, and it produced nothing
+            // to keep: the slot goes back here. The late answer of a cancelled
+            // dictation is exactly this case, and it must cost one slot — the
+            // cancel already gave one back for the queued work it set aside.
+            self.release_slot(SlotHolder::Job(seq));
             return;
         }
 
@@ -1249,6 +1619,9 @@ impl<P: Port> Coordinator<P> {
             if owns {
                 self.show_error(format!("ASR failed: {error}"));
             }
+            // A failed conversion produces no text to keep: its slot is given
+            // back, or a run of failures would fill the budget with nothing.
+            self.release_slot(SlotHolder::Job(seq));
             self.settle(session, is_final, owns);
             return;
         }
@@ -1258,6 +1631,8 @@ impl<P: Port> Coordinator<P> {
         let (to_type_raw, backspaces) = match &plan {
             TypePlan::Skip(reason) => {
                 tracing::info!(seq, reason = reason.as_str(), "nothing to type");
+                // Nothing was typed and nothing is held, so the slot goes back.
+                self.release_slot(SlotHolder::Job(seq));
                 self.settle(session, is_final, owns);
                 return;
             }
@@ -1308,11 +1683,21 @@ impl<P: Port> Coordinator<P> {
         // user edited the text in between, the erase would delete their words.
         // So an approved insert is a plain type of whatever the box says.
         if review::should_hold(DraftKind::Review, self.review_enabled(target.as_ref())) {
+            // Raised with the **base** text, not the boundary-adjusted one. The
+            // separator belongs between this text and the document at the moment
+            // of insert, and a space baked in here would be a stale guess by the
+            // time the user presses «درج» — or by the time they have edited the
+            // text, which makes the guess wrong even if nothing else moved (F4).
             self.raise_draft(
+                // The slot this job was admitted under. Held text is what the
+                // promise was for, so the store is asked to convert it — never
+                // to make room it has already spent.
+                Some(SlotHolder::Job(seq)),
                 DraftKind::Review,
-                to_type.to_string(),
+                to_type_raw.to_string(),
                 target.clone(),
                 session,
+                None,
             );
             // `stitch` above has already advanced this session's seam memory,
             // and that memory is only true if the document took the text. It
@@ -1335,15 +1720,10 @@ impl<P: Port> Coordinator<P> {
         // before the first key, and asked **once**: re-asking between the erase
         // and the text would only widen the gap it is trying to close.
         //
-        // Two limits are stated rather than solved, because the code cannot
-        // close either of them:
-        //
-        // * the answer is about the **window**, not the text box inside it — one
-        //   window holds several typeable fields, and moving between two of them
-        //   is invisible here;
-        // * the gap between this answer and `SendInput` is real time, and the
-        //   user can spend it moving focus. That is the price of not stealing
-        //   focus back, which would be worse.
+        // Production restores the captured window and, when exposed, its
+        // native/accessibility focus. A caret retained by the application is
+        // still an application-level assumption. Focus can also move again
+        // between this final check and SendInput.
         let validity = match &target {
             Some(id) => self.desktop.check(id),
             // A dictation that captured no window has no destination, and "no
@@ -1393,12 +1773,20 @@ impl<P: Port> Coordinator<P> {
         // nothing and delete nothing. Leaving it behind would be the one way to
         // make this stage *eat the user's words*.
         if !outcome.is_whole() {
+            if validity.allows_insert() {
+                if let Some(target) = &target {
+                    self.desktop.invalidate_caret(target);
+                }
+            }
             self.forget_seam(session);
             self.forget_boundary();
         }
 
         match outcome {
             InjectOutcome::Complete { accepted_pairs } => {
+                if let Some(target) = &target {
+                    self.desktop.inserted(target);
+                }
                 tracing::info!(
                     seq,
                     accepted_pairs,
@@ -1406,6 +1794,8 @@ impl<P: Port> Coordinator<P> {
                 );
                 self.status.set_last_text(to_type.to_string());
                 self.record_boundary(to_type, session, target.clone());
+                // Typed, so nothing is held for it: the slot goes back.
+                self.release_slot(SlotHolder::Job(seq));
             }
             InjectOutcome::Partial { accepted_pairs } => {
                 // Reported, and **never re-sent**: the accepted half is already
@@ -1505,12 +1895,53 @@ impl<P: Port> Coordinator<P> {
     /// editable, and an edit the user made is a decision about what to type.
     async fn on_review(&mut self, command: ReviewCommand) {
         let command_id = command.id();
+
+        // The archive commands are handled **here**, with the loop's injected
+        // clock, rather than inside the store: `restore` has to restart a
+        // deadline, and the deadline must be the same testable clock that
+        // expiry uses.
+        match &command {
+            ReviewCommand::Restore { id } => {
+                match self.review.restore(*id, self.clock.now()) {
+                    Some(draft) => tracing::info!(
+                        archived_id = id,
+                        new_id = draft.id,
+                        "expired text restored for a fresh decision; nothing typed"
+                    ),
+                    None => tracing::info!(
+                        archived_id = id,
+                        "restore asked for text that is not archived; ignored"
+                    ),
+                }
+                return;
+            }
+            ReviewCommand::DiscardArchived { id } => {
+                if self.review.discard_archived(*id) {
+                    tracing::info!(
+                        archived_id = id,
+                        "archived text deleted at the user's request"
+                    );
+                } else {
+                    tracing::info!(
+                        archived_id = id,
+                        "delete asked for text that is not archived"
+                    );
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let source_record = self.review.source_record(command_id);
         match self.review.resolve(command) {
             // Nothing to do, and that is the whole handling. A duplicate click,
             // or an answer that arrived after the draft expired, must type
             // nothing at all — not "the same text again".
             ReviewOutcome::Stale => {
-                tracing::info!(id = command_id, "review answer for an unknown draft; ignored");
+                tracing::info!(
+                    id = command_id,
+                    "review answer for an unknown draft; ignored"
+                );
             }
             ReviewOutcome::Cancelled => {
                 tracing::info!(id = command_id, "draft discarded by the user");
@@ -1527,7 +1958,16 @@ impl<P: Port> Coordinator<P> {
                 self.forget_boundary();
             }
             ReviewOutcome::Insert { text, destination } => {
-                self.insert_reviewed(command_id, &text, destination).await;
+                self.insert_reviewed(command_id, &text, destination, source_record)
+                    .await;
+            }
+            // Handled above before the store was asked; reaching here means the
+            // answer was misrouted, and doing nothing is the honest response.
+            ReviewOutcome::Restored { .. } | ReviewOutcome::ArchivedDiscarded { .. } => {
+                tracing::warn!(
+                    id = command_id,
+                    "archive outcome reached the pending path; ignored"
+                );
             }
         }
     }
@@ -1539,6 +1979,7 @@ impl<P: Port> Coordinator<P> {
         id: u64,
         text: &str,
         destination: Option<TargetIdentity>,
+        source_record: Option<review::RecordIdentity>,
     ) {
         let validity = match &destination {
             Some(target) => self.desktop.check(target),
@@ -1546,6 +1987,10 @@ impl<P: Port> Coordinator<P> {
             // "any destination".
             None => TargetValidity::Unknown,
         };
+        // Hiding the review window alone was insufficient after an app switch.
+        // WindowTargets now restores the original destination and checks the
+        // actual foreground/accessibility focus; a failed restore still sends
+        // no keys and keeps the text.
         if !validity.allows_insert() {
             tracing::warn!(
                 id,
@@ -1556,23 +2001,70 @@ impl<P: Port> Coordinator<P> {
             // Raised again rather than dropped: the user asked for this text to
             // be typed, and losing it because they moved a window is exactly the
             // failure this feature exists to prevent. It comes back as
-            // `Undelivered` so it is offered regardless of the review setting.
-            self.raise_draft(DraftKind::Undelivered, text.to_string(), destination, None);
+            // `Undelivered` so it is offered regardless of the review setting,
+            // and it keeps its record identity so a later success retires the
+            // record it came from instead of clearing every record.
+            self.raise_draft(
+                // No slot: this text came out of a draft that had already
+                // released its own when the user resolved it. A refusal here
+                // does not lose it — `raise_draft` keeps it in the recovery
+                // records — which is the one path that can still be refused.
+                None,
+                DraftKind::Undelivered,
+                text.to_string(),
+                destination,
+                None,
+                source_record,
+            );
             return;
         }
 
-        let steps = self.deliver(text, 0);
+        // ── the boundary, computed **here**, at approval time (F4) ──────────
+        //
+        // From the text the user actually approved, against the document as it
+        // is *now*: minutes may have passed since the draft was raised and other
+        // text may have landed in between, so a separator decided at raise time
+        // would be a guess about a document that no longer exists. An edit the
+        // user made is the input, not the original.
+        let to_type = {
+            let boundary = self
+                .boundary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            boundary.apply(text, 0, &destination)
+        };
+
+        let steps = self.deliver(&to_type, 0);
         let outcome = judge_insert(&steps);
+        if !outcome.is_whole() {
+            if let Some(target) = &destination {
+                self.desktop.invalidate_caret(target);
+            }
+        }
         match outcome {
             InjectOutcome::Complete { accepted_pairs } => {
-                tracing::info!(
-                    id,
-                    accepted_pairs,
-                    "approved text accepted whole"
-                );
-                self.status.set_last_text(text.to_string());
-                self.record_boundary(text, None, destination);
-                self.clear_kept();
+                tracing::info!(id, accepted_pairs, "approved text accepted whole");
+                if let Some(target) = &destination {
+                    self.desktop.inserted(target);
+                }
+                self.status.set_last_text(to_type.clone());
+                self.record_boundary(&to_type, None, destination);
+                // Only the record this draft came from. Clearing the whole kept
+                // list here would delete text belonging to other drafts and
+                // other dictations — the failure this feature exists to prevent
+                // (F4). A review draft has no record, and then there is nothing
+                // to retire.
+                if let Some(identity) = source_record {
+                    if self.forget_kept_record(identity) {
+                        tracing::info!(
+                            id,
+                            session = identity.session.map(|s| s.0),
+                            chunk = identity.chunk.map(|c| c.0),
+                            seq = identity.seq,
+                            "the recovery record this draft came from is retired"
+                        );
+                    }
+                }
             }
             // Reported, never re-sent: the accepted half is already in the
             // document.
@@ -1585,8 +2077,8 @@ impl<P: Port> Coordinator<P> {
                 let record = KeptRecord {
                     session: None,
                     chunk: None,
-                    seq: 0,
-                    planned_text: text.to_string(),
+                    seq: self.next_kept_seq(),
+                    planned_text: to_type.clone(),
                     destination,
                     outcome,
                     backspace: None,
@@ -1602,59 +2094,240 @@ impl<P: Port> Coordinator<P> {
                 let record = KeptRecord {
                     session: None,
                     chunk: None,
-                    seq: 0,
-                    planned_text: text.to_string(),
+                    seq: self.next_kept_seq(),
+                    planned_text: to_type.clone(),
                     destination: destination.clone(),
                     outcome,
                     backspace: None,
                     text: steps.first().cloned(),
                 };
+                // The identity is taken **before** the record is moved into the
+                // list, so the re-offered draft points at exactly this record.
+                let identity = record.identity();
                 self.record_kept(record);
                 // Offered again immediately: the user is looking at a window
                 // with this text in it, and a silent failure would read as the
                 // app having ignored them.
-                self.raise_draft(DraftKind::Undelivered, text.to_string(), destination, None);
+                // No slot: this text came out of a draft that released its own
+                // when the user resolved it, and its record (`seq` above) is
+                // deliberately outside the job pipeline. The record already
+                // holds the text, so a refusal here loses nothing — it only
+                // re-offers what is kept either way.
+                self.raise_draft(
+                    None,
+                    DraftKind::Undelivered,
+                    to_type.clone(),
+                    destination,
+                    None,
+                    Some(identity),
+                );
                 self.show_error("injection failed: nothing was typed".to_string());
             }
         }
     }
 
-    /// Puts a draft up for a decision and says so in the log.
+    /// Puts a draft up for a decision, reports what happened, and returns it.
     ///
-    /// Returns nothing: the caller does not act on the draft, and the only
-    /// honest response to "there is now text waiting" is a log line naming it.
-    /// A caller that needed to know *whether* it was raised would have to
-    /// duplicate the store's own emptiness rule.
+    /// The report is **here** rather than at the call sites because the three
+    /// outcomes need three different words and only one place should own them:
+    /// text that is now waiting, text there was nothing to decide about, and text
+    /// the store refused to hold because it is already holding as much as it will
+    /// hold. The last one is the one the F3 finding was about — it is a
+    /// user-visible problem, said once per dictation, never once per loop turn.
+    ///
+    /// The returned outcome exists for callers that have to *act* on it and for
+    /// the loop's tests, which assert that a refusal is a refusal instead of
+    /// reading a log line.
+    /// Claims a capacity slot for work that is about to be accepted.
+    ///
+    /// `false` means there is no room, and the caller must refuse the work
+    /// **before it starts**: the microphone stays shut, the chunk is not queued,
+    /// no engine is asked. Accepting work whose text the app cannot keep is the
+    /// failure this whole path exists to prevent — a refusal *after* conversion
+    /// has already been spoken is a dropped dictation, however politely it is
+    /// reported.
+    fn claim_slot(&mut self, holder: SlotHolder) -> bool {
+        if !self.review.reserve() {
+            return false;
+        }
+        let fresh = self.slots.insert(holder);
+        debug_assert!(fresh, "a capacity slot was claimed twice for one holder");
+        true
+    }
+
+    /// Gives a claimed slot back. Exactly once, by construction: a holder that
+    /// has already given its slot back is no longer in the set, so the second
+    /// release — the cancel *and* the late answer it caused, say — finds nothing
+    /// to give and cannot hand one slot to two dictations.
+    fn release_slot(&mut self, holder: SlotHolder) -> bool {
+        if !self.slots.remove(&holder) {
+            return false;
+        }
+        self.review.release_reservation();
+        true
+    }
+
+    /// Hands a claimed slot to the text that work produced.
+    ///
+    /// The slot is **converted**, not released and re-claimed: the store turns
+    /// the promise into a held draft under its own lock, so the running total
+    /// never dips — which would let another dictation take the room — and never
+    /// exceeds the cap.
+    fn spend_slot(&mut self, holder: SlotHolder, draft: PendingDraft) -> review::RaiseOutcome {
+        let outcome = self.review.raise_reserved(draft);
+        match &outcome {
+            review::RaiseOutcome::Raised(_) => {
+                self.slots.remove(&holder);
+            }
+            // Nothing was stored, so the slot was never spent: give it back.
+            review::RaiseOutcome::NothingWorthOffering => {
+                self.release_slot(holder);
+            }
+            // The store saw no promise, so nothing was consumed. The holder
+            // keeps its claim and the caller decides what to keep — never a
+            // silent drop.
+            review::RaiseOutcome::RefusedAtCapacity { .. } => {}
+        }
+        outcome
+    }
+
+    /// Whether one piece of work is admitted, and under which slot.
+    ///
+    /// The final piece of a recording **takes over the session's slot** instead
+    /// of claiming a second one: the promise made when the microphone opened was
+    /// always for this text, and charging a session two slots for one final
+    /// draft would spend budget on nothing.
+    fn admit(&mut self, session: Option<SessionId>, is_final: bool, seq: u64) -> bool {
+        if is_final && self.inherit_session_slot(session, seq) {
+            return true;
+        }
+        self.claim_slot(SlotHolder::Job(seq))
+    }
+
+    /// Moves a recording's slot onto the job that will carry its ending.
+    ///
+    /// `false` means the recording held no slot to move — a microphone that
+    /// never opened, or text that has already been accounted for — and then
+    /// nothing is claimed here: the caller decides whether the piece needs a
+    /// fresh one. Nothing is ever *released* by this, which is what makes it
+    /// safe to call for an ending that cannot be refused.
+    fn inherit_session_slot(&mut self, session: Option<SessionId>, seq: u64) -> bool {
+        let Some(id) = session else {
+            return false;
+        };
+        if !self.slots.remove(&SlotHolder::Session(id)) {
+            return false;
+        }
+        self.slots.insert(SlotHolder::Job(seq));
+        true
+    }
+
+    /// Offers text for a decision, spending the slot that was claimed for it.
+    ///
+    /// `slot` is `Some` for text whose work was admitted (it holds a promise the
+    /// store is asked to convert) and `None` only for a raise that never claimed
+    /// one — a re-offer of text the user had already seen, whose own draft had
+    /// already given its slot back. That second case can be refused, and a
+    /// refusal there is handled without losing the text: see the arm below.
     fn raise_draft(
-        &self,
+        &mut self,
+        slot: Option<SlotHolder>,
         kind: DraftKind,
         text: String,
         destination: Option<TargetIdentity>,
         session: Option<SessionId>,
-    ) -> Option<PendingDraft> {
-        let raised = self.review.raise(PendingDraft {
+        source_record: Option<review::RecordIdentity>,
+    ) -> review::RaiseOutcome {
+        // Counted before the text is moved into the draft: a refusal has to be
+        // logged with a size, and never with the text itself.
+        let chars = text.chars().count();
+        // Whether the refused text still exists somewhere the user can reach it.
+        // It does when this draft came from a recovery record: that record is
+        // kept before the offer is made, so a refused re-offer loses nothing.
+        let record_kept = source_record.is_some();
+        // A raise that holds a slot cannot be refused — the slot was claimed for
+        // exactly this text. One that holds no slot can, and the store drops what
+        // it refuses, so that text is copied **before** it is handed over: this
+        // app never drops a dictation on the floor.
+        let fallback_destination = destination.clone();
+        let fallback_text = if slot.is_none() && !record_kept {
+            Some(text.clone())
+        } else {
+            None
+        };
+        let draft = PendingDraft {
             id: 0,
             kind,
             text,
             destination,
             session,
             raised: self.clock.now(),
-        });
-        if let Some(draft) = &raised {
-            tracing::info!(
-                id = draft.id,
-                kind = draft.kind.as_str(),
-                chars = draft.text.chars().count(),
-                destination = draft.destination.as_ref().map(|t| t.hwnd),
-                "text held for the user; nothing has been typed"
-            );
-        } else {
-            tracing::info!(
-                kind = kind.as_str(),
-                "nothing worth holding: there was no text to decide about"
-            );
+            source_record,
+        };
+        let outcome = match slot {
+            Some(holder) => self.spend_slot(holder, draft),
+            None => self.review.raise(draft),
+        };
+        match &outcome {
+            review::RaiseOutcome::Raised(draft) => {
+                tracing::info!(
+                    id = draft.id,
+                    kind = draft.kind.as_str(),
+                    chars = draft.text.chars().count(),
+                    destination = draft.destination.as_ref().map(|t| t.hwnd),
+                    "text held for the user; nothing has been typed"
+                );
+            }
+            review::RaiseOutcome::NothingWorthOffering => {
+                tracing::info!(
+                    kind = kind.as_str(),
+                    "nothing worth holding: there was no text to decide about"
+                );
+            }
+            review::RaiseOutcome::RefusedAtCapacity { held, cap } => {
+                // The refused text is **not** stored, and in review mode not
+                // typed either: a hold that was refused is not a decision anyone
+                // made, and typing it would be this app deciding on its own the
+                // one thing it never decides on its own. Said out loud, because
+                // the user is the only one who can free the space.
+                //
+                // Nothing is lost either. Work that was admitted holds a slot,
+                // so a refusal cannot be one of those; what reaches here is a
+                // raise that claimed no slot, and its text is put in the
+                // recovery records — the same place every other un-typed text
+                // goes — before the user is told which of the two happened.
+                let mut record_kept = record_kept;
+                if let Some(text) = fallback_text {
+                    self.record_kept(KeptRecord {
+                        session,
+                        chunk: None,
+                        seq: self.next_kept_seq(),
+                        planned_text: text,
+                        destination: fallback_destination,
+                        outcome: InjectOutcome::NotAttempted,
+                        backspace: None,
+                        text: None,
+                    });
+                    record_kept = true;
+                }
+                tracing::warn!(
+                    kind = kind.as_str(),
+                    chars,
+                    held,
+                    cap,
+                    kept = record_kept,
+                    "refused to hold more uninserted text: the retention budget is full"
+                );
+                self.capacity_notice.set(true);
+                self.show_error(capacity_message(*held, *cap, record_kept));
+            }
         }
-        raised
+        // The budget filling up is a **state**, not an event: said when it is
+        // reached rather than on every turn it lasts (F3). A refusal above has
+        // already said its own, different thing, so this finds the flag set and
+        // adds nothing.
+        self.note_capacity_state();
+        outcome
     }
 
     /// The sends of one insert, in the order they are made, and **nothing** when
@@ -1719,7 +2392,15 @@ impl<P: Port> Coordinator<P> {
                 let live = self.port.capture_live();
                 self.with_session(|s| s.note_capture_live(live));
                 if !live {
-                    self.status.set_state(AppState::Idle);
+                    // …and reported as `Idle`, **unless** the badge is already
+                    // carrying something the user has to read. A recording
+                    // stopped at the capacity limit put its explanation there a
+                    // moment ago; overwriting it with `Idle` would take the
+                    // explanation away before it could be read, which is the
+                    // same rule the ending below follows.
+                    if !is_transient(&self.status.snapshot().state) {
+                        self.status.set_state(AppState::Idle);
+                    }
                 }
             }
         }
@@ -1828,20 +2509,85 @@ impl<P: Port> Coordinator<P> {
     /// A loop event for the same reason the error windows are one: the clock
     /// says *when*, and only this loop may decide whether the draft it was armed
     /// for is still the one on offer. No background timer touches the store.
+    ///
+    /// Expiry revokes the **permission to insert**: the draft leaves the
+    /// answerable set, so a late answer or a second click finds nothing. It does
+    /// not delete the text — that moves to the in-memory archive, where the user
+    /// can read it, copy it, or bring it back for a fresh decision (F3). Neither
+    /// half depends on how much text is already held: the pass has no capacity
+    /// branch at all, because archiving moves text inside one budget instead of
+    /// adding to it.
+    ///
+    /// The log line this replaced said the text "is in the log and in history".
+    /// Neither half was true: the log held a character count, and the history is
+    /// the list of what was *typed*, which this text by definition was not. The
+    /// line now says where the text actually is.
+    ///
+    /// It reports the budget being full **once**, through
+    /// [`Self::note_capacity_state`], rather than on every turn it stays full:
+    /// the repeat-per-turn warning this replaced was both noise and, on a stale
+    /// deadline, an infinite loop.
     fn expire_drafts_due(&mut self) {
         let now = self.clock.now();
-        let expired = self.review.expire(now, self.draft_ttl());
-        for draft in &expired {
+        let outcome = self.review.expire(now, self.draft_ttl());
+        for archived in &outcome.archived {
             tracing::info!(
-                id = draft.id,
-                kind = draft.kind.as_str(),
-                chars = draft.text.chars().count(),
-                "draft expired unanswered; its text is in the log and in history"
+                id = archived.draft.id,
+                kind = archived.draft.kind.as_str(),
+                chars = archived.draft.text.chars().count(),
+                session = archived.draft.session.map(|s| s.0),
+                "draft expired unanswered; insert is no longer possible and its text is in the uninserted-text archive"
             );
         }
+        self.note_capacity_state();
+    }
+
+    /// Says that the app is holding as much uninserted text as it will hold,
+    /// **once** per time the budget fills.
+    ///
+    /// Edge-triggered, which is the whole point (F3). The state lasts for as long
+    /// as the user leaves the texts alone — many loop turns — and a warning shown
+    /// on every one of them stops being a warning; the previous version did
+    /// exactly that, on every expiry pass. The flag is cleared the moment text is
+    /// held again, so someone who frees room and fills it a second time is told
+    /// again rather than never.
+    ///
+    /// A refusal of *new* text is not routed through here: that is a fresh user
+    /// action with its own message, and [`Self::raise_draft`] says it directly.
+    fn note_capacity_state(&mut self) {
+        if !self.review.retention_is_full() {
+            self.capacity_notice.set(false);
+            return;
+        }
+        if self.capacity_notice.replace(true) {
+            // Already said, and nothing has changed since.
+            return;
+        }
+        let held = self.review.retention_len();
+        let cap = review::DraftStore::RETENTION_CAP;
+        tracing::warn!(
+            held,
+            cap,
+            "the uninserted-text budget is full; nothing held will be deleted to make room"
+        );
+        self.show_error(capacity_full_message(held, cap));
     }
 
     /// The soonest moment this loop has to wake up for a draft.
+    ///
+    /// A deadline that has already passed is returned again, and that is
+    /// deliberate: it is the only thing that makes the loop wake up and run the
+    /// expiry pass for it. "Do not wake on a processed deadline" is therefore
+    /// not solved here — filtering past deadlines out here would starve a draft
+    /// whose deadline passed between two turns, because nothing else would ever
+    /// fire for it. It is solved where the deadline is *processed*: expiry always
+    /// revokes the insert permission, at any capacity, so a draft that is due
+    /// after the pass cannot exist, and the next deadline this computes is a
+    /// moment that has not happened yet.
+    ///
+    /// That is what the spin was, and it was never the ask: with an archive-only
+    /// cap, a due draft the full archive could not take stayed answerable with a
+    /// deadline in the past, so the sleep returned at once, every turn, forever.
     fn next_draft_deadline(&self) -> Option<Instant> {
         let ttl = self.draft_ttl();
         self.review
@@ -1866,8 +2612,18 @@ impl<P: Port> Coordinator<P> {
     /// accepted boundary cannot be located the answer is `None` and **nothing
     /// is offered**: guessing there would produce duplicate text, which is
     /// worse than saying nothing.
-    fn recover_from(&self, record: &KeptRecord) {
-        self.record_kept(record.clone());
+    fn recover_from(&mut self, record: &KeptRecord) {
+        let identity = record.identity();
+        // Recorded by identity: a record that is already preserved for this
+        // exact insert is **not** pushed again. Without this, a recovery pass
+        // that runs twice for one insert would leave two records describing one
+        // problem, and a later success would have to guess which to retire.
+        if !self.record_kept(record.clone()) {
+            tracing::info!(
+                seq = record.seq,
+                "record already preserved for this insert; not duplicated"
+            );
+        }
         let Some(text) = record.unaccepted_text() else {
             tracing::warn!(
                 seq = record.seq,
@@ -1878,16 +2634,41 @@ impl<P: Port> Coordinator<P> {
         if text.is_empty() {
             return;
         }
+        // The slot the job was admitted under, if it still holds one. The text
+        // was produced by work that reserved a place for it, so that place is
+        // **converted** rather than asked for again — which is what makes a
+        // failure at a full budget keep the text instead of refusing it.
+        let holder = SlotHolder::Job(record.seq);
+        let slot = self.slots.contains(&holder).then_some(holder);
         self.raise_draft(
+            slot,
             DraftKind::Undelivered,
             text.to_string(),
             record.destination.clone(),
             record.session,
+            Some(identity),
         );
     }
 
+    /// A `seq` for a record created outside the job pipeline.
+    ///
+    /// Offset into a range no job can reach, so a review-path record's identity
+    /// is distinct from every pipeline one even though both use `(session,
+    /// chunk, seq)`.
+    fn next_kept_seq(&self) -> u64 {
+        1_000_000_000
+            + self
+                .kept_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Keeps an undelivered or action-needed text record in memory.
-    fn record_kept(&self, record: KeptRecord) {
+    ///
+    /// Returns `false` when a record with the same identity was already
+    /// preserved and no duplicate was added. Identity is `(session, chunk,
+    /// seq)` — the insert the record describes — so the same insert can be
+    /// recorded repeatedly without the list growing.
+    fn record_kept(&self, record: KeptRecord) -> bool {
         tracing::info!(
             session = record.session.map(|id| id.0),
             chunk = record.chunk.map(|c| c.0),
@@ -1895,22 +2676,32 @@ impl<P: Port> Coordinator<P> {
             outcome = ?record.outcome,
             "action-needed text record preserved in memory"
         );
-        self.kept
+        let identity = record.identity();
+        let mut kept = self
+            .kept
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(record);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.iter().any(|existing| existing.identity() == identity) {
+            return false;
+        }
+        kept.push(record);
+        true
     }
 
-    /// Drops every undelivered record.
+    /// Retires exactly one preserved record, named by identity.
     ///
-    /// Called after a text the user had been shown is finally typed: the record
-    /// described a problem that no longer exists, and leaving it would mean the
-    /// next recovery offers text that is already in the document.
-    fn clear_kept(&self) {
-        self.kept
+    /// Replaces the blanket clear that used to run after an approved insert:
+    /// that deleted text belonging to other drafts and other dictations, which
+    /// is the failure this whole feature exists to prevent. Returns whether a
+    /// record was actually removed.
+    fn forget_kept_record(&self, identity: review::RecordIdentity) -> bool {
+        let mut kept = self
+            .kept
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = kept.len();
+        kept.retain(|record| record.identity() != identity);
+        kept.len() != before
     }
 
     /// Drops one session's undelivered records on explicit cancellation.
@@ -1935,6 +2726,11 @@ impl<P: Port> Coordinator<P> {
             .collect();
         self.queue.retain(|job| job.session != session);
         self.skipped.extend(dropped.iter().copied());
+        // Work set aside before it ran never produced text, so every slot it was
+        // admitted under goes back — once per job, since each job has its own.
+        for seq in &dropped {
+            self.release_slot(SlotHolder::Job(*seq));
+        }
         if !dropped.is_empty() {
             tracing::info!(
                 session = session.map(|id| id.0),
@@ -1997,7 +2793,20 @@ impl<P: Port> Coordinator<P> {
                 AppState::Error(message) if *message == window.message
             );
         if still_active {
-            self.status.set_state(AppState::Idle);
+            // The *error* is over; the dictation may not be. Publishing Idle here
+            // turned the orb white, and stopped its blob, while the microphone
+            // was still live — the user read that as "the recording stopped",
+            // and their report of it is the reason this line asks the session
+            // instead of assuming. The log shows what they saw: a refused chunk
+            // raises this error, the window expires, and the *same* session
+            // produces two more chunks afterwards with nothing on screen to say
+            // it was still listening.
+            let recording = self.with_session(|s| s.is_recording());
+            self.status.set_state(if recording {
+                AppState::Recording
+            } else {
+                AppState::Idle
+            });
         }
     }
 
@@ -2483,6 +3292,8 @@ mod tests {
     /// `output::classify` with a scripted observation, exactly as the real
     /// `validate_target` calls it with a real one. Only the observation is fake.
     struct ScriptedDesktop {
+        caret_invalidations: std::sync::atomic::AtomicUsize,
+        restore_allowed: AtomicBool,
         /// The window the user is looking at. `None` is no foreground window at
         /// all: a locked desktop, or another session holding it.
         now: Mutex<Option<isize>>,
@@ -2506,6 +3317,8 @@ mod tests {
         fn new() -> Arc<Self> {
             let (seen, _rx) = watch::channel(Vec::new());
             Arc::new(Self {
+                caret_invalidations: std::sync::atomic::AtomicUsize::new(0),
+                restore_allowed: AtomicBool::new(false),
                 now: Mutex::new(Some(0x1000)),
                 title: Mutex::new(None),
                 alive: AtomicBool::new(true),
@@ -2576,6 +3389,9 @@ mod tests {
     }
 
     impl TargetPort for ScriptedDesktop {
+        fn invalidate_caret(&self, _expected: &TargetIdentity) {
+            self.caret_invalidations.fetch_add(1, Ordering::SeqCst);
+        }
         fn capture(&self) -> Option<TargetIdentity> {
             // One pid per handle: this fake has no process table, and the
             // production rule compares the handle *and* the process.
@@ -2591,12 +3407,17 @@ mod tests {
                 pid: hwnd as u32,
                 exe_path: self.exe.lock().unwrap().clone(),
                 title_at_capture: title,
+                focus_hwnd: None,
+                focus_element: None,
             };
             self.seen.send_modify(|seen| seen.push(id.clone()));
             Some(id)
         }
 
         fn check(&self, expected: &TargetIdentity) -> TargetValidity {
+            if self.restore_allowed.load(Ordering::SeqCst) && self.alive.load(Ordering::SeqCst) {
+                *self.now.lock().unwrap() = Some(expected.hwnd);
+            }
             let foreground = (*self.now.lock().unwrap()).map(|hwnd| (hwnd, hwnd as u32));
             crate::output::classify(
                 expected,
@@ -2788,6 +3609,88 @@ mod tests {
             .await
         }
 
+        /// Waits until at least `n` drafts are waiting, and returns the newest.
+        ///
+        /// The `n`-aware version of [`Self::wait_draft`], needed by any scenario
+        /// that has to know **how many** texts are on offer before it answers
+        /// one: two dictations whose second draft has not been raised yet look
+        /// identical to one dictation.
+        async fn wait_drafts(&self, n: usize) -> review::PendingDraft {
+            let review = self.review.clone();
+            within(PATIENCE, "the loop to hold text for the user", async {
+                loop {
+                    let mut changed = review.subscribe();
+                    let snapshot = review.snapshot();
+                    if snapshot.drafts.len() >= n {
+                        return snapshot.latest().cloned().expect("at least one");
+                    }
+                    changed.changed().await.expect("the wire outlives the loop");
+                }
+            })
+            .await
+        }
+
+        /// The expired drafts a user could currently read, copy or restore.
+        fn archived(&self) -> Vec<review::ArchivedDraft> {
+            self.review.snapshot().archived
+        }
+
+        /// Waits until at least `n` drafts have expired into the archive.
+        async fn wait_archived(&self, n: usize) {
+            let review = self.review.clone();
+            within(PATIENCE, "expired text to reach the archive", async {
+                loop {
+                    let mut changed = review.subscribe();
+                    if review.snapshot().archived.len() >= n {
+                        return;
+                    }
+                    changed.changed().await.expect("the wire outlives the loop");
+                }
+            })
+            .await
+        }
+
+        /// Waits until **exactly** `n` drafts are in the archive.
+        ///
+        /// The `==` form of [`Self::wait_archived`], for scenarios that free room:
+        /// "at least n" would accept the state they are trying to leave, so a test
+        /// that deletes one archived text has to wait for the deletion to have
+        /// landed before it asserts on what happens next.
+        async fn wait_archive_len(&self, n: usize) {
+            let review = self.review.clone();
+            within(PATIENCE, "the archive to reach the expected size", async {
+                loop {
+                    if review.snapshot().archived.len() == n {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        }
+
+        /// Waits until exactly `n` records are being kept.
+        ///
+        /// The deterministic form of "the record list should be shorter now":
+        /// `wait_ops` proves a key was sent, not that the bookkeeping which
+        /// follows the send has run, so a test that asserts on the list has to
+        /// wait for the list.
+        async fn wait_kept_len(&self, n: usize) {
+            within(
+                PATIENCE,
+                "the kept records to reach the expected count",
+                async {
+                    loop {
+                        if self.kept_records().len() == n {
+                            return;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                },
+            )
+            .await
+        }
+
         /// Waits until nothing is recorded as undelivered.
         ///
         /// The counterpart to [`Self::wait_ops`]: a keystroke and the bookkeeping
@@ -2865,7 +3768,15 @@ mod tests {
             engine: &Arc<ScriptedEngine>,
             clock: Arc<dyn Clock>,
         ) -> Self {
-            Self::start_scripted(port, discarded, engine, clock, false, Rig::ordinary(), false)
+            Self::start_scripted(
+                port,
+                discarded,
+                engine,
+                clock,
+                false,
+                Rig::ordinary(),
+                false,
+            )
         }
 
         /// The same, with the rig the destination and insert scenarios need.
@@ -2879,7 +3790,15 @@ mod tests {
             engine: &Arc<ScriptedEngine>,
             rig: Rig,
         ) -> Self {
-            Self::start_scripted(port, discarded, engine, Arc::new(SystemClock), false, rig, false)
+            Self::start_scripted(
+                port,
+                discarded,
+                engine,
+                Arc::new(SystemClock),
+                false,
+                rig,
+                false,
+            )
         }
 
         /// A loop whose *policy* the scenario wrote.
@@ -3306,6 +4225,43 @@ mod tests {
             "the cancelled dictation must not type anything at all"
         );
         h.quit().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn orb_toggle_records_until_the_second_click_despite_keyboard_release() {
+        let (h_port, discarded) = port(vec![], vec![ends(2)]);
+        let h_engine = engine(vec![Step::Text { samples: n(2), text: "کلیک دوم" }]);
+        let mut h = Harness::start(h_port, discarded, &h_engine);
+        h.event(HotkeyEvent::OrbToggle);
+        assert!(h.wait_for_state(|state| matches!(state, AppState::Recording)).await);
+        assert!(h.wait_for_latched(true).await);
+        h.event(HotkeyEvent::RecordUp);
+        h.event(HotkeyEvent::OrbToggle);
+        assert_eq!(h.ops_until(1).await, typed("کلیک دوم"));
+        h.quit().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_allowed_restore_inserts_into_the_session_destination_after_an_app_switch() {
+        let gate = Gate::new();
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = engine(vec![Step::Gated {
+            samples: n(1),
+            gate: gate.clone(),
+            text: "مقصد اولیه",
+        }]);
+        let desktop = ScriptedDesktop::new();
+        desktop.restore_allowed.store(true, Ordering::SeqCst);
+        let mut h = Harness::start_rig(h_port, discarded, &h_engine,
+            Rig::with(desktop.clone(), Platform::default()));
+        h.event(HotkeyEvent::RecordDown);
+        h.event(HotkeyEvent::RecordUp);
+        gate.wait_arrived();
+        desktop.moved_to(0x2000);
+        gate.open();
+        assert_eq!(h.ops_until(1).await, typed("مقصد اولیه"));
+        h.quit().await;
+        assert_eq!(*desktop.now.lock().unwrap(), Some(0x1000));
     }
 
     // ── 3. cancel while the engine is working (the gap this stage is about) ─
@@ -4090,7 +5046,12 @@ mod tests {
         // The second window closes in its own turn, and *that* one may clear.
         clock.advance(ERROR_READABLE + std::time::Duration::from_secs(1));
         clock.wait_asked(|asked| asked.last() == Some(&None)).await;
-        assert_eq!(h.state(), AppState::Idle);
+        // The error left the badge — and because this dictation was never
+        // stopped (there is no `RecordUp` above), the badge has to show the
+        // dictation. `Idle` here is exactly what the user read as "the recording
+        // stopped": an orb gone white over a live microphone, which is the
+        // report that changed `on_error_expired`.
+        assert_eq!(h.state(), AppState::Recording);
         h.quit().await;
     }
 
@@ -4399,7 +5360,14 @@ mod tests {
         // The second window closes in its own turn, and that one may clear.
         clock.advance(ERROR_READABLE + std::time::Duration::from_secs(1));
         clock.wait_asked(|asked| asked.last() == Some(&None)).await;
-        assert_eq!(h.state(), AppState::Idle, "the active error did not clear");
+        // Cleared — and the dictation that is still running (no `RecordUp`
+        // above) is what the badge has to show. Asserting `Idle` here would
+        // pin the orb-white-over-a-live-microphone bug the user reported.
+        assert_eq!(
+            h.state(),
+            AppState::Recording,
+            "the active error did not clear, or it cleared the dictation with it"
+        );
         h.quit().await;
     }
 
@@ -5024,6 +5992,8 @@ mod tests {
         assert_eq!(records.len(), 2);
 
         // Record 0: Failed
+        assert_eq!(desktop.caret_invalidations.load(Ordering::SeqCst), 2,
+            "failed and partial sends must both abandon the pre-insertion caret");
         assert_eq!(records[0].outcome, InjectOutcome::Failed);
         assert!(records[0].is_wholly_undelivered());
         assert_eq!(records[0].planned_text, "شکست کامل");
@@ -5968,7 +6938,15 @@ mod tests {
         engine: &Arc<ScriptedEngine>,
         rig: Rig,
     ) -> Harness {
-        Harness::start_scripted(port, discarded, engine, Arc::new(SystemClock), false, rig, true)
+        Harness::start_scripted(
+            port,
+            discarded,
+            engine,
+            Arc::new(SystemClock),
+            false,
+            rig,
+            true,
+        )
     }
 
     /// One dictation, spoken and released, against `desktop`.
@@ -5979,9 +6957,77 @@ mod tests {
         h.wait_draft().await
     }
 
+    /// One dictation, waiting for the `nth` captured window and the `nth` draft.
+    ///
+    /// The single-dictation helper above cannot be used twice in a row: its
+    /// `wait_captured(1)` is already satisfied by the first dictation, so the
+    /// second one would release the key before the loop had captured anything.
+    async fn dictate_nth(
+        h: &Harness,
+        desktop: &Arc<ScriptedDesktop>,
+        nth: usize,
+    ) -> review::PendingDraft {
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(nth).await;
+        h.event(HotkeyEvent::RecordUp);
+        h.wait_drafts(nth).await
+    }
+
+    /// Waits for the pending draft holding exactly `text`, and hands it back.
+    ///
+    /// Needed whenever the store already holds other text: [`Harness::wait_drafts`]
+    /// counts drafts, so a scenario that filled the budget directly would find its
+    /// count satisfied by the filler and sail past the moment it meant to wait
+    /// for. The text is the identity here because the scenario wrote it.
+    async fn wait_draft_text(h: &Harness, text: &str) -> review::PendingDraft {
+        let review = h.review.clone();
+        within(PATIENCE, "the dictated text to be held", async {
+            loop {
+                if let Some(draft) = review
+                    .snapshot()
+                    .drafts
+                    .into_iter()
+                    .find(|d| d.text == text)
+                {
+                    return draft;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    /// Waits for the pending draft whose text **contains** `marker`.
+    ///
+    /// The `contains` form of [`wait_draft_text`], for scenarios whose
+    /// dictations share one window: the boundary rule can legitimately put a
+    /// separator in front of the text, and that separator is not what the
+    /// scenario is asserting about. The marker is still the scenario's own
+    /// words, so it cannot match a draft the scenario did not mean.
+    async fn wait_draft_containing(h: &Harness, marker: &str) -> review::PendingDraft {
+        let review = h.review.clone();
+        within(PATIENCE, "the dictated text to be held", async {
+            loop {
+                if let Some(draft) = review
+                    .snapshot()
+                    .drafts
+                    .into_iter()
+                    .find(|d| d.text.contains(marker))
+                {
+                    return draft;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
     /// An engine that answers every utterance with the same words.
     fn one_utterance(text: &'static str) -> Arc<ScriptedEngine> {
-        engine(vec![Step::Text { samples: n(1), text }])
+        engine(vec![Step::Text {
+            samples: n(1),
+            text,
+        }])
     }
 
     /// The headline rule: a finished dictation types **nothing** until the user
@@ -6037,6 +7083,47 @@ mod tests {
             "the edit is what gets typed, not the original"
         );
         assert!(h.drafts().is_empty(), "an answered draft is done");
+
+        h.quit().await;
+    }
+
+    // ── what a click on «درج» is judged against ──────────────────────────
+    //
+    // The user's report was "the insert button does not work, only copy does".
+    // The cause was not the loop: pressing a button in the review window makes
+    // *that* window the one in front, so a check that only accepts a destination
+    // already in front refused every attempt — the log from their own test is a
+    // row of `validity=Changed` with the same text re-offered four times. What
+    // the panel does about it, and the two refusals it must still make, are
+    // pinned below and in `gui::overlay::review_panel`'s own tests.
+
+    /// A destination that is still the window in front is typed into, with the
+    /// window and process rules unchanged: this is the ordinary case, and it is
+    /// the one the fix has to leave alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_approved_text_into_a_live_destination_still_types() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance("سلام دنیا");
+        let desktop = ScriptedDesktop::new();
+        let mut h = reviewing(
+            h_port,
+            discarded,
+            &h_engine,
+            Rig::with(desktop.clone(), Platform::default()),
+        );
+
+        let draft = dictate_once(&h, &desktop).await;
+        h.answer(review::ReviewCommand::Insert {
+            id: draft.id,
+            text: draft.text.clone(),
+        });
+
+        within(PATIENCE, "the approved text to be typed", h.wait_ops(1)).await;
+        assert_eq!(h.seen.borrow().clone(), typed("سلام دنیا"));
+        assert!(
+            h.drafts().is_empty(),
+            "the text was delivered, not re-offered"
+        );
 
         h.quit().await;
     }
@@ -6177,6 +7264,871 @@ mod tests {
         h.quit().await;
     }
 
+    // ── F4: the separator belongs to the moment of insert ────────────────
+
+    /// Two drafts are waiting before either is answered. The second must take
+    /// its separator from the boundary the **first insert** created, computed at
+    /// approval time — not from the boundary that existed when it was raised.
+    ///
+    /// This is the scenario the finding named. Before the change, the second
+    /// draft was boundary-adjusted *at raise time*, when nothing had been typed
+    /// yet, so it typed `دوم` with no separator even though `اول` was by then in
+    /// the document. The assertion below is on the **whole** `TextSink` output,
+    /// which is what makes it a statement about what the user's document
+    /// receives rather than about a string in a panel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_draft_takes_its_space_from_the_boundary_the_first_insert_made() {
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(2)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "اول",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "دوم",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = reviewing(
+            h_port,
+            discarded,
+            &h_engine,
+            Rig::with(desktop.clone(), Platform::default()),
+        );
+
+        // Two dictations, in order, before either is answered.
+        let first = dictate_nth(&h, &desktop, 1).await;
+        let second = dictate_nth(&h, &desktop, 2).await;
+        assert_eq!(first.text, "اول");
+        assert_eq!(second.text, "دوم");
+        assert_eq!(h.drafts().len(), 2, "both drafts are waiting");
+        assert!(
+            h.seen.borrow().is_empty(),
+            "nothing may be typed before a decision"
+        );
+
+        // The older one first: it lands at the start of the document, so it
+        // gets no separator at all.
+        h.answer(review::ReviewCommand::Insert {
+            id: first.id,
+            text: first.text.clone(),
+        });
+        within(
+            PATIENCE,
+            "the first approved text to be typed",
+            h.wait_ops(1),
+        )
+        .await;
+        h.wait_resolved(first.id).await;
+
+        // The newer one: it must pick up the space the first insert established.
+        h.answer(review::ReviewCommand::Insert {
+            id: second.id,
+            text: second.text.clone(),
+        });
+        within(
+            PATIENCE,
+            "the second approved text to be typed",
+            h.wait_ops(2),
+        )
+        .await;
+
+        assert_eq!(
+            h.seen.borrow().clone(),
+            vec![Op::Type("اول".to_string()), Op::Type(" دوم".to_string())],
+            "the second draft's separator must be computed at approval time, from the boundary the first insert made"
+        );
+
+        h.quit().await;
+    }
+
+    /// A success retires **its own** recovery record, and nothing else.
+    ///
+    /// Two dictations had their insert refused, so two records are being kept.
+    /// Approving one must leave the other alone: the blanket clear this
+    /// replaced deleted both, which is text the user never got back. Both the
+    /// count and the surviving text are asserted, because deleting the *wrong*
+    /// record would satisfy a count-only check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_success_retires_only_its_own_record() {
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(2)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "اولی",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "دومی",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_rig(
+            h_port,
+            discarded,
+            &h_engine,
+            Rig::with(desktop.clone(), Platform::default()),
+        );
+
+        // First dictation: captured in the original window, then the user looks
+        // away while the engine works.
+        h.event(HotkeyEvent::RecordDown);
+        let captured = desktop.wait_captured(1).await;
+        let origin = captured[0].hwnd;
+        desktop.moved_to(0x9999);
+        h.event(HotkeyEvent::RecordUp);
+        let first = h.wait_draft().await;
+
+        // And again, before answering anything. The capture has to happen in the
+        // **original** window — a dictation captured after the focus moved is a
+        // dictation addressed to wherever it moved to, and its insert would be
+        // allowed.
+        desktop.moved_to(origin);
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(2).await;
+        desktop.moved_to(0x9999);
+        h.event(HotkeyEvent::RecordUp);
+        let second = h.wait_drafts(2).await;
+
+        assert_ne!(first.id, second.id, "two decisions, two drafts");
+        assert_eq!(
+            h.kept_records().len(),
+            2,
+            "one record per refused insert, both still the user's"
+        );
+
+        // The user comes back and approves the newer one.
+        desktop.moved_to(origin);
+        h.answer(review::ReviewCommand::Insert {
+            id: second.id,
+            text: second.text.clone(),
+        });
+        within(PATIENCE, "the recovered text to be typed", h.wait_ops(1)).await;
+
+        // The keystroke and the bookkeeping that retires the record are two
+        // moments: waiting for the first and reading the second would be a race,
+        // which is exactly how this passed alone and failed in a full run.
+        h.wait_kept_len(1).await;
+        let kept = h.kept_records();
+        assert_eq!(
+            kept.len(),
+            1,
+            "only the answered draft's record may be retired: {kept:?}"
+        );
+        assert_eq!(
+            kept[0].planned_text, "اولی",
+            "the unrelated text is still the user's to recover"
+        );
+        assert_eq!(h.seen.borrow().clone(), typed("دومی"));
+
+        h.quit().await;
+    }
+
+    /// Waits for a pending draft that is not `answered`: the re-offer a refused
+    /// or failed approval produces.
+    ///
+    /// Waiting on a **different** id is the point. Reading "the newest draft"
+    /// straight after answering would race the loop and find the one that is
+    /// still pending until the answer is handled.
+    async fn wait_re_offer(h: &Harness, answered: u64) -> review::PendingDraft {
+        let review = h.review.clone();
+        within(PATIENCE, "the text to be offered again", async {
+            loop {
+                if let Some(draft) = review
+                    .snapshot()
+                    .drafts
+                    .into_iter()
+                    .find(|d| d.id != answered)
+                {
+                    return draft;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    /// F4: an edited text — newline and all — never reaches a window the draft
+    /// was not dictated into, and never one with no window at all.
+    ///
+    /// Both refusals are the same rule seen twice: the destination is re-checked
+    /// when the user approves, against the window that was captured when the
+    /// recording started, and "somewhere else" and "nowhere" are both not it.
+    /// Zero sends, and the text comes back as the user's — the edit included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_edited_draft_with_a_newline_is_not_typed_into_a_window_that_moved() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance("متن");
+        let desktop = ScriptedDesktop::new();
+        let h = reviewing(
+            h_port,
+            discarded,
+            &h_engine,
+            Rig::with(desktop.clone(), Platform::default()),
+        );
+
+        let draft = dictate_once(&h, &desktop).await;
+
+        // The user edits the text — the newline makes it more than one keystroke
+        // long, which is where a "resend the rest" bug would show up — and then
+        // clicks into another application while the window is open.
+        let edited = "خط اول\nخط دوم".to_string();
+        desktop.moved_to(0x9999);
+
+        h.answer(review::ReviewCommand::Insert {
+            id: draft.id,
+            text: edited.clone(),
+        });
+
+        let again = wait_re_offer(&h, draft.id).await;
+        assert_eq!(again.kind, DraftKind::Undelivered);
+        assert_eq!(
+            again.text, edited,
+            "the edit is what was preserved, not the original dictation"
+        );
+        assert!(
+            h.seen.borrow().is_empty(),
+            "focus moved; not one key may be sent: {:?}",
+            h.seen.borrow()
+        );
+
+        // And with no window in front at all: also not a destination.
+        desktop.went_dark();
+        h.answer(review::ReviewCommand::Insert {
+            id: again.id,
+            text: again.text.clone(),
+        });
+        let third = wait_re_offer(&h, again.id).await;
+        assert_eq!(third.text, edited);
+        assert!(
+            h.seen.borrow().is_empty(),
+            "no destination is not any destination: {:?}",
+            h.seen.borrow()
+        );
+
+        h.quit().await;
+    }
+
+    /// F4: a **partial** approval is reported and never repeated.
+    ///
+    /// The accepted half is already in the document, so typing it again would
+    /// double it. What did not land is recorded — and only it: the records of
+    /// other refusals are the user's text too, and one failure is not a reason to
+    /// delete them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partial_approval_is_not_re_sent_and_keeps_its_own_record() {
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(2)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "اولی",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "دومی",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        // The keyboard takes two events of the approved text and then stops,
+        // which is the shape `SendInput` reports when another window takes over
+        // in the middle of a send.
+        let mut h = Harness::start_rig(
+            h_port,
+            discarded,
+            &h_engine,
+            Rig::with(
+                desktop.clone(),
+                Platform {
+                    types: vec![Accept::Then(2)],
+                    ..Platform::default()
+                },
+            ),
+        );
+
+        // Two dictations, both refused because the user looked away: two records
+        // that have nothing to do with the approval below.
+        h.event(HotkeyEvent::RecordDown);
+        let captured = desktop.wait_captured(1).await;
+        let origin = captured[0].hwnd;
+        desktop.moved_to(0x9999);
+        h.event(HotkeyEvent::RecordUp);
+        let first = h.wait_draft().await;
+
+        desktop.moved_to(origin);
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(2).await;
+        desktop.moved_to(0x9999);
+        h.event(HotkeyEvent::RecordUp);
+        let second = h.wait_drafts(2).await;
+        h.wait_kept_len(2).await;
+
+        // The user comes back and approves the newer one.
+        desktop.moved_to(origin);
+        h.answer(review::ReviewCommand::Insert {
+            id: second.id,
+            text: second.text.clone(),
+        });
+
+        // The send happened once, and the loop then reports it as incomplete.
+        // Waiting for the **badge** is the barrier, not the keystroke: the send
+        // and the bookkeeping that follows it are two moments, and a test that
+        // reads the second right after the first is racing the loop — which is
+        // how this passed alone and failed in a full run.
+        within(PATIENCE, "the partial send to be attempted", h.wait_ops(1)).await;
+        assert!(
+            h.wait_for_state(|state| matches!(
+                state,
+                AppState::Error(message) if message.contains("not re-sent")
+            ))
+            .await,
+            "the user has to be told it was incomplete rather than complete"
+        );
+        h.tick();
+        h.tick();
+        assert_eq!(
+            h.seen.borrow().clone(),
+            typed("دومی"),
+            "a partial insert must never be sent again: {:?}",
+            h.seen.borrow()
+        );
+
+        // Its own record is kept; the two unrelated ones are untouched.
+        h.wait_kept_len(3).await;
+        let kept = h.kept_records();
+        assert_eq!(
+            kept.len(),
+            3,
+            "the partial insert records what did not land: {kept:?}"
+        );
+        assert_eq!(
+            kept.iter().filter(|r| r.planned_text == "اولی").count(),
+            1,
+            "the unrelated dictation is still recoverable: {kept:?}"
+        );
+        let partial = kept
+            .iter()
+            .find(|r| matches!(r.outcome, InjectOutcome::Partial { .. }))
+            .expect("the partial send is recorded as one");
+        assert_eq!(partial.planned_text, "دومی");
+        assert!(
+            partial.seq >= 1_000_000_000,
+            "it is a record of the approval path, not of a conversion"
+        );
+
+        // The older draft is still on offer; the answered one is not.
+        assert_eq!(h.drafts().len(), 1);
+        assert_eq!(h.drafts()[0].id, first.id);
+
+        h.quit().await;
+        assert_eq!(desktop.caret_invalidations.load(Ordering::SeqCst), 1,
+            "partial approval must also abandon its pre-insertion caret");
+    }
+
+    /// F4: a failed approval keeps the text, and its retry types it **once**.
+    ///
+    /// The keyboard refuses the whole send, which is the case a user actually
+    /// meets: `SendInput` fails outright in front of a higher-privilege window.
+    /// Nothing was typed, so nothing may be dropped — and the retry has to be the
+    /// user's decision, not an automatic replay that would double the text the
+    /// first attempt did land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_approval_is_kept_and_its_retry_types_the_text_once() {
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance("متن مهم");
+        let desktop = ScriptedDesktop::new();
+        let mut h = reviewing(
+            h_port,
+            discarded,
+            &h_engine,
+            Rig::with(
+                desktop.clone(),
+                Platform {
+                    // First approval: every event refused. The retry: accepted
+                    // whole.
+                    types: vec![Accept::None, Accept::All],
+                    ..Platform::default()
+                },
+            ),
+        );
+
+        let draft = dictate_once(&h, &desktop).await;
+        h.answer(review::ReviewCommand::Insert {
+            id: draft.id,
+            text: draft.text.clone(),
+        });
+
+        // The attempt is in the log — the sink writes down what it was *asked*
+        // for — and it was accepted by nobody.
+        within(PATIENCE, "the failed send to be attempted", h.wait_ops(1)).await;
+        h.wait_kept_len(1).await;
+        let kept = h.kept_records();
+        assert_eq!(
+            kept.len(),
+            1,
+            "nothing was typed, so nothing may be dropped: {kept:?}"
+        );
+        assert_eq!(kept[0].planned_text, "متن مهم");
+        assert!(
+            !matches!(kept[0].outcome, InjectOutcome::Complete { .. }),
+            "a failed send must not be recorded as delivered"
+        );
+        assert_eq!(
+            h.drafts().len(),
+            1,
+            "the text is offered again: {:?}",
+            h.drafts()
+        );
+        assert_eq!(
+            h.drafts()[0].kind,
+            DraftKind::Undelivered,
+            "a failure is not a review request"
+        );
+
+        // The retry, through the same rule the first attempt ran under.
+        let again = wait_re_offer(&h, draft.id).await;
+        h.answer(review::ReviewCommand::Insert {
+            id: again.id,
+            text: again.text.clone(),
+        });
+        within(PATIENCE, "the retry to be typed", h.wait_ops(2)).await;
+        h.wait_nothing_kept().await;
+
+        // Exactly two sends: one per attempt, and no automatic replay of either.
+        assert_eq!(
+            h.seen.borrow().clone(),
+            vec![
+                Op::Type("متن مهم".to_string()),
+                Op::Type("متن مهم".to_string())
+            ],
+            "the retry types the text once, with no automatic resend: {:?}",
+            h.seen.borrow()
+        );
+        assert!(
+            h.drafts().is_empty(),
+            "a delivered text is not offered again"
+        );
+
+        h.quit().await;
+    }
+
+    /// F4: the separator is never baked into the text the user is shown.
+    ///
+    /// A space decided when the draft was raised is a guess about a document,
+    /// and by the time someone presses «درج» — after an edit, after another
+    /// insert — it is a guess about a document that no longer exists. So the
+    /// draft holds the base text, and the **edited** text still gets exactly one
+    /// separator, added at the moment of insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_edited_second_draft_gets_one_separator_at_insert_time_and_none_in_its_text() {
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(2)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "اول",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "دوم",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = reviewing(
+            h_port,
+            discarded,
+            &h_engine,
+            Rig::with(desktop.clone(), Platform::default()),
+        );
+
+        let first = dictate_nth(&h, &desktop, 1).await;
+        let second = dictate_nth(&h, &desktop, 2).await;
+        assert_eq!(first.text, "اول");
+        assert_eq!(
+            second.text, "دوم",
+            "the raised text must not carry a separator that belongs to the insert"
+        );
+
+        // The first insert lands at the start of the document: no separator.
+        h.answer(review::ReviewCommand::Insert {
+            id: first.id,
+            text: first.text.clone(),
+        });
+        within(
+            PATIENCE,
+            "the first approved text to be typed",
+            h.wait_ops(1),
+        )
+        .await;
+
+        // The second is edited before it is approved. The separator is computed
+        // from the **edit**, and exactly once.
+        h.answer(review::ReviewCommand::Insert {
+            id: second.id,
+            text: "دوم ویرایش شد".into(),
+        });
+        within(PATIENCE, "the edited text to be typed", h.wait_ops(2)).await;
+
+        assert_eq!(
+            h.seen.borrow().clone(),
+            vec![
+                Op::Type("اول".to_string()),
+                Op::Type(" دوم ویرایش شد".to_string()),
+            ],
+            "one separator, added at insert time, over the text the user approved"
+        );
+
+        h.quit().await;
+    }
+
+    // ── F3: a deadline revokes the insert, not the text ──────────────────
+
+    /// Past the deadline the app will not insert the text on its own, and the
+    /// text moves to the archive instead of disappearing. A late answer types
+    /// nothing; a deliberate restore brings it back for a fresh decision, and
+    /// **that** insert works.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_expired_draft_cannot_be_inserted_but_its_text_is_recoverable() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = one_utterance("سلام دنیا");
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        let draft = dictate_once(&h, &desktop).await;
+        assert!(h.seen.borrow().is_empty());
+
+        // Time passes with nobody answering. The loop expires on its own
+        // injected clock — no test drives the expiry stage by hand.
+        clock.advance(review::DEFAULT_DRAFT_TTL + std::time::Duration::from_secs(5));
+        h.wait_archived(1).await;
+
+        assert!(
+            h.drafts().is_empty(),
+            "the deadline revokes the permission to insert"
+        );
+        let archived = h.archived();
+        assert_eq!(
+            archived[0].draft.text, "سلام دنیا",
+            "and the text must not be lost"
+        );
+        assert_eq!(
+            archived[0].draft.id, draft.id,
+            "the id is kept, not recycled"
+        );
+        assert_eq!(archived[0].draft.kind, DraftKind::Review);
+        assert!(
+            archived[0].draft.destination.is_some(),
+            "the destination it was dictated into is kept with it"
+        );
+
+        // A late answer to the old id types nothing — and neither does a fresh
+        // dictation sent alongside it to give the loop turns.
+        h.answer(review::ReviewCommand::Insert {
+            id: draft.id,
+            text: draft.text.clone(),
+        });
+        h.event(HotkeyEvent::RecordDown);
+        h.event(HotkeyEvent::RecordUp);
+        assert!(
+            h.seen.borrow().is_empty(),
+            "an expired draft must not be insertable by a late answer: {:?}",
+            h.seen.borrow()
+        );
+
+        // The user brings it back on purpose, and only then can it be typed.
+        h.answer(review::ReviewCommand::Restore {
+            id: archived[0].draft.id,
+        });
+        let restored = h.wait_drafts(1).await;
+        assert_ne!(restored.id, draft.id, "recovery is a fresh decision");
+        assert_eq!(restored.text, "سلام دنیا");
+        assert!(h.archived().is_empty(), "it is not in two places at once");
+
+        h.answer(review::ReviewCommand::Insert {
+            id: restored.id,
+            text: restored.text.clone(),
+        });
+        within(PATIENCE, "the restored text to be typed", h.wait_ops(1)).await;
+        assert_eq!(h.seen.borrow().clone(), typed("سلام دنیا"));
+
+        h.quit().await;
+    }
+
+    /// F3 at the budget: a full store revokes every deadline, keeps every text,
+    /// refuses new text out loud, frees room when the user names one text — and
+    /// then **waits** instead of spinning on a deadline it has already handled.
+    ///
+    /// Four properties in one scenario because they are one behaviour: what
+    /// happens at the cap. The filler is raised straight through the channel the
+    /// loop reads, so the test does not need sixty-four dictations to reach the
+    /// state; the two dictations at the end are real, so "a rejected dictation
+    /// types nothing" is a statement about the loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_full_budget_revokes_every_deadline_keeps_every_text_and_waits() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(2), ends(3)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "اول",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "دوم",
+            },
+            Step::Text {
+                samples: n(3),
+                text: "تازه",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        // Sixty-two texts are already waiting, so the two real dictations are
+        // the ones that fill the budget exactly.
+        let now = clock.now();
+        for i in 0..review::DraftStore::RETENTION_CAP - 2 {
+            let outcome = h.review.raise(review::PendingDraft {
+                id: 0,
+                kind: DraftKind::Review,
+                text: format!("پر {i}"),
+                destination: None,
+                session: None,
+                raised: now,
+                source_record: None,
+            });
+            assert!(
+                matches!(outcome, review::RaiseOutcome::Raised(_)),
+                "the filler must fit: {outcome:?}"
+            );
+        }
+
+        let mut dictated = Vec::new();
+        for (nth, text) in [(1usize, "اول"), (2, "دوم")] {
+            h.event(HotkeyEvent::RecordDown);
+            desktop.wait_captured(nth).await;
+            h.event(HotkeyEvent::RecordUp);
+            dictated.push(wait_draft_text(&h, text).await);
+        }
+        assert!(h.review.retention_is_full(), "the budget is exactly full");
+        assert!(
+            h.seen.borrow().is_empty(),
+            "nothing may be typed before a decision"
+        );
+
+        // Nobody answers. The deadline passes on the injected clock, and the
+        // loop — not the test — decides that the drafts are due.
+        clock.advance(review::DEFAULT_DRAFT_TTL + std::time::Duration::from_secs(5));
+        h.wait_archived(review::DraftStore::RETENTION_CAP).await;
+
+        // 1. The permission to insert is revoked at the cap…
+        assert!(
+            h.drafts().is_empty(),
+            "no draft may stay answerable past its deadline"
+        );
+        // 2. …and every text is still there, the dictated ones included.
+        let archived = h.archived();
+        assert_eq!(archived.len(), review::DraftStore::RETENTION_CAP);
+        for draft in &dictated {
+            assert!(
+                archived
+                    .iter()
+                    .any(|a| a.draft.id == draft.id && a.draft.text == draft.text),
+                "the text of draft {} must be kept",
+                draft.id
+            );
+        }
+        assert_eq!(
+            h.review.retention_len(),
+            review::DraftStore::RETENTION_CAP,
+            "expiry kept the budget where it was"
+        );
+
+        // 3. A late answer to either id types nothing — and so does a fresh
+        //    dictation sent alongside it to give the loop turns.
+        for draft in &dictated {
+            h.answer(review::ReviewCommand::Insert {
+                id: draft.id,
+                text: draft.text.clone(),
+            });
+        }
+        h.tick();
+        h.tick();
+        assert!(
+            h.seen.borrow().is_empty(),
+            "an expired draft must not be insertable by a late answer: {:?}",
+            h.seen.borrow()
+        );
+
+        // 4. The capacity problem is not re-reported every turn: once its
+        //    readable window has closed it stays closed, and the turns the loop
+        //    is given afterwards must not bring it back.
+        clock.advance(ERROR_READABLE + std::time::Duration::from_secs(1));
+        assert!(
+            h.wait_for_state(|state| matches!(state, AppState::Idle))
+                .await,
+            "the badge must return to Idle once the notice has been read"
+        );
+
+        // 5. And the loop is **waiting**: nothing to expire, nothing to type, and
+        //    nothing to wake up for. Every turn after this point asks the clock
+        //    for exactly that — `None` — never for a moment that has already
+        //    passed, which is what a loop re-waking on a processed deadline would
+        //    ask for. The turns are driven by hand and *waited* for, so the
+        //    assertion is about their answers rather than about their timing.
+        let before = clock.asked().len();
+        clock.wait_asked(|asked| asked.last() == Some(&None)).await;
+        h.tick();
+        h.tick();
+        h.tick();
+        clock.wait_asked(|asked| asked.len() >= before + 3).await;
+        assert!(
+            !matches!(h.state(), AppState::Error(_)),
+            "the capacity problem was reported again on a later turn: {:?}",
+            h.state()
+        );
+        let asked = clock.asked();
+        let since_parked = &asked[before.min(asked.len())..];
+        assert!(
+            since_parked.iter().all(|deadline| deadline.is_none()),
+            "the loop asked to be woken at a moment that has already passed: {asked:?}"
+        );
+
+        // 6. Room is freed the way the finding demands — by naming one text, with
+        //    nothing deleted on the user's behalf and no new text sacrificed.
+        let victim = h.archived()[0].draft.id;
+        h.answer(review::ReviewCommand::DiscardArchived { id: victim });
+        h.wait_archive_len(review::DraftStore::RETENTION_CAP - 1)
+            .await;
+        assert!(!h.review.retention_is_full(), "one deletion freed the room");
+
+        // 7. So the next dictation is held again — and the loop asks to be woken
+        //    at a moment that has **not** passed.
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(3).await;
+        h.event(HotkeyEvent::RecordUp);
+        let fresh = wait_draft_text(&h, "تازه").await;
+        assert_eq!(fresh.kind, DraftKind::Review);
+        clock
+            .wait_asked(|asked| matches!(asked.last(), Some(Some(at)) if *at > clock.now()))
+            .await;
+        assert!(
+            h.seen.borrow().is_empty(),
+            "a held draft still types nothing"
+        );
+
+        h.quit().await;
+    }
+
+    /// F3: the capacity notice is **edge-triggered** — said when the budget
+    /// fills, and not on the passes that follow while it stays full.
+    ///
+    /// The repeat this replaces was not cosmetic: with a due draft the full
+    /// archive could not take, every turn re-expired, re-logged and re-reported
+    /// it, because the moment it was sleeping until had already passed. Here the
+    /// budget is full, time keeps passing, a further expiry pass runs — and the
+    /// badge has to stay quiet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_capacity_notice_is_not_repeated_on_every_expiry_pass() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![]);
+        let h_engine = engine(vec![]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        // The budget is full the moment the loop's pass moves these texts into
+        // the archive. Raising them through the channel keeps this scenario about
+        // the passes rather than about sixty-four dictations.
+        let now = clock.now();
+        for i in 0..review::DraftStore::RETENTION_CAP {
+            let outcome = h.review.raise(review::PendingDraft {
+                id: 0,
+                kind: DraftKind::Review,
+                text: format!("متن {i}"),
+                destination: None,
+                session: None,
+                raised: now,
+                source_record: None,
+            });
+            assert!(
+                matches!(outcome, review::RaiseOutcome::Raised(_)),
+                "the filler must fit: {outcome:?}"
+            );
+        }
+
+        // Give the loop a turn so its next wake-up includes what was just raised,
+        // and **wait** for that ask: advancing the clock before it would make the
+        // deadline relative to the new time and this scenario would then be
+        // waiting for a moment that never comes.
+        h.tick();
+        clock
+            .wait_asked(|asked| matches!(asked.last(), Some(Some(at)) if *at > clock.now()))
+            .await;
+
+        clock.advance(review::DEFAULT_DRAFT_TTL + std::time::Duration::from_secs(1));
+        h.wait_archived(review::DraftStore::RETENTION_CAP).await;
+
+        // Said when the budget filled — once.
+        assert!(
+            h.wait_for_state(|state| matches!(
+                state,
+                AppState::Error(message) if message.contains("uninserted-text limit reached")
+            ))
+            .await,
+            "the user has to be told the budget is full: {:?}",
+            h.state()
+        );
+        // The loop is now **parked on the notice's own window**: its last ask is a
+        // moment that has not passed. Waiting for that — rather than for the
+        // archive count, which is visible *inside* the pass — is what makes the
+        // check below about the pass that follows rather than about this one.
+        clock
+            .wait_asked(|asked| matches!(asked.last(), Some(Some(at)) if *at > clock.now()))
+            .await;
+        let before_passes = clock.asked().len();
+
+        // Now time moves on with the budget still full. The notice's window has
+        // closed, and the pass that runs next must not open another one: a second
+        // report would set the badge to `Error` inside that very pass.
+        clock.advance(ERROR_READABLE + std::time::Duration::from_secs(30));
+        clock.wait_asked(|asked| asked.len() > before_passes).await;
+        assert!(
+            matches!(h.state(), AppState::Idle),
+            "the capacity problem was reported again on a later pass: {:?}",
+            h.state()
+        );
+
+        // And after that there is nothing left to wait for at all, which is the
+        // loop saying so: no deadline, so no further pass, so no further report.
+        clock.wait_asked(|asked| asked.last() == Some(&None)).await;
+
+        h.quit().await;
+    }
+
     /// Approving while the user is looking at a *different* window must not
     /// type there. Review mode has to be at least as careful as direct mode.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6254,7 +8206,8 @@ mod tests {
             h.drafts()
         );
         assert_eq!(
-            h.drafts()[0].id, first.id,
+            h.drafts()[0].id,
+            first.id,
             "and it must be that first dictation's, untouched by the cancel"
         );
 
@@ -6288,6 +8241,913 @@ mod tests {
 
         h.quit().await;
     }
+
+    // ── F3: work is admitted only if its text can be kept ────────────────
+    //
+    // Checking the budget only where text is *stored* is one step too late: the
+    // dictation has been spoken, converted, and offered — and a refusal there
+    // throws away a sentence the user really said. These scenarios are the other
+    // half of the policy: a slot is claimed when work is **accepted** (the
+    // microphone opens, a chunk is queued), so the text that work produces is
+    // stored by converting a promise the budget already counted, and work that
+    // cannot be admitted never starts at all.
+
+    /// Fills the budget with texts that are nobody's dictation, so a scenario
+    /// can put the real thing at an exact distance from the cap.
+    fn fill_budget(h: &Harness, count: usize, now: Instant) {
+        for i in 0..count {
+            let outcome = h.review.raise(review::PendingDraft {
+                id: 0,
+                kind: DraftKind::Review,
+                text: format!("پر {i}"),
+                destination: None,
+                session: None,
+                raised: now,
+                source_record: None,
+            });
+            assert!(
+                matches!(outcome, review::RaiseOutcome::Raised(_)),
+                "the filler must fit: {outcome:?}"
+            );
+        }
+    }
+
+    /// Waits for the loop's promises to settle at exactly `n`.
+    ///
+    /// Polling rather than waiting on a notification, and deliberately so: a
+    /// reservation is the loop's own bookkeeping and bumps no revision, so a
+    /// watcher that only woke on other people's changes would be asserting a
+    /// race. Bounded by [`PATIENCE`], and it never sleeps — it yields.
+    async fn wait_reserved(h: &Harness, n: usize) {
+        let review = h.review.clone();
+        within(PATIENCE, "the promised slots to settle", async move {
+            while review.reserved() != n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    /// The headline of this policy: at a full budget the dictation is refused
+    /// **before it starts** — the microphone never opens, no engine is asked —
+    /// instead of being recorded and then having its text dropped.
+    #[tokio::test]
+    async fn a_full_budget_refuses_to_start_a_recording() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = engine(vec![Step::Text {
+            samples: n(1),
+            text: "دیر شده",
+        }]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        fill_budget(&h, review::DraftStore::RETENTION_CAP, clock.now());
+        assert!(h.review.retention_is_full(), "the budget is full");
+
+        h.event(HotkeyEvent::RecordDown);
+        // The refusal is a message, not a silence: the user has to know why
+        // nothing happened, and that nothing was lost either.
+        assert!(
+            h.wait_for_state(
+                |state| matches!(state, AppState::Error(message) if message.contains("not started"))
+            )
+            .await,
+            "the refusal has to say the dictation did not start"
+        );
+        assert_eq!(h.review.reserved(), 0, "a refused start claims no slot");
+        assert_eq!(
+            h.review.retention_len(),
+            review::DraftStore::RETENTION_CAP,
+            "and the budget is left exactly as it was"
+        );
+
+        // The key release has nothing to finish: no text, nothing typed, no
+        // draft, and no promise left behind.
+        h.event(HotkeyEvent::RecordUp);
+        h.tick();
+        wait_reserved(&h, 0).await;
+        assert_eq!(
+            h.drafts().len(),
+            review::DraftStore::RETENTION_CAP,
+            "the texts that were already held, and nothing else"
+        );
+        assert!(
+            h.drafts().iter().all(|d| !d.text.contains("دیر شده")),
+            "a start that never happened cannot hold text"
+        );
+        assert!(h.seen.borrow().is_empty(), "nothing may be typed");
+        assert_eq!(h.review.reserved(), 0);
+
+        h.quit().await;
+    }
+
+    /// One slot is offered once. The work that claimed it keeps its text, and a
+    /// second piece of work is refused rather than promising the same slot twice.
+    #[tokio::test]
+    async fn one_free_slot_is_not_handed_out_twice() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![ends(1), ends(2)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "تنها",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "دوم",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        let now = clock.now();
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 2, now);
+        assert_eq!(h.review.retention_room(), 2, "exactly two slots left");
+
+        // The first dictation claims one of them when the microphone opens.
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        assert_eq!(h.review.reserved(), 1, "the recording holds the slot");
+
+        // A text arrives while it is still recording: it takes the **other**
+        // slot, and now there is none left at all.
+        fill_budget(&h, 1, now);
+        assert_eq!(h.review.retention_room(), 0, "the last slot is spent");
+
+        h.event(HotkeyEvent::RecordUp);
+        let first = wait_draft_text(&h, "تنها").await;
+        assert_eq!(first.kind, DraftKind::Review);
+        wait_reserved(&h, 0).await;
+
+        // The same slot is not offered to a second dictation: the first one's
+        // text is what it was for, and that is where it went.
+        h.event(HotkeyEvent::RecordDown);
+        assert!(
+            h.wait_for_state(
+                |state| matches!(state, AppState::Error(message) if message.contains("not started"))
+            )
+            .await,
+            "with the budget full the second dictation must not start"
+        );
+        assert_eq!(h.review.reserved(), 0, "and it claims nothing");
+        assert_eq!(
+            h.drafts()
+                .iter()
+                .filter(|d| d.text.contains("تنها"))
+                .count(),
+            1,
+            "exactly one dictation produced text"
+        );
+        assert!(
+            h.drafts().iter().all(|d| !d.text.contains("دوم")),
+            "the refused dictation's text cannot exist: it never started"
+        );
+
+        h.quit().await;
+    }
+
+    /// The budget fills **while** an accepted dictation is still being
+    /// converted. Its text still has somewhere to go — the promise made when the
+    /// microphone opened — so it is held rather than refused.
+    #[tokio::test]
+    async fn text_of_work_accepted_before_the_budget_filled_is_kept() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = engine(vec![Step::Text {
+            samples: n(1),
+            text: "مهم‌ترین",
+        }]);
+        let desktop = ScriptedDesktop::new();
+        let h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        let now = clock.now();
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 2, now);
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        assert_eq!(h.review.reserved(), 1, "the accepted work holds its slot");
+
+        // One more text arrives; the promise is counted against the budget, so
+        // this is the last one that fits and the next is refused out loud.
+        fill_budget(&h, 1, now);
+        assert_eq!(
+            h.review.retention_room(),
+            0,
+            "the promise spent the last slot"
+        );
+        let extra = h.review.raise(review::PendingDraft {
+            id: 0,
+            kind: DraftKind::Review,
+            text: "زیادی".into(),
+            destination: None,
+            session: None,
+            raised: now,
+            source_record: None,
+        });
+        assert!(
+            matches!(extra, review::RaiseOutcome::RefusedAtCapacity { .. }),
+            "the promise is counted against the budget: {extra:?}"
+        );
+
+        // The accepted dictation still lands, at a budget the store already
+        // considers full.
+        h.event(HotkeyEvent::RecordUp);
+        let draft = wait_draft_text(&h, "مهم‌ترین").await;
+        assert_eq!(draft.kind, DraftKind::Review);
+        assert!(h.review.retention_is_full());
+        assert_eq!(
+            h.review.retention_len(),
+            review::DraftStore::RETENTION_CAP,
+            "the promise was converted, not spent twice"
+        );
+        wait_reserved(&h, 0).await;
+
+        h.quit().await;
+    }
+
+    /// A long dictation keeps producing pieces. Every piece that was admitted
+    /// survives: a budget checked only when the microphone opened would have
+    /// taken work it could not keep, and dropped the text of it.
+    #[tokio::test]
+    async fn a_continuous_recording_never_loses_an_admitted_chunk() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![chunk(1), chunk(2)], vec![ends(3)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "یک",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "دو",
+            },
+            Step::Text {
+                samples: n(3),
+                text: "سه",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        // Room for exactly three pieces: two chunks and the ending.
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 3, clock.now());
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.tick();
+        h.tick();
+        h.event(HotkeyEvent::RecordUp);
+
+        // Three texts, all of them the user's. Each is asked for by name, so a
+        // missing piece cannot hide behind the others.
+        for text in ["یک", "دو", "سه"] {
+            let draft = wait_draft_text(&h, text).await;
+            assert!(
+                draft.text.contains(text),
+                "the piece the user spoke must be the piece on offer: {draft:?}"
+            );
+        }
+        assert_eq!(
+            h.drafts().len(),
+            review::DraftStore::RETENTION_CAP,
+            "the texts that were already held, plus the three pieces"
+        );
+        assert_eq!(
+            h.review.retention_len(),
+            review::DraftStore::RETENTION_CAP,
+            "three pieces, three slots, and the budget exactly full"
+        );
+        wait_reserved(&h, 0).await;
+        assert!(
+            h.seen.borrow().is_empty(),
+            "nothing is typed in review mode"
+        );
+
+        h.quit().await;
+    }
+
+    /// A direct insert that fails at a full budget still keeps its text: the
+    /// slot the dictation was admitted under becomes the recovery draft, instead
+    /// of being refused because the budget is full.
+    #[tokio::test]
+    async fn a_failed_direct_insert_at_full_capacity_keeps_the_text() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = engine(vec![Step::Text {
+            samples: n(1),
+            text: "متن مهم",
+        }]);
+        let desktop = ScriptedDesktop::new();
+        // Review is **off**: this dictation goes straight at the document, and
+        // the platform takes nothing.
+        let h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(
+                desktop.clone(),
+                Platform {
+                    types: vec![Accept::None],
+                    ..Platform::default()
+                },
+            ),
+            false,
+        );
+
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 1, clock.now());
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        assert_eq!(h.review.reserved(), 1, "accepted, so the slot is claimed");
+        h.event(HotkeyEvent::RecordUp);
+
+        let draft = wait_draft_text(&h, "متن مهم").await;
+        assert_eq!(
+            draft.kind,
+            DraftKind::Undelivered,
+            "a failed insert is a recovery, not a review request"
+        );
+        h.wait_kept_len(1).await;
+        assert_eq!(h.kept_records()[0].planned_text, "متن مهم");
+        assert!(h.review.retention_is_full());
+        wait_reserved(&h, 0).await;
+        assert_eq!(
+            h.review.retention_len(),
+            review::DraftStore::RETENTION_CAP,
+            "the recovery took the slot the dictation was admitted under"
+        );
+
+        h.quit().await;
+    }
+
+    /// Cancel and the late answer it causes cost **one** slot, not two: the
+    /// release is keyed by holder, so the second one finds nothing to give back.
+    #[tokio::test]
+    async fn a_cancel_and_a_late_answer_release_the_slot_once() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![chunk(1)], vec![ends(2)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "لغو شده",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "هرگز گفته نشد",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        let held = review::DraftStore::RETENTION_CAP - 2;
+        fill_budget(&h, held, clock.now());
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        // A chunk is admitted, so there is work in flight as well as a
+        // recording — both holding a slot when the cancel lands.
+        h.tick();
+
+        h.event(HotkeyEvent::Cancel);
+        h.tick();
+        wait_reserved(&h, 0).await;
+
+        assert_eq!(
+            h.review.reserved(),
+            0,
+            "a cancel and its late answer must not double-release"
+        );
+        assert_eq!(
+            h.review.retention_room(),
+            review::DraftStore::RETENTION_CAP - held,
+            "both slots came back, each exactly once"
+        );
+        assert!(
+            h.drafts().iter().all(|d| !d.text.contains("لغو شده")),
+            "the cancelled text is not offered"
+        );
+        assert!(h.seen.borrow().is_empty(), "and nothing was typed");
+
+        h.quit().await;
+    }
+
+    /// Freeing a slot makes the next dictation possible again — and the press
+    /// that was refused consumed nothing on the way.
+    #[tokio::test]
+    async fn freeing_a_slot_lets_a_recording_start_again() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![], vec![ends(1)]);
+        let h_engine = engine(vec![Step::Text {
+            samples: n(1),
+            text: "بعد از آزادسازی",
+        }]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        fill_budget(&h, review::DraftStore::RETENTION_CAP, clock.now());
+        h.event(HotkeyEvent::RecordDown);
+        assert!(
+            h.wait_for_state(
+                |state| matches!(state, AppState::Error(message) if message.contains("not started"))
+            )
+            .await,
+            "a full budget refuses the start"
+        );
+        h.event(HotkeyEvent::RecordUp);
+
+        // Everything that was waiting is now the user's to read, keep or delete.
+        clock.advance(std::time::Duration::from_secs(3600));
+        h.tick();
+        h.wait_archived(review::DraftStore::RETENTION_CAP).await;
+        assert!(
+            h.drafts().is_empty(),
+            "the archive is what the user can browse"
+        );
+
+        let victim = h.archived()[0].draft.id;
+        h.answer(review::ReviewCommand::DiscardArchived { id: victim });
+        h.wait_archive_len(review::DraftStore::RETENTION_CAP - 1)
+            .await;
+
+        // The refused press never reached the microphone: the **single**
+        // scripted ending is still waiting, and this dictation is the one that
+        // spends it.
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.event(HotkeyEvent::RecordUp);
+        let draft = wait_draft_text(&h, "بعد از آزادسازی").await;
+        assert_eq!(draft.kind, DraftKind::Review);
+        assert_eq!(
+            h.review.retention_len(),
+            review::DraftStore::RETENTION_CAP,
+            "the freed slot is spent on a dictation that really ran"
+        );
+        wait_reserved(&h, 0).await;
+
+        h.quit().await;
+    }
+
+    // ── F3: a stop at the limit is not a cancel ───────────────────────────
+    //
+    // A recording whose next piece could not be admitted is *stopped*, not
+    // abandoned. Every piece already accepted was accepted on the promise that
+    // its text would be kept, so those pieces, the drafts they became and the
+    // records they left must all still be there afterwards — and the session
+    // they belong to must stay valid until they have settled, or the results
+    // this path exists to preserve would be refused as the late answers of a
+    // session nobody closed. An explicit cancel is the other policy, and these
+    // scenarios keep the two side by side so neither can drift into the other.
+
+    /// The finding: a recording stopped because its next piece did not fit is
+    /// **not** a dictation the user cancelled.
+    ///
+    /// Two pieces are accepted — one already inside the engine, held there by
+    /// the gate, which is what makes "in flight" a fact rather than timing —
+    /// and one waiting in the queue — and the third is refused at the limit.
+    /// The microphone closes, and both accepted pieces must still become the
+    /// user's text, in the order they were spoken. Routing this through
+    /// `discard_session`, the cancel path, marked the session `Cancelled`, set
+    /// its queue aside and forgot its drafts, which deleted exactly this work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_capacity_stop_keeps_the_work_it_already_accepted() {
+        let clock = Arc::new(ManualClock::new());
+        let gate = Gate::new();
+        let (h_port, discarded) = port(vec![chunk(1), chunk(2), chunk(3)], vec![ends(4)]);
+        let h_engine = engine(vec![
+            Step::Gated {
+                samples: n(1),
+                gate: gate.clone(),
+                text: "پذیرفتهٔ نخست",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "پذیرفتهٔ دوم",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        // Room for the ending and the two pieces that fit; the third piece is
+        // the one the budget refuses.
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 3, clock.now());
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.tick(); // chunk 1 is admitted, and its conversion parks at the gate
+        gate.wait_arrived();
+        h.tick(); // chunk 2 is admitted behind it, still unconverted
+        h.tick(); // chunk 3 cannot be admitted: the recording is stopped
+
+        assert!(
+            h.wait_for_state(|state| matches!(
+                state,
+                AppState::Error(message) if message.contains("recording was stopped")
+            ))
+            .await,
+            "a stop the user did not ask for has to say why"
+        );
+
+        // Only now does the engine answer the piece it was holding.
+        gate.open();
+
+        wait_draft_text(&h, "پذیرفتهٔ نخست").await;
+        wait_draft_text(&h, "پذیرفتهٔ دوم").await;
+
+        // …in the order they were spoken, which is the order of the queue.
+        let texts: Vec<String> = h.drafts().into_iter().map(|d| d.text).collect();
+        let first = texts
+            .iter()
+            .position(|t| t == "پذیرفتهٔ نخست")
+            .expect("the first accepted piece");
+        let second = texts
+            .iter()
+            .position(|t| t == "پذیرفتهٔ دوم")
+            .expect("the second accepted piece");
+        assert!(first < second, "the queue order was not kept: {texts:?}");
+
+        // Every promise settled: two became held text, and the ending — which
+        // carried no sound — gave its own back instead of leaking it.
+        wait_reserved(&h, 0).await;
+        assert_eq!(
+            h.review.retention_len(),
+            review::DraftStore::RETENTION_CAP - 1,
+            "the texts that were already held, plus the two accepted pieces"
+        );
+        assert!(
+            h.seen.borrow().is_empty(),
+            "nothing is typed in review mode"
+        );
+
+        // The explanation outlives the work behind it: the accepted chunk
+        // settling must not put the badge back to Idle on top of it.
+        assert!(
+            matches!(h.state(), AppState::Error(message) if message.contains("recording was stopped")),
+            "the stop's explanation was hidden before it could be read: {:?}",
+            h.state()
+        );
+
+        h.quit().await;
+    }
+
+    /// A draft that was already on offer when the recording was stopped is
+    /// still the user's to approve, and approving it still types it: the stop
+    /// refuses *new* work, it does not retract a decision already in front of
+    /// them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_capacity_stop_leaves_a_ready_draft_answerable() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![chunk(1), chunk(2)], vec![]);
+        let h_engine = engine(vec![Step::Text {
+            samples: n(1),
+            text: "پیش‌نویس آماده",
+        }]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        // The held draft takes the last room there is, so the next piece has
+        // nowhere to go.
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 2, clock.now());
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.tick(); // chunk 1 is admitted and converted into a held draft
+        let ready = wait_draft_text(&h, "پیش‌نویس آماده").await;
+        h.tick(); // chunk 2 is refused at the limit: the recording is stopped
+
+        assert!(
+            h.wait_for_state(|state| matches!(
+                state,
+                AppState::Error(message) if message.contains("recording was stopped")
+            ))
+            .await,
+            "the stop has to say why the recording ended"
+        );
+        wait_reserved(&h, 0).await;
+
+        // Still on offer, still answerable — and approving it still types it.
+        assert!(
+            h.drafts().iter().any(|d| d.id == ready.id),
+            "the stop took away a text the user was already deciding about"
+        );
+        assert!(
+            matches!(h.state(), AppState::Error(message) if message.contains("recording was stopped")),
+            "the stop's explanation was hidden before it could be read: {:?}",
+            h.state()
+        );
+        h.answer(review::ReviewCommand::Insert {
+            id: ready.id,
+            text: ready.text.clone(),
+        });
+        let ops = h.wait_ops(1).await;
+        assert!(
+            matches!(&ops[0], Op::Type(text) if text.contains("پیش‌نویس آماده")),
+            "the approved text was not typed: {ops:?}"
+        );
+
+        h.quit().await;
+    }
+
+    /// The text of an insert that failed is preserved as a recovery record, and
+    /// a stop at the limit does not clear it: that record belongs to work the
+    /// app accepted, and the stop is about work it would not take.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_capacity_stop_leaves_an_undelivered_record_recoverable() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![chunk(1), chunk(2)], vec![]);
+        let h_engine = engine(vec![Step::Text {
+            samples: n(1),
+            text: "متن نگه‌داشته",
+        }]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(
+                desktop.clone(),
+                Platform {
+                    types: vec![Accept::None],
+                    ..Platform::default()
+                },
+            ),
+            false,
+        );
+
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 2, clock.now());
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.tick(); // chunk 1 is admitted, and its insert is refused by the platform
+        let kept = wait_draft_text(&h, "متن نگه‌داشته").await;
+        assert_eq!(kept.kind, DraftKind::Undelivered);
+        h.wait_kept_len(1).await;
+
+        h.tick(); // chunk 2 is refused at the limit: the recording is stopped
+        assert!(
+            h.wait_for_state(|state| matches!(
+                state,
+                AppState::Error(message) if message.contains("recording was stopped")
+            ))
+            .await,
+            "the stop has to say why the recording ended"
+        );
+        wait_reserved(&h, 0).await;
+
+        let records = h.kept_records();
+        assert_eq!(records.len(), 1, "the recovery record was thrown away");
+        assert_eq!(records[0].planned_text, "متن نگه‌داشته");
+        assert!(
+            h.drafts().iter().any(|d| d.text == "متن نگه‌داشته"),
+            "the text of the record is no longer in front of the user"
+        );
+
+        h.quit().await;
+    }
+
+    /// The other half of the same scenario, and the reason the two paths are
+    /// separate: an **explicit** cancel still throws the dictation away. The
+    /// accepted chunk's late answer is refused, the queued chunk never runs,
+    /// and neither is offered to the user.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_explicit_cancel_still_throws_the_accepted_work_away() {
+        let clock = Arc::new(ManualClock::new());
+        let gate = Gate::new();
+        let (h_port, discarded) = port(vec![chunk(1), chunk(2)], vec![ends(3)]);
+        let h_engine = engine(vec![
+            Step::Gated {
+                samples: n(1),
+                gate: gate.clone(),
+                text: "لغو شده",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "هرگز گفته نشد",
+            },
+            Step::Text {
+                samples: n(3),
+                text: "بعد از لغو",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(desktop.clone(), Platform::default()),
+            true,
+        );
+
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 3, clock.now());
+
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.tick(); // chunk 1 is admitted and parked at the gate
+        gate.wait_arrived();
+        h.tick(); // chunk 2 waits in the queue
+
+        // The user abandons the dictation while the engine is still working,
+        // and the barrier says so: the cancel has reached the hardware before
+        // the engine is allowed to answer.
+        h.event(HotkeyEvent::Cancel);
+        h.discarded().await;
+        gate.open();
+
+        // A later dictation is the barrier for the answer itself: its text can
+        // only be held after everything ordered before it has been dealt with,
+        // so seeing it proves the cancelled answer was **dropped**, not merely
+        // still on its way.
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(2).await;
+        h.event(HotkeyEvent::RecordUp);
+        wait_draft_text(&h, "بعد از لغو").await;
+
+        wait_reserved(&h, 0).await;
+        assert!(
+            h.drafts()
+                .iter()
+                .all(|d| !d.text.contains("لغو شده") && !d.text.contains("هرگز")),
+            "a cancelled dictation offered text"
+        );
+        assert_eq!(
+            h.drafts().len(),
+            review::DraftStore::RETENTION_CAP - 2,
+            "only the filler texts and the later dictation are on offer"
+        );
+        assert!(
+            h.seen.borrow().is_empty(),
+            "nothing is typed in review mode"
+        );
+
+        h.quit().await;
+    }
+
+    /// A stop belongs to the session that ran out of room. Another dictation's
+    /// text — held or kept — is not the stopped session's to lose, which is why
+    /// the work of one session is named by its id everywhere the stop path
+    /// touches it. This is the scenario that would catch a "clear it all"
+    /// shortcut in that path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_capacity_stop_leaves_another_sessions_texts_alone() {
+        let clock = Arc::new(ManualClock::new());
+        let (h_port, discarded) = port(vec![chunk(1), chunk(3), chunk(4)], vec![ends(2)]);
+        let h_engine = engine(vec![
+            Step::Text {
+                samples: n(1),
+                text: "متن الف",
+            },
+            Step::Text {
+                samples: n(2),
+                text: "پایان الف",
+            },
+            Step::Text {
+                samples: n(3),
+                text: "متن ب",
+            },
+        ]);
+        let desktop = ScriptedDesktop::new();
+        let mut h = Harness::start_scripted(
+            h_port,
+            discarded,
+            &h_engine,
+            clock.clone(),
+            false,
+            Rig::with(
+                desktop.clone(),
+                Platform {
+                    // One answer per send, in order: session A's piece is
+                    // refused (leaving a record behind), A's ending is taken
+                    // (so A settles cleanly), and session B's accepted piece is
+                    // refused too.
+                    types: vec![Accept::None, Accept::All, Accept::None],
+                    ..Platform::default()
+                },
+            ),
+            false,
+        );
+
+        fill_budget(&h, review::DraftStore::RETENTION_CAP - 3, clock.now());
+
+        // Session A: one piece whose insert the platform refuses, then its
+        // ending, which the platform takes.
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(1).await;
+        h.tick();
+        wait_draft_containing(&h, "متن الف").await;
+        h.event(HotkeyEvent::RecordUp);
+        h.wait_ops(1).await;
+        // A is settled — its ending spent the slot it was admitted under — and
+        // only then does the next dictation start.
+        wait_reserved(&h, 0).await;
+
+        // Session B runs out of room on its second piece.
+        h.event(HotkeyEvent::RecordDown);
+        desktop.wait_captured(2).await;
+        h.tick();
+        wait_draft_containing(&h, "متن ب").await;
+        h.tick();
+
+        assert!(
+            h.wait_for_state(|state| matches!(
+                state,
+                AppState::Error(message) if message.contains("recording was stopped")
+            ))
+            .await,
+            "the stop has to say why the recording ended"
+        );
+        wait_reserved(&h, 0).await;
+
+        let records = h.kept_records();
+        assert!(
+            records.iter().any(|r| r.planned_text.contains("متن الف")),
+            "the stop took another session's recovery record: {:?}",
+            records
+                .iter()
+                .map(|r| r.planned_text.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            h.drafts().iter().any(|d| d.text.contains("متن الف")),
+            "the stop withdrew another session's held text"
+        );
+        assert!(
+            h.drafts().iter().any(|d| d.text.contains("متن ب")),
+            "the stopped session's own accepted piece was lost"
+        );
+
+        h.quit().await;
+    }
+
     // ── application profiles (P1) ─────────────────────────────────────────
     //
     // The *decisions* — general fallback, an override merging field by field, an
@@ -6649,7 +9509,8 @@ mod tests {
         );
         let mut settings = profiled_settings(vec![profile]);
         settings.gui.review_before_insert = true;
-        let mut h = Harness::start_profiled(h_port, discarded, &h_engine, desktop.clone(), settings);
+        let mut h =
+            Harness::start_profiled(h_port, discarded, &h_engine, desktop.clone(), settings);
 
         h.event(HotkeyEvent::RecordDown);
         desktop.wait_captured(1).await;
@@ -6716,7 +9577,12 @@ mod tests {
         h.event(HotkeyEvent::RecordDown);
         desktop.wait_captured(1).await;
         h.event(HotkeyEvent::RecordUp);
-        within(PATIENCE, "the first dictation to type itself", h.wait_ops(1)).await;
+        within(
+            PATIENCE,
+            "the first dictation to type itself",
+            h.wait_ops(1),
+        )
+        .await;
         assert_eq!(
             typed_text(&h.seen.borrow().clone()),
             MISHEARD,
@@ -6728,7 +9594,12 @@ mod tests {
         h.event(HotkeyEvent::RecordDown);
         desktop.wait_captured(2).await;
         h.event(HotkeyEvent::RecordUp);
-        within(PATIENCE, "the second dictation to type itself", h.wait_ops(2)).await;
+        within(
+            PATIENCE,
+            "the second dictation to type itself",
+            h.wait_ops(2),
+        )
+        .await;
 
         let typed = typed_text(&h.seen.borrow().clone());
         assert!(

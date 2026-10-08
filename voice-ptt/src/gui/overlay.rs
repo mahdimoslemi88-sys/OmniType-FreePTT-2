@@ -150,36 +150,37 @@ fn screen_size_pt(ctx: &egui::Context) -> (f32, f32) {
 /// Validates a settings draft before it is written to `config.toml`.
 /// Returns a Persian error string for the first failing field, so the save
 /// button can stay disabled and the reason can be shown inline.
+///
+/// **Every message is raw text, never shaped.** Each is drawn by a callout or a
+/// hover text that formats what it is given; shaping it here as well shaped it
+/// twice, and a second pass reorders an already-reordered line — the backwards
+/// warning boxes in the Settings and Profiles tabs. One of the readers is the
+/// profiles panel's save guard, another is a hover text in this file: the shaping
+/// belongs at the drawing end, which is the only place that knows it draws.
 fn validate_settings(s: &Settings) -> Result<(), String> {
     if s.audio.sample_rate == 0 {
-        return Err(format_persian_display("نرخ نمونه‌برداری نمی‌تواند صفر باشد"));
+        return Err("نرخ نمونه‌برداری نمی‌تواند صفر باشد".to_string());
     }
     if s.audio.channels == 0 {
-        return Err(format_persian_display("تعداد کانال‌ها نمی‌تواند صفر باشد"));
+        return Err("تعداد کانال‌ها نمی‌تواند صفر باشد".to_string());
     }
     if !(0.0..=1.0).contains(&s.vad.threshold) {
-        return Err(format_persian_display("حساسیت VAD باید بین ۰ و ۱ باشد"));
+        return Err("حساسیت VAD باید بین ۰ و ۱ باشد".to_string());
     }
     if s.vad.silence_timeout_ms == 0 {
-        return Err(format_persian_display("مدت سکوت باید بزرگتر از صفر باشد"));
+        return Err("مدت سکوت باید بزرگتر از صفر باشد".to_string());
     }
     // Hotkey strings are parsed into virtual-key codes at startup; a string
     // that cannot be parse is rejected here so the user sees the problem in the
     // settings UI instead of silently falling back to the default.
     if let Err(e) = HotkeyBinding::parse(&s.hotkey.record) {
-        return Err(format_persian_display(&format!(
-            "کلید ضبط نامعتبر است: {e}"
-        )));
+        return Err(format!("کلید ضبط نامعتبر است: {e}"));
     }
     if let Err(e) = HotkeyBinding::parse(&s.hotkey.toggle_overlay) {
-        return Err(format_persian_display(&format!(
-            "کلید نمایش/مخفی نامعتبر است: {e}"
-        )));
+        return Err(format!("کلید نمایش/مخفی نامعتبر است: {e}"));
     }
     if let Err(e) = HotkeyBinding::parse(&s.hotkey.quit) {
-        return Err(format_persian_display(&format!(
-            "کلید خروج نامعتبر است: {e}"
-        )));
+        return Err(format!("کلید خروج نامعتبر است: {e}"));
     }
     Ok(())
 }
@@ -974,6 +975,17 @@ impl OverlayApp {
                         ui.add_space(6.0);
 
                         // ── Tab bar ──
+                        let retained = self.review.snapshot();
+                        let retained_count = retained.drafts.iter()
+                            .filter(|d| d.kind == crate::state::review::DraftKind::Undelivered)
+                            .count() + retained.archived.len();
+                        if retained_count > 0
+                            && ui.button(format_persian_display(&format!(
+                                "متن‌های درج‌نشده ({retained_count})"
+                            ))).clicked()
+                        {
+                            self.review_panel.open_recovery();
+                        }
                         ui.horizontal(|ui| {
                             for tab in [
                                 DashboardTab::Engines,
@@ -1640,13 +1652,8 @@ impl eframe::App for OverlayApp {
                 // *where* the click landed, this is the only place that knows
                 // *what was done about it*. Without both lines, "the window
                 // took the click" and "the app ignored it" look the same.
-                let action = if matches!(status.state, AppState::Recording) {
-                    let _ = self.events_tx.send(HotkeyEvent::RecordUp);
-                    "record_up"
-                } else {
-                    let _ = self.events_tx.send(HotkeyEvent::RecordDown);
-                    "record_down"
-                };
+                let _ = self.events_tx.send(HotkeyEvent::OrbToggle);
+                let action = "orb_toggle";
                 tracing::info!(
                     state = ?status.state,
                     action,

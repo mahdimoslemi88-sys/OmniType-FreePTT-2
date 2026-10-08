@@ -268,6 +268,8 @@ mod tests {
             pid: 100,
             exe_path: None,
             title_at_capture: "Test".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         tracker.record_success("میخوا", Some(SessionId(1)), target.clone());
 
@@ -287,6 +289,8 @@ mod tests {
             pid: 100,
             exe_path: None,
             title_at_capture: "Test".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         tracker.record_success("سلام", Some(SessionId(1)), target.clone());
 
@@ -307,12 +311,16 @@ mod tests {
             pid: 100,
             exe_path: None,
             title_at_capture: "App 1".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         let target2 = Some(TargetIdentity {
             hwnd: 0x2222,
             pid: 200,
             exe_path: None,
             title_at_capture: "App 2".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
 
         tracker.record_success("سلام", Some(SessionId(1)), target1.clone());
@@ -333,12 +341,16 @@ mod tests {
             pid: 1234,
             exe_path: None,
             title_at_capture: "Document - Word".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         let target2_updated_title = Some(TargetIdentity {
             hwnd: 0x5000,
             pid: 1234,
             exe_path: None,
             title_at_capture: "Document [Modified] - Word".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
 
         tracker.record_success("سلام", Some(SessionId(1)), target1);
@@ -359,6 +371,8 @@ mod tests {
             pid: 1234,
             exe_path: None,
             title_at_capture: "App".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         tracker.record_success("سلام", Some(SessionId(1)), target);
         assert!(!tracker.is_valid_for(&None));
@@ -377,18 +391,24 @@ mod tests {
             pid: 100,
             exe_path: None,
             title_at_capture: "App".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         let same_hwnd_different_pid = Some(TargetIdentity {
             hwnd: 0x5000,
             pid: 999,
             exe_path: None,
             title_at_capture: "App".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         let different_hwnd_same_pid = Some(TargetIdentity {
             hwnd: 0x6000,
             pid: 100,
             exe_path: None,
             title_at_capture: "App".to_string(),
+            focus_hwnd: None,
+            focus_element: None,
         });
 
         tracker.record_success("سلام", Some(SessionId(1)), target1);

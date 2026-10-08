@@ -771,6 +771,11 @@ pub fn enable_true_transparency(hwnd: isize) {
     let mode = *transparency_mode();
     let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
     unsafe {
+        // 0. This window never takes the foreground — see
+        // `ensure_never_activates` for why this is its own repair and why it has
+        // to run in every mode, not only when transparency styles are written.
+        ensure_never_activates(hwnd);
+
         // 1. Strip non-client styles (caption, thickframe, min/max buttons, sysmenu, borders) FIRST
         let cur_style = GetWindowLongW(win_hwnd, GWL_STYLE);
         if mode == TransparencyMode::NoStyleRewrite {
@@ -789,7 +794,8 @@ pub fn enable_true_transparency(hwnd: isize) {
         let style_changed = stripped as i32 != cur_style;
         let _ = SetWindowLongW(win_hwnd, GWL_STYLE, stripped as i32);
 
-        // 2. Strip extended styles (sunken/raised edges, static edges, dialog frame)
+        // 2. Strip extended styles (sunken/raised edges, static edges, dialog frame).
+        // `WS_EX_NOACTIVATE` from step 0 is kept: this only clears bits.
         let cur_ex = GetWindowLongW(win_hwnd, GWL_EXSTYLE);
         let stripped_ex = cur_ex as u32
             & !(0x0000_0100 /* WS_EX_WINDOWEDGE */
@@ -871,12 +877,94 @@ pub fn enable_true_transparency(hwnd: isize) {
     }
 }
 
+/// Repairs made by [`ensure_never_activates`], so a window that keeps losing the
+/// style says so once, loudly, and then quietly — instead of writing one line
+/// per frame into a log the user is meant to read.
+#[cfg(windows)]
+static NO_ACTIVATE_REPAIRS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// True when the extended style is missing `WS_EX_NOACTIVATE`.
+///
+/// The pure half of the repair below, so the bit arithmetic is pinned by a test
+/// even though only a live window can be repaired.
+#[cfg(windows)]
+fn ex_style_needs_no_activate(ex: i32) -> bool {
+    (ex as u32) & 0x0800_0000 /* WS_EX_NOACTIVATE */ == 0
+}
+
+/// Keeps the orb's window out of the foreground, in every transparency mode.
+///
+/// `WS_EX_NOACTIVATE` is what makes a click on the orb *not* activate it. The
+/// orb is a control, not a window the user works in: when a click activates it,
+/// the caret leaves the document the user was typing into — "it is as if a new
+/// app was selected and I have to click back in" — even though the dictation
+/// itself still finds its destination.
+///
+/// It needs a repair of its own because winit owns the extended style: on any of
+/// its own window-flag updates it recomputes the whole ex-style from its own bits
+/// and writes it back (`winit-0.29.15/src/platform_impl/windows/window_state.rs`,
+/// `SetWindowLongW(window, GWL_EXSTYLE, style_ex)`), and `WS_EX_NOACTIVATE` is not
+/// one of its bits. `enforce_frameless_window` cannot catch that in the default
+/// `NoStyleRewrite` mode, because that mode deliberately writes nothing at all.
+///
+/// Measured, not assumed: the running app logged `main window set to never
+/// activate … hwnd=657356` at 16:58:03, and a read-only probe of the same handle
+/// (`docs/reaserch/gui/probes/orb-activation-probe.ps1`) answered
+/// `NOACTIVATE=False` with that window holding the foreground minutes later.
+///
+/// Returns `true` when the style had to be re-applied here.
+#[cfg(windows)]
+pub fn ensure_never_activates(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    };
+    if hwnd == 0 {
+        return false;
+    }
+    let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    let ex = unsafe { GetWindowLongW(win_hwnd, GWL_EXSTYLE) };
+    if !ex_style_needs_no_activate(ex) {
+        return false;
+    }
+    let fixed = ((ex as u32) | WS_EX_NOACTIVATE.0) as i32;
+    unsafe {
+        let _ = SetWindowLongW(win_hwnd, GWL_EXSTYLE, fixed);
+    }
+    let repairs = NO_ACTIVATE_REPAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if repairs == 0 {
+        tracing::info!(
+            hwnd,
+            "main window set to never activate: an orb click must not take the foreground"
+        );
+    } else {
+        // A repeated repair is a winit style write the user never asked for.
+        // Counted rather than printed at info: a per-frame loss would otherwise
+        // bury the log the rest of this project depends on.
+        tracing::debug!(
+            hwnd,
+            repairs = repairs + 1,
+            "the never-activate style was re-applied"
+        );
+    }
+    true
+}
+
 /// True when the OS window already has the shaper's target style: a frameless
-/// popup with no raised/sunken/dialog edge.
+/// popup, with no raised/sunken/dialog edge, that **cannot be activated**.
+///
+/// `WS_EX_NOACTIVATE` is part of "shaped" rather than a separate concern because
+/// of how this predicate is used: [`enforce_frameless_window`] runs it every
+/// frame and repairs the window when it says no. winit re-applies its own window
+/// attributes on minimize/restore, which is the drift this guard exists for — and
+/// an activation style lost that way would put the orb back in front on the next
+/// click, so a dictation started from the orb would again capture this program as
+/// its own destination.
 #[cfg(windows)]
 fn window_style_is_shaped(style: i32, ex: i32) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WS_BORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+        WS_BORDER, WS_CAPTION, WS_EX_NOACTIVATE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+        WS_SYSMENU, WS_THICKFRAME,
     };
     const WS_DLGFRAME: u32 = 0x0080_0000;
     const WS_EX_WINDOWEDGE: u32 = 0x0000_0100;
@@ -898,7 +986,8 @@ fn window_style_is_shaped(style: i32, ex: i32) -> bool {
     let not_popup = s & WS_POPUP.0 == 0;
     let edged =
         e & (WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_DLGMODALFRAME) != 0;
-    !(framed || not_popup || edged)
+    let activatable = e & WS_EX_NOACTIVATE.0 == 0;
+    !(framed || not_popup || edged || activatable)
 }
 
 /// Cheap per-frame guard: keeps a window frameless for as long as it lives.
@@ -920,15 +1009,20 @@ pub fn enforce_frameless_window(hwnd: isize) -> bool {
         return false;
     }
     let win_hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    // The activation guard is repaired in **every** mode, including
+    // `NoStyleRewrite`. It is not a transparency style: it is what keeps a click
+    // on the orb from taking the caret out of the user's document, and winit can
+    // drop the bit while the app runs — see `ensure_never_activates`.
+    let repaired = ensure_never_activates(hwnd);
     if *transparency_mode() == TransparencyMode::NoStyleRewrite {
         // This mode never writes styles, so "the style drifted" is not an error
         // to repair: repairing it is exactly what we are testing against.
-        return false;
+        return repaired;
     }
     let style = unsafe { GetWindowLongW(win_hwnd, GWL_STYLE) };
     let ex = unsafe { GetWindowLongW(win_hwnd, GWL_EXSTYLE) };
     if window_style_is_shaped(style, ex) {
-        return false;
+        return repaired;
     }
     enable_true_transparency(hwnd);
     true
@@ -1431,12 +1525,13 @@ const PREVIEW_RESHAPE_INTERVAL: u32 = 15;
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{
-        click_region_px, expected_region_box, invalidate_click_region, position_in_screen,
-        region_is_current, transparency_mode_from, ClickRegion, TransparencyMode,
-    };
     use super::super::orb::{self, Orb};
     use super::super::orb_animation::OrbMode;
+    use super::{
+        click_region_px, ex_style_needs_no_activate, expected_region_box, invalidate_click_region,
+        position_in_screen, region_is_current, transparency_mode_from, window_style_is_shaped,
+        ClickRegion, TransparencyMode,
+    };
 
     /// Q1-1, pinned as arithmetic: every window this places has to end up
     /// **inside** the screen it was given, for both anchors and for screens
@@ -1998,5 +2093,50 @@ mod tests {
         // ...and the bar is the shape the region grew for, so this is not a test
         // that would pass with no bar at all.
         assert!(bar[3] > cy + r, "the bar has to hang below the circle: {bar:?}");
+    }
+
+    // ── the orb window must never take the foreground ────────────────────
+
+    /// The style set the shaper writes. `WS_POPUP`, no caption and no edge — and
+    /// `WS_EX_NOACTIVATE`.
+    const SHAPED_STYLE: i32 = 0x8000_0000u32 as i32; // WS_POPUP
+    const SHAPED_EX: i32 = 0x0800_0000; // WS_EX_NOACTIVATE
+
+    /// A click on the orb must not make this program the window in front.
+    ///
+    /// The user's log is the reason: `orb click handled action="record_down"`,
+    /// then `recording started target=<this program's own window>`, then
+    /// `destination refused validity=Changed` — nothing typed anywhere and an
+    /// error badge, because the dictation had been aimed at the app's own canvas.
+    /// With this style the click leaves the user's document in front, which is
+    /// what the capture then reads.
+    /// The repair predicate: the bit is either there or it is not, and an
+    /// unreadable ex-style (`0`) counts as missing it — a window that never took
+    /// the bit is exactly the one whose click steals the user's caret.
+    #[test]
+    fn a_window_missing_the_never_activate_bit_is_repaired() {
+        assert!(
+            !ex_style_needs_no_activate(SHAPED_EX),
+            "a shaped window is already done"
+        );
+        assert!(
+            !ex_style_needs_no_activate(SHAPED_EX | 0x0000_0008 /* WS_EX_TOPMOST */),
+            "other bits must not hide the one this looks for"
+        );
+        assert!(ex_style_needs_no_activate(0x0000_0008));
+        assert!(ex_style_needs_no_activate(0));
+    }
+
+    #[test]
+    fn a_shaped_window_never_activates() {
+        assert!(
+            window_style_is_shaped(SHAPED_STYLE, SHAPED_EX),
+            "the target style is the one the repair path leaves alone"
+        );
+        assert!(
+            !window_style_is_shaped(SHAPED_STYLE, SHAPED_EX & !0x0800_0000),
+            "a window that *can* be activated is not shaped: an orb click that \
+             takes the foreground is how the destination became this program"
+        );
     }
 }

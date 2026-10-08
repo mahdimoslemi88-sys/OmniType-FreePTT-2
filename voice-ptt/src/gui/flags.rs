@@ -53,7 +53,10 @@ impl Toggle {
             HotkeyEvent::Quit => Some(Toggle::Quit),
             // Record and Cancel are the state machine's business; the overlay
             // reacts to them through `StatusChannel`, not through a request.
-            HotkeyEvent::RecordDown | HotkeyEvent::RecordUp | HotkeyEvent::Cancel => None,
+            HotkeyEvent::OrbToggle
+            | HotkeyEvent::RecordDown
+            | HotkeyEvent::RecordUp
+            | HotkeyEvent::Cancel => None,
         }
     }
 }

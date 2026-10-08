@@ -26,6 +26,7 @@
 //! also why [`MachinePort::take_utterance`] answers with `None` instead of
 //! handing the coordinator an empty recording to convert.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -91,6 +92,7 @@ pub struct AppServices {
 /// there was nothing to transcribe", not "nothing happened": the session still
 /// has to close.
 pub struct MachinePort {
+    mouse_recording: AtomicBool,
     services: Arc<AppServices>,
     /// The utterance's accumulation buffer and how far the VAD has read into it.
     ///
@@ -100,10 +102,31 @@ pub struct MachinePort {
     frame: usize,
 }
 
+fn recording_streaming(
+    settings: &crate::config::settings::StreamingSettings,
+    mouse: bool,
+) -> crate::config::settings::StreamingSettings {
+    let mut cfg = settings.clone();
+    if mouse {
+        cfg.enabled = true;
+        cfg.strategy = "silence".into();
+        cfg.chunk_seconds = cfg.chunk_seconds.clamp(1, 20);
+        cfg.min_chunk_seconds = cfg.min_chunk_seconds.clamp(1, cfg.chunk_seconds);
+        cfg.overlap_ms = cfg.overlap_ms.min(cfg.min_chunk_seconds * 500);
+        if !settings.enabled || !settings.seam_merge {
+            // Forced mouse chunking must not repeat audio when the text-side
+            // seam deduplicator is disabled by the user's settings.
+            cfg.overlap_ms = 0;
+        }
+    }
+    cfg
+}
+
 impl MachinePort {
     pub fn new(services: Arc<AppServices>) -> Self {
         let frame = services.settings.vad.chunk_size;
         Self {
+            mouse_recording: AtomicBool::new(false),
             services,
             bufs: Mutex::new(SessionBuffers::default()),
             frame,
@@ -188,12 +211,19 @@ impl MachinePort {
     /// Samples of audio repeated at the start of the next chunk (seam safety).
     fn chunk_overlap_samples(&self) -> usize {
         let rate = u64::from(self.services.capture.pipeline_sample_rate());
-        (rate * self.services.settings.streaming.overlap_ms / 1000) as usize
+        let cfg = recording_streaming(
+            &self.services.settings.streaming,
+            self.mouse_recording.load(Ordering::Relaxed),
+        );
+        (rate * cfg.overlap_ms / 1000) as usize
     }
 
     /// Whether a mid-session chunk is due right now (VAD metrics included).
     async fn chunk_flush_due(&self, buffer_len: usize) -> bool {
-        let cfg = &self.services.settings.streaming;
+        let cfg = recording_streaming(
+            &self.services.settings.streaming,
+            self.mouse_recording.load(Ordering::Relaxed),
+        );
         if !cfg.enabled {
             return false;
         }
@@ -205,7 +235,7 @@ impl MachinePort {
                 unit.endpoint.speech_samples(),
             )
         };
-        should_flush_chunk(cfg, rate, buffer_len, silence, speech)
+        should_flush_chunk(&cfg, rate, buffer_len, silence, speech)
     }
 
     /// Removes the finished chunk from the accumulation buffer and keeps the
@@ -232,6 +262,9 @@ impl MachinePort {
 }
 
 impl Port for MachinePort {
+    fn set_mouse_recording(&self, enabled: bool) {
+        self.mouse_recording.store(enabled, Ordering::Relaxed);
+    }
     async fn begin(&self) -> Option<String> {
         let mut bufs = self.bufs.lock().await;
         bufs.audio.clear();
@@ -260,14 +293,19 @@ impl Port for MachinePort {
         let rate = self.services.capture.pipeline_sample_rate();
         let decision = {
             let unit = self.services.vad.lock().await;
-            let cutoff = self.services.settings.vad.cutoff_on_hold;
+            let mouse = self.mouse_recording.load(Ordering::Relaxed);
+            let cutoff = self.services.settings.vad.cutoff_on_hold && !mouse;
             endpoint_decision(
                 bufs.audio.len(),
                 unit.endpoint.should_finalize(),
                 cutoff,
-                streaming.enabled,
+                streaming.enabled || mouse,
                 self.services.capture.capacity(),
-                u64::from(rate) * streaming.max_utterance_seconds,
+                if mouse {
+                    u64::MAX
+                } else {
+                    u64::from(rate) * streaming.max_utterance_seconds
+                },
             )
         };
         if let EndpointDecision::Finalize(reason) = decision {
@@ -279,8 +317,9 @@ impl Port for MachinePort {
             });
         }
         if self.chunk_flush_due(bufs.audio.len()).await {
+            let enough_speech = self.services.vad.lock().await.endpoint.has_enough_speech();
             let chunk = self.take_chunk(&mut bufs);
-            if !chunk.samples.is_empty() {
+            if enough_speech && !chunk.samples.is_empty() {
                 return Ok(PollOutcome::Chunk { audio: chunk });
             }
         }
@@ -456,9 +495,7 @@ impl StateMachine {
     /// gate watching a status nobody publishes to would happily hand the
     /// microphone over in the middle of a dictation.
     pub(crate) fn mic_gate(&self) -> std::sync::Arc<crate::audio::gate::LiveMicGate> {
-        std::sync::Arc::new(crate::audio::gate::LiveMicGate::new(
-            self.status.clone(),
-        ))
+        std::sync::Arc::new(crate::audio::gate::LiveMicGate::new(self.status.clone()))
     }
 
     /// The review/recovery wire, for whoever draws the review window.
@@ -531,6 +568,25 @@ mod tests {
     use super::*;
     use crate::config::settings::StreamingSettings;
     use crate::processing::seam::SeamOptions;
+
+    #[test]
+    fn mouse_policy_chunks_even_when_streaming_is_disabled_and_bounds_bad_config() {
+        let original = StreamingSettings {
+            enabled: false,
+            chunk_seconds: u64::MAX,
+            min_chunk_seconds: u64::MAX,
+            overlap_ms: u64::MAX,
+            ..StreamingSettings::default()
+        };
+        let cfg = recording_streaming(&original, true);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.chunk_seconds, 20);
+        assert_eq!(cfg.min_chunk_seconds, 20);
+        assert!(cfg.overlap_ms < cfg.chunk_seconds * 1000);
+        assert_eq!(cfg.overlap_ms, 0);
+        assert!(should_flush_chunk(&cfg, 16000, 20 * 16000, 0, 16000));
+        assert_eq!(recording_streaming(&original, false), original);
+    }
 
     #[test]
     fn seam_repair_can_be_switched_off_from_settings() {

@@ -5,15 +5,11 @@
 //! *where the user was*, and every later moment has to ask again — otherwise a
 //! slow transcription lands in a window the user has since switched to.
 //!
-//! Two limits are deliberate, not oversights:
-//!
-//! * **`HWND` is not an edit control.** One window can hold several typeable
-//!   fields (a browser tab, Word, a terminal), and only the window is known
-//!   here. The first version checks window plus process and says so out loud.
-//! * **Focus is never taken.** When the target cannot be trusted the text is
-//!   kept, not delivered somewhere that merely accepts it. Stealing focus would
-//!   put text in front of the user without asking, which is worse than a
-//!   delayed dictation.
+//! The user explicitly requested returning to the original application on
+//! insertion. `restore_target` implements that policy, while `validate_target`
+//! remains an observation-only check. Native focus and an accessibility element
+//! are captured when available. Neither proves that an application preserved
+//! the caret position inside its document; that needs application acceptance.
 //!
 //! The decision lives in [`classify`], a pure function over [`Observation`],
 //! so the table below is tested without a desktop session. The Win32 calls are
@@ -21,6 +17,7 @@
 
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Who the user was dictating into, captured when recording started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +34,10 @@ pub struct TargetIdentity {
     /// and change. It is kept for the log line, and program identity comes
     /// from `exe_path`.
     pub title_at_capture: String,
+    /// Native focused child captured with the destination, when Windows exposes it.
+    pub focus_hwnd: Option<isize>,
+    /// Exact accessibility element, when the application exposes one.
+    pub focus_element: Option<std::sync::Arc<super::focus::FocusLease>>,
 }
 
 /// Whether the recorded destination is still the one in front of the user.
@@ -146,6 +147,102 @@ impl TargetTracker {
     }
 }
 
+/// The last window in front that belonged to **another** program.
+///
+/// Why it exists: the orb is a control, and clicking it must not throw away the
+/// destination of the dictation it starts. With no memory to fall back on, a
+/// click that leaves this program's own window in front produced a dictation
+/// with no destination at all — the user's log has four orb clicks in a row,
+/// each followed by `the window in front belongs to this program; no
+/// destination captured` and `destination refused ... validity=Unknown`, and not
+/// one character typed anywhere. Sampling the foreground while the user works
+/// means that click still knows which window they came from.
+///
+/// Only ever a **fallback**: a live foreground window that is not ours always
+/// wins, so this cannot aim text at a window the user has since left unless they
+/// have left it for this program's own UI.
+static LAST_EXTERNAL: Mutex<Option<TargetIdentity>> = Mutex::new(None);
+
+/// Samples the window in front and keeps it when it is somebody else's.
+///
+/// Called on a timer rather than at capture time on purpose: by the time a
+/// dictation starts, the window in front may already be the orb the user just
+/// clicked. Ours is never stored, and neither is "no foreground window" — both
+/// leave the previous answer standing, which is exactly the document the user
+/// was working in.
+///
+/// Cheap in the steady state: when the same window is already remembered the
+/// work stops after `GetForegroundWindow` and one pid lookup, so a 20 ms caller
+/// does not re-read a title or open a process handle per tick.
+pub fn remember_foreground() {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return;
+    }
+    let hwnd = hwnd.0 as isize;
+    // This program's own windows — the orb, the dashboard, the review box, the
+    // transcript card — are not documents.
+    if owns_window(hwnd) {
+        return;
+    }
+    let Some(pid) = window_pid(hwnd) else {
+        return;
+    };
+    if lock()
+        .as_ref()
+        .is_some_and(|prev| prev.hwnd == hwnd && prev.pid == pid)
+    {
+        return;
+    }
+    let remembered = TargetIdentity {
+        hwnd,
+        pid,
+        exe_path: process_path(pid).ok().flatten(),
+        title_at_capture: window_title(hwnd).unwrap_or_default(),
+        focus_hwnd: focused_child(hwnd),
+        // No accessibility element here: those live on the focus thread's own
+        // COM apartment and are captured with a dictation, not with a sample.
+        // The native window and its focused child are the documented path when
+        // UI Automation is not consulted, and `restore_target` re-checks both.
+        focus_element: None,
+    };
+    *lock() = Some(remembered);
+}
+
+/// The remembered window, while it is still alive and still somebody else's.
+///
+/// A window that closed, or whose handle Windows has recycled to another
+/// process, is forgotten rather than handed back: text aimed at it would be text
+/// aimed at nothing.
+pub fn remembered_target() -> Option<TargetIdentity> {
+    let id = lock().clone()?;
+    let alive = observe(id.hwnd).window_alive;
+    let pid_now = window_pid(id.hwnd);
+    if !remembered_is_usable(owns_window(id.hwnd), alive, pid_now, id.pid) {
+        return None;
+    }
+    Some(id)
+}
+
+/// The pure half of [`remembered_target`]'s verdict.
+///
+/// Kept separate so the rule can be asserted without a desktop session, and so
+/// there is exactly one place that decides what "still usable" means.
+fn remembered_is_usable(ours: bool, alive: bool, pid_now: Option<u32>, pid_then: u32) -> bool {
+    !ours && alive && pid_now == Some(pid_then)
+}
+
+/// The remembered window, with a poisoned lock treated as "empty".
+///
+/// A panicking sampler must not take the destination of every later dictation
+/// down with it: an empty slot is the honest answer, and the next sample refills
+/// it.
+fn lock() -> std::sync::MutexGuard<'static, Option<TargetIdentity>> {
+    LAST_EXTERNAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Reads the window currently in front of the user.
 pub fn capture_target() -> Result<TargetIdentity> {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
@@ -160,17 +257,129 @@ pub fn capture_target() -> Result<TargetIdentity> {
     let title = window_title(hwnd).unwrap_or_default();
     let exe_path = process_path(pid).ok().flatten();
 
+    let focus_hwnd = focused_child(hwnd);
+    let focus_element = super::focus::capture(pid);
+    if !classify(
+        &TargetIdentity {
+            hwnd,
+            pid,
+            exe_path: None,
+            title_at_capture: String::new(),
+            focus_hwnd: None,
+            focus_element: None,
+        },
+        observe(hwnd),
+    )
+    .allows_insert()
+    {
+        anyhow::bail!("foreground changed while capturing the destination");
+    }
     Ok(TargetIdentity {
         hwnd,
         pid,
         exe_path,
         title_at_capture: title,
+        focus_hwnd,
+        focus_element,
     })
 }
 
 /// Re-checks a captured destination against the window in front of the user.
 pub fn validate_target(id: &TargetIdentity) -> TargetValidity {
     classify(id, observe(id.hwnd))
+}
+
+pub(super) fn focused_child(hwnd: isize) -> Option<isize> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    };
+    let thread = unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), None) };
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if thread == 0
+        || unsafe { GetGUIThreadInfo(thread, &mut info) }.is_err()
+        || info.hwndFocus.0.is_null()
+    {
+        return None;
+    }
+    Some(info.hwndFocus.0 as isize)
+}
+
+/// Return to the explicitly captured destination and verify actual focus before typing.
+/// Browser/editor DOM caret positions are retained by the application itself;
+/// a native child handle does not identify a DOM input or a terminal prompt.
+pub fn restore_target(id: &TargetIdentity) -> TargetValidity {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsChild, IsIconic, IsWindow, SetForegroundWindow, ShowWindowAsync, SW_RESTORE,
+    };
+    let raw = HWND(id.hwnd as *mut _);
+    if !unsafe { IsWindow(raw) }.as_bool()
+        || window_pid(id.hwnd) != Some(id.pid)
+        || owns_window(id.hwnd)
+    {
+        return TargetValidity::Unknown;
+    }
+    if let Some(child) = id.focus_hwnd {
+        let child_raw = HWND(child as *mut _);
+        if !unsafe { IsWindow(child_raw) }.as_bool()
+            || window_pid(child) != Some(id.pid)
+            || (child != id.hwnd && !unsafe { IsChild(raw, child_raw) }.as_bool())
+        {
+            return TargetValidity::Changed;
+        }
+    }
+    if !validate_target(id).allows_insert() {
+        if unsafe { IsIconic(raw) }.as_bool() {
+            let _ = unsafe { ShowWindowAsync(raw, SW_RESTORE) };
+        }
+        let _ = unsafe { SetForegroundWindow(raw) };
+    }
+    // Activation can be asynchronous, but a delay is never proof of success.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    while !validate_target(id).allows_insert() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if !validate_target(id).allows_insert() {
+        return TargetValidity::Changed;
+    }
+    if let Some(child) = id.focus_hwnd {
+        if focused_child(id.hwnd) != Some(child)
+            && !super::focus::restore_native(id.hwnd, child, id.pid)
+        {
+            return TargetValidity::Changed;
+        }
+    }
+    if let Some(element) = &id.focus_element {
+        if !super::focus::restore(element, id.pid) {
+            return TargetValidity::Changed;
+        }
+    }
+    validate_target(id)
+}
+
+/// Whether `hwnd` is a window of **this process**.
+///
+/// The app's own windows — the orb, the dashboard, the review window, the
+/// transcript card — are not documents. Text dictated while one of them is in
+/// front has no destination at all, and typing it there would put the user's
+/// words into a window they cannot edit. It used to happen: a mouse click on the
+/// orb made the overlay, not the user's editor, the window in front, and the
+/// dictation came back as "focus moved" with an error badge.
+pub fn owns_window(hwnd: isize) -> bool {
+    is_own_pid(window_pid(hwnd), std::process::id())
+}
+
+/// The pure half of [`owns_window`].
+///
+/// A pid that cannot be read is **not** treated as ours: an unknown window is a
+/// real window until proven otherwise, and the alternative would silently throw
+/// away a destination the user could have kept.
+fn is_own_pid(pid: Option<u32>, own: u32) -> bool {
+    pid == Some(own)
 }
 
 /// The platform half of [`classify`]: asks Windows three questions and
@@ -198,7 +407,7 @@ fn observe(hwnd: isize) -> Observation {
     }
 }
 
-fn window_pid(hwnd: isize) -> Option<u32> {
+pub(super) fn window_pid(hwnd: isize) -> Option<u32> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
@@ -275,6 +484,8 @@ mod tests {
             pid,
             exe_path: None,
             title_at_capture: "t".into(),
+            focus_hwnd: None,
+            focus_element: None,
         }
     }
 
@@ -367,5 +578,31 @@ mod tests {
         // test states exactly what is and is not compared.
         let id = target(10, 20);
         assert_eq!(classify(&id, live(Some((10, 20)))), TargetValidity::Valid);
+    }
+
+    // ── the remembered destination ───────────────────────────────────────
+
+    /// The remembered window is a fallback, so it has exactly four ways to be
+    /// unusable and each one has to refuse — the alternative is aiming a
+    /// dictation at a window that is not there, or at this program's own canvas.
+    #[test]
+    fn a_remembered_window_is_usable_only_while_it_is_alive_and_not_ours() {
+        assert!(remembered_is_usable(false, true, Some(20), 20));
+        assert!(
+            !remembered_is_usable(true, true, Some(20), 20),
+            "this program's own window is not a document"
+        );
+        assert!(
+            !remembered_is_usable(false, false, Some(20), 20),
+            "a closed window cannot receive text"
+        );
+        assert!(
+            !remembered_is_usable(false, true, Some(99), 20),
+            "Windows recycles handles; a different pid is a different window"
+        );
+        assert!(
+            !remembered_is_usable(false, true, None, 20),
+            "a pid that cannot be read is not a match"
+        );
     }
 }

@@ -19,17 +19,18 @@
 //! * **Every button resolves its draft.** Each one names an id, so a
 //!   double-click is a stale answer rather than a second insert.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use super::text::format_persian_display;
+use super::text::{format_persian_display, persian_text_edit_layouter};
 use super::theme::{
     apply_theme_visuals, manager_card, manager_central_panel, manager_header, manager_subtitle,
     palette,
 };
-use crate::state::review::{DraftKind, PendingDraft, ReviewCommand};
+use crate::state::review::{ArchivedDraft, DraftKind, PendingDraft, ReviewCommand};
 use crate::state::ReviewChannel;
 
 /// What put this version of the text in the box.
@@ -207,6 +208,8 @@ impl EditHistory {
 /// the draft the user is actually looking at.
 #[derive(Debug, Default)]
 pub struct ReviewPanelState {
+    /// Recovery is opened by the user, rather than interrupting every failed insert.
+    recovery_requested: bool,
     /// The draft currently in the box, if any.
     editing: Option<u64>,
     /// The editable text.
@@ -221,13 +224,192 @@ pub struct ReviewPanelState {
     built_from: u64,
     /// When the window was last opened, for the elapsed hint.
     opened: Option<Instant>,
+    /// Pending drafts whose window the user closed.
+    ///
+    /// Closing is **not** an answer: the draft keeps its deadline and its text,
+    /// and it is offered again from the archive once it expires. What closing
+    /// stops is this window coming back for the same text — the build the user
+    /// tested had no way out of it at all, because a closed window was simply
+    /// drawn again on the next frame.
+    closed_pending: BTreeSet<u64>,
+    /// Archived texts the user has been shown and closed the window for.
+    ///
+    /// Kept apart from [`Self::closed_pending`] on purpose: a pending text the
+    /// user closed *is* worth mentioning once it becomes an archived one (the
+    /// text is now kept for good), while an archived text the user has already
+    /// seen and dismissed is not worth re-opening for.
+    closed_archive: BTreeSet<u64>,
+    /// An answer waiting for this window to get out of the way, with the moment
+    /// it may go out.
+    ///
+    /// Set by a click on «درج» and by nothing else — see [`Self::defer_insert`].
+    pending_answer: Option<DeferredAnswer>,
 }
 
+/// How long this window stays out of the way before the insert is asked for.
+///
+/// The window has to be *gone* when the loop judges the destination: the desktop
+/// hands the foreground back to the window that had it before this one, and that
+/// hand-back is what the check needs to see. Four or five frames is already
+/// enough in practice; a fifth of a second costs the user nothing they can
+/// perceive and covers the frames the OS needs to settle.
+const STEP_ASIDE: Duration = Duration::from_millis(200);
+
+/// One answer that has to wait for the window to move first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredAnswer {
+    command: ReviewCommand,
+    send_at: Instant,
+}
+
+/// How many closed ids are remembered before the oldest is forgotten.
+///
+/// A bound, so a session that closes hundreds of texts cannot grow this window's
+/// state without limit. Forgetting the oldest can at worst re-open the window for
+/// a text the user closed long ago — which is the safe direction to fail in.
+const CLOSED_MEMORY: usize = 128;
+
 impl ReviewPanelState {
+    pub fn open_recovery(&mut self) {
+        self.recovery_requested = true;
+        self.closed_pending.clear();
+        self.closed_archive.clear();
+    }
     /// The draft id the buttons would act on, if the window has one loaded.
     fn editing_id(&self) -> Option<u64> {
         self.editing
     }
+
+    /// Remembers that the user closed the window for this pending draft.
+    fn close_pending(&mut self, id: u64) {
+        forget_oldest(&mut self.closed_pending, CLOSED_MEMORY);
+        self.closed_pending.insert(id);
+    }
+
+    /// A click on «درج»: gets this window out of the way first.
+    ///
+    /// The command is **not** sent on the click. Pressing a button in the review
+    /// window makes that window the one in front, and the loop judges the
+    /// destination against the window in front — so an insert asked for from here
+    /// was refused every single time, which is the user's "the insert button does
+    /// not work, only copy does" (their log: four attempts, four
+    /// `validity=Changed`, the same text re-offered each time). Closing the
+    /// window for `STEP_ASIDE` avoids competing with activation. The coordinator
+    /// explicitly restores the original destination and verifies it; this delay
+    /// itself is not evidence that the destination has focus.
+    fn defer_insert(&mut self, id: u64, text: String, now: Instant) {
+        self.pending_answer = Some(DeferredAnswer {
+            command: ReviewCommand::Insert { id, text },
+            send_at: now + STEP_ASIDE,
+        });
+    }
+
+    /// The answer that is due now, if any. `None` means "not yet" — the caller
+    /// keeps drawing no window and asking for another frame.
+    fn take_due_answer(&mut self, now: Instant) -> Option<ReviewCommand> {
+        let pending = self.pending_answer.as_ref()?;
+        if now < pending.send_at {
+            return None;
+        }
+        self.pending_answer.take().map(|held| held.command)
+    }
+
+    /// Remembers that the user closed the archive window.
+    ///
+    /// Every text on screen at that moment counts as seen, so the window does not
+    /// simply re-open on the next frame for the same set. A text archived *after*
+    /// this — the pending draft that expires later, or another dictation — is not
+    /// in the set and does open the window, which is how "your text was kept"
+    /// still reaches the user.
+    fn close_archive(&mut self, archived: &[ArchivedDraft]) {
+        for item in archived {
+            forget_oldest(&mut self.closed_archive, CLOSED_MEMORY);
+            self.closed_archive.insert(item.draft.id);
+        }
+    }
+}
+
+/// Drops the smallest id once `set` is at its bound.
+///
+/// Ids are handed out in increasing order, so the smallest is the oldest and the
+/// least likely to be closed on purpose.
+fn forget_oldest(set: &mut BTreeSet<u64>, bound: usize) {
+    while set.len() >= bound {
+        let Some(oldest) = set.iter().next().copied() else {
+            return;
+        };
+        set.remove(&oldest);
+    }
+}
+
+/// Which window this panel draws, and for what.
+///
+/// Pure, so the rule the user experiences ("close it and it stays closed, until
+/// there is something new to say") is a table that can be read and tested
+/// without a screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowPlan {
+    /// The newest draft, waiting for an answer.
+    Pending(u64),
+    /// Text that expired uninserted and is kept until the user decides.
+    Archive,
+    /// Nothing to say — or the user has already closed the window for what is
+    /// there.
+    Hidden,
+}
+
+/// The window this frame draws, which is [`plan_window`] except for one
+/// deliberate override: **nothing** is drawn while an answer is waiting for this
+/// window to get out of the way. Drawing it would put it back in front — the
+/// exact window the loop must not see when it judges the destination.
+fn plan_for_frame(
+    state: &ReviewPanelState,
+    latest: Option<&PendingDraft>,
+    archived: &[ArchivedDraft],
+) -> WindowPlan {
+    if state.pending_answer.is_some() {
+        return WindowPlan::Hidden;
+    }
+    if !state.recovery_requested && !latest.is_some_and(|draft| draft.kind == DraftKind::Review) {
+        return WindowPlan::Hidden;
+    }
+    plan_window(
+        latest,
+        archived,
+        &state.closed_pending,
+        &state.closed_archive,
+    )
+}
+
+fn plan_window(
+    latest: Option<&PendingDraft>,
+    archived: &[ArchivedDraft],
+    closed_pending: &BTreeSet<u64>,
+    closed_archive: &BTreeSet<u64>,
+) -> WindowPlan {
+    if let Some(draft) = latest {
+        return if closed_pending.contains(&draft.id) {
+            WindowPlan::Hidden
+        } else {
+            WindowPlan::Pending(draft.id)
+        };
+    }
+    if archived
+        .iter()
+        .any(|item| !closed_archive.contains(&item.draft.id))
+    {
+        return WindowPlan::Archive;
+    }
+    WindowPlan::Hidden
+}
+
+/// What the user did to the window itself, as opposed to to a draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowClosed {
+    /// The × (or Alt+F4) on the text waiting for an answer.
+    Pending(u64),
+    /// The × (or Alt+F4) on the archive.
+    Archive,
 }
 
 /// Shows the review window when a draft is waiting, and hides it when none is.
@@ -244,36 +426,101 @@ pub fn render(
     ttl: Duration,
 ) {
     let snapshot = channel.snapshot();
+    let latest = snapshot.latest().cloned();
 
+    // An insert that asked this window to get out of the way first: it goes out
+    // as soon as the wait is over. `request_repaint_after` is what makes the wait
+    // a delay rather than a stall — an event-driven GUI has no reason to draw
+    // another frame while there is nothing on screen, and the answer would then
+    // sit in here until the user moved the mouse.
+    let now = Instant::now();
+    if let Some(command) = state.take_due_answer(now) {
+        answer(channel, command);
+    } else if state.pending_answer.is_some() {
+        ctx.request_repaint_after(Duration::from_millis(25));
+    }
+
+    let plan = plan_for_frame(state, latest.as_ref(), &snapshot.archived);
+    // Filled in by whichever viewport is drawn, then applied below: the reply to
+    // "the user clicked ×" cannot be decided inside the frame that is closing,
+    // or the window would be closed again for a draft that has not been seen.
+    let mut closed = None;
+
+    match plan {
+        WindowPlan::Pending(_) => {
+            let draft = latest.expect("a pending plan without a draft is impossible");
+            render_pending(ctx, channel, state, &draft, &snapshot, ttl, &mut closed);
+        }
+        // Nothing on screen. If expired text is still available the window shows
+        // **all** of it — never only the newest entry, which would make the rest
+        // reachable only by deleting it. It is drawn while there is an entry the
+        // user has not closed the window for, so "×" ends it and a newly kept
+        // text brings it back once.
+        WindowPlan::Archive => render_archive_window(ctx, &snapshot.archived, channel, &mut closed),
+        WindowPlan::Hidden => {}
+    }
+
+    match closed {
+        Some(WindowClosed::Pending(id)) => {
+            state.recovery_requested = false;
+            tracing::info!(
+                id,
+                "review window closed by the user; the text keeps its deadline"
+            );
+            state.close_pending(id);
+        }
+        Some(WindowClosed::Archive) => {
+            state.recovery_requested = false;
+            tracing::info!(
+                kept = snapshot.archived.len(),
+                "archive window closed by the user"
+            );
+            state.close_archive(&snapshot.archived);
+        }
+        None => {}
+    }
+
+    if matches!(plan, WindowPlan::Hidden) && state.pending_answer.is_none() {
+        // The box belongs to the window. With nothing on screen it starts empty,
+        // so a text the user closed the window for cannot appear in the box of
+        // the next draft without passing through the store again. Not while an
+        // answer is in flight, though: that window is out of the way, not done —
+        // the text in the box is what the loop is about to type.
+        state.editing = None;
+        state.text.clear();
+        state.history = EditHistory::default();
+        state.opened = None;
+    }
+}
+
+/// Draws the window for the newest draft.
+#[allow(clippy::too_many_arguments)]
+fn render_pending(
+    ctx: &egui::Context,
+    channel: &Arc<ReviewChannel>,
+    state: &mut ReviewPanelState,
+    draft: &PendingDraft,
+    snapshot: &crate::state::ReviewSnapshot,
+    ttl: Duration,
+    closed: &mut Option<WindowClosed>,
+) {
     // The box follows the store. When the newest draft is not the one loaded,
     // it is rebuilt from that draft — which is what makes a second dictation
     // replace the first one's text instead of quietly appending to it.
-    let latest = snapshot.latest().cloned();
-    let needs_reload = match (&latest, state.editing) {
-        (Some(draft), Some(id)) => draft.id != id || snapshot.revision != state.built_from,
-        (Some(_), None) => true,
-        (None, _) => false,
+    let needs_reload = match state.editing {
+        Some(id) => draft.id != id || snapshot.revision != state.built_from,
+        None => true,
     };
     if needs_reload {
-        state.editing = latest.as_ref().map(|d| d.id);
-        state.text = latest.as_ref().map(|d| d.text.clone()).unwrap_or_default();
+        state.editing = Some(draft.id);
+        state.text = draft.text.clone();
         // A new draft starts a new history. Without this, undo would be able
         // to bring back a *previous* dictation's text over the one the user is
         // looking at — the "do not destroy new text" rule, as a reset.
         state.history = EditHistory::loaded(&state.text);
         state.built_from = snapshot.revision;
-        state.opened = latest.as_ref().map(|_| Instant::now());
+        state.opened = Some(Instant::now());
     }
-
-    let Some(draft) = latest else {
-        // Nothing pending: the window closes itself. Left open with an empty
-        // box it would be a dialog the user has to dismiss to get back to work.
-        state.editing = None;
-        state.text.clear();
-        state.history = EditHistory::default();
-        state.opened = None;
-        return;
-    };
     if state.editing != Some(draft.id) {
         // The store moved on under a box we could not reload (only reachable
         // while the loop is answering another draft). Draw the store's text.
@@ -294,10 +541,11 @@ pub fn render(
         Some(BOTTOM_MARGIN),
     );
 
+    let id = draft.id;
     ctx.show_viewport_immediate(
         review_viewport_id(),
         egui::ViewportBuilder::default()
-            .with_title(title_for(&draft))
+            .with_title(title_for(draft))
             .with_position([pos_x, pos_y])
             .with_inner_size([win_w, win_h])
             .with_min_inner_size([380.0, 240.0])
@@ -305,6 +553,16 @@ pub fn render(
             .with_resizable(true)
             .with_transparent(false),
         |win_ctx, _class| {
+            if win_ctx.input(|i| i.viewport().close_requested()) {
+                // Answering "the window is going away" *here* rather than
+                // ignoring it is the whole fix for the window that could not be
+                // closed: this viewport is re-created every frame while a draft
+                // exists, so a close request nobody acts on is a close button
+                // that does nothing.
+                if closed.is_none() {
+                    *closed = Some(WindowClosed::Pending(id));
+                }
+            }
             apply_theme_visuals(win_ctx);
             egui::CentralPanel::default()
                 .frame(manager_central_panel())
@@ -312,12 +570,198 @@ pub fn render(
                     ui.with_layout(
                         egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
                         |ui| {
-                            render_body(ui, state, &draft, channel, ttl);
+                            render_body(ui, state, draft, channel, ttl);
                         },
                     );
                 });
         },
     );
+}
+
+/// The window for **expired** text: everything the app is still holding that it
+/// will no longer insert on its own.
+///
+/// It lists the **whole** archive, newest first, rather than only the newest
+/// entry. Showing one at a time made the older texts reachable only by deleting
+/// the newer ones — deleting the user's text in order to reach their text, which
+/// is the transaction this archive exists to avoid (F3). Here every kept text can
+/// be read, copied, restored or deleted on its own, and none of those requires
+/// touching another one.
+///
+/// Four things it deliberately is not:
+///
+/// * it is not editable — a text that is not answerable must not look like one
+///   click away from being typed;
+/// * «کپی» does **not** send a command: copying archived text is a pure GUI
+///   action and must not retire the draft. That is the difference between the
+///   archive and the pending window, where copying is an answer;
+/// * «حذف از آرشیو» is the only control that deletes anything, and it names the
+///   one text it deletes, so no misclick can take another;
+/// * nothing is deleted **for** the user. Reaching the cap costs new text, never
+///   old text: the store enforces that, and this window is where the user sees it
+///   and can act on it.
+fn render_archive_window(
+    ctx: &egui::Context,
+    archived: &[ArchivedDraft],
+    channel: &Arc<ReviewChannel>,
+    closed: &mut Option<WindowClosed>,
+) {
+    let (win_w, win_h) = (win_w(), win_h());
+    let (pos_x, pos_y) = crate::gui::window_shape::position_in_screen(
+        super::screen_size_pt(ctx),
+        (win_w, win_h),
+        Some(BOTTOM_MARGIN),
+    );
+    ctx.show_viewport_immediate(
+        review_viewport_id(),
+        egui::ViewportBuilder::default()
+            .with_title(ARCHIVE_TITLE)
+            .with_position([pos_x, pos_y])
+            .with_inner_size([win_w, win_h])
+            .with_min_inner_size([380.0, 240.0])
+            .with_decorations(true)
+            .with_resizable(true)
+            .with_transparent(false),
+        |win_ctx, _class| {
+            if win_ctx.input(|i| i.viewport().close_requested()) && closed.is_none() {
+                // Closing the archive is a real answer too, and it must stick:
+                // "every kept text keeps this window open forever" was the other
+                // half of the window that could not be closed. Nothing is deleted
+                // and nothing is answered — the texts stay kept, and the next one
+                // that expires brings the window back once.
+                *closed = Some(WindowClosed::Archive);
+            }
+            apply_theme_visuals(win_ctx);
+            egui::CentralPanel::default()
+                .frame(manager_central_panel())
+                .show(win_ctx, |ui| {
+                    ui.with_layout(
+                        egui::Layout::top_down(egui::Align::RIGHT).with_cross_justify(true),
+                        |ui| render_archive_body(ui, archived, channel),
+                    );
+                });
+        },
+    );
+}
+
+/// The archive window's title, in one place: a window renamed here and asserted
+/// somewhere else is a window nobody proved was opened.
+const ARCHIVE_TITLE: &str = "متن‌های درج‌نشدهٔ بازمانده — OmniType";
+
+fn render_archive_body(
+    ui: &mut egui::Ui,
+    archived: &[ArchivedDraft],
+    channel: &Arc<ReviewChannel>,
+) {
+    manager_header(ui, "متن‌های درج‌نشدهٔ بازمانده", None);
+    manager_subtitle(
+        ui,
+        &format!(
+            "مهلت درج این متن‌ها تمام شده و مستقیم درج نمی‌شوند؛ {} متن نگه داشته شده و هیچ‌یک حذف نخواهد شد.",
+            archived.len()
+        ),
+    );
+    ui.add_space(6.0);
+
+    // The list scrolls, so a full budget is browsable in one window: reaching an
+    // older text never requires giving up a newer one.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // Newest first: the text the user has just lost is the one they are
+            // most likely looking for.
+            for item in archived.iter().rev() {
+                render_archived_item(ui, item, channel);
+                ui.add_space(8.0);
+            }
+        });
+}
+
+/// One kept text: readable, copyable, restorable and deletable — on its own.
+fn render_archived_item(ui: &mut egui::Ui, archived: &ArchivedDraft, channel: &Arc<ReviewChannel>) {
+    let id = archived.draft.id;
+    manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+        match &archived.draft.destination {
+            Some(destination) => {
+                let title = destination.title_at_capture.trim();
+                let line = if title.is_empty() {
+                    "مقصد: نامشخص".to_string()
+                } else {
+                    format!("مقصد: {title}")
+                };
+                ui.label(
+                    egui::RichText::new(format_persian_display(&line))
+                        .size(10.5)
+                        .color(palette::TEXT_SECONDARY),
+                );
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(format_persian_display(
+                        "مقصدی ثبت نشده است؛ برای درج باید مقصد دوباره بررسی شود.",
+                    ))
+                    .size(10.5)
+                    .color(palette::WARNING),
+                );
+            }
+        }
+
+        // Read-only. `interactive(false)` rather than a disabled `TextEdit` so
+        // the text is still selectable for the user's own copy, and so it cannot
+        // be mistaken for an editable box. Laid out through the Persian shaper
+        // for the same reason the pending box is: an unshaped `TextEdit` draws
+        // Persian unconnected and in reading order left-to-right.
+        let mut shown = archived.draft.text.clone();
+        let mut layouter =
+            |ui: &egui::Ui, text: &str, wrap: f32| persian_text_edit_layouter(ui, text, wrap);
+        ui.add(
+            egui::TextEdit::multiline(&mut shown)
+                .desired_width(f32::INFINITY)
+                .desired_rows(3)
+                .layouter(&mut layouter)
+                .interactive(false),
+        );
+
+        ui.horizontal(|ui| {
+            if ui
+                .button(format_persian_display("بازگردانی برای بررسی"))
+                .on_hover_text(
+                    "bring this text back as a new draft. It gets a fresh deadline,\n\
+                     and inserting it re-checks the destination first.",
+                )
+                .clicked()
+            {
+                answer(channel, ReviewCommand::Restore { id });
+            }
+
+            if ui
+                .button(format_persian_display("کپی"))
+                .on_hover_text("copy only: nothing is typed and nothing is deleted.")
+                .clicked()
+            {
+                // Pure GUI action: the archive keeps the text.
+                ui.ctx().copy_text(archived.draft.text.clone());
+            }
+
+            if ui
+                .button(format_persian_display("حذف از آرشیو"))
+                .on_hover_text("delete exactly this text, at your request.")
+                .clicked()
+            {
+                answer(channel, ReviewCommand::DiscardArchived { id });
+            }
+        });
+
+        let mut footer = format!("شناسهٔ متن: {id}");
+        if let Some(session) = archived.draft.session {
+            footer.push_str(&format!(" — از دیکتهٔ شمارهٔ {}", session.0));
+        }
+        ui.label(
+            egui::RichText::new(format_persian_display(&footer))
+                .size(9.5)
+                .color(palette::TEXT_FAINT),
+        );
+    });
 }
 
 /// The one id this window uses, in one place.
@@ -399,11 +843,9 @@ fn render_body(
         let title = destination.title_at_capture.trim();
         if !title.is_empty() {
             ui.label(
-                egui::RichText::new(format_persian_display(&format!(
-                    "مقصد: {title}"
-                )))
-                .size(10.5)
-                .color(tint),
+                egui::RichText::new(format_persian_display(&format!("مقصد: {title}")))
+                    .size(10.5)
+                    .color(tint),
             );
         } else {
             ui.label(
@@ -425,11 +867,20 @@ fn render_body(
     ui.add_space(8.0);
 
     manager_card(palette::CARD_BG_ALT, palette::STROKE).show(ui, |ui| {
+        // **The box is laid out through the Persian shaper.** It used to be a
+        // plain `TextEdit`, which egui draws with no shaping and no direction:
+        // the letters came out unconnected and in reading order left-to-right,
+        // which for Persian is exactly the "completely reversed and unreadable"
+        // the user reported. The buffer itself still holds the keystrokes — only
+        // the drawing is shaped.
+        let mut layouter =
+            |ui: &egui::Ui, text: &str, wrap: f32| persian_text_edit_layouter(ui, text, wrap);
         ui.add(
             egui::TextEdit::multiline(&mut state.text)
                 .desired_width(f32::INFINITY)
                 .desired_rows(5)
-                .hint_text("متن خالی است"),
+                .layouter(&mut layouter)
+                .hint_text(format_persian_display("متن خالی است")),
         );
     });
 
@@ -479,23 +930,22 @@ fn render_body(
     ui.horizontal(|ui| {
         let insertable = id.is_some() && !state.text.trim().is_empty();
         if ui
-            .add_enabled(
-                insertable,
-                egui::Button::new(format_persian_display("درج")),
+            .add_enabled(insertable, egui::Button::new(format_persian_display("درج")))
+            .on_hover_text(
+                "type this text into the window it was dictated into.\n\
+                 This window steps out of the way first, so the text goes to your\n\
+                 document instead of here.",
             )
             .clicked()
         {
             if let Some(id) = id {
-                answer(channel, ReviewCommand::Insert {
-                    id,
-                    text: state.text.clone(),
-                });
+                // Deferred, never sent from here: see `defer_insert`. This window
+                // is the one in front while the button is being clicked, and it is
+                // the one window that can never be the destination.
+                state.defer_insert(id, state.text.clone(), Instant::now());
             }
         }
-        if ui
-            .button(format_persian_display("کپی"))
-            .clicked()
-        {
+        if ui.button(format_persian_display("کپی")).clicked() {
             if let Some(id) = id {
                 // The clipboard is a GUI-thread resource, so the copy happens
                 // here and the loop is only told the draft is finished. Its
@@ -504,8 +954,16 @@ fn render_body(
                 answer(channel, ReviewCommand::Copy { id });
             }
         }
+        // The cancel button, named as the user asked for it: «لغو» throws the text
+        // away (nothing is typed, nothing is kept), which is also the only way to
+        // delete a draft. Its hover text says so, because a button whose effect is
+        // "this text is gone" should not have to be guessed at.
         if ui
             .button(format_persian_display("لغو"))
+            .on_hover_text(
+                "throw this text away: nothing is typed, nothing is kept, and the\n\
+                 window closes. Use کپی first if you want a copy of it.",
+            )
             .clicked()
         {
             if let Some(id) = id {
@@ -550,6 +1008,23 @@ mod tests {
     use crate::state::review::{DraftKind, DEFAULT_DRAFT_TTL};
     use crate::state::ReviewSnapshot;
 
+    fn recovery_state() -> ReviewPanelState {
+        let mut state = ReviewPanelState::default();
+        state.open_recovery();
+        state
+    }
+
+    #[test]
+    fn undelivered_text_waits_for_explicit_recovery_but_review_still_opens() {
+        let mut state = ReviewPanelState::default();
+        let mut pending = draft(7, "متن");
+        assert_eq!(plan_for_frame(&state, Some(&pending), &[]), WindowPlan::Hidden);
+        state.open_recovery();
+        assert_eq!(plan_for_frame(&state, Some(&pending), &[]), WindowPlan::Pending(7));
+        pending.kind = DraftKind::Review;
+        assert_eq!(plan_for_frame(&ReviewPanelState::default(), Some(&pending), &[]), WindowPlan::Pending(7));
+    }
+
     fn draft(id: u64, text: &str) -> PendingDraft {
         PendingDraft {
             id,
@@ -558,16 +1033,18 @@ mod tests {
             destination: None,
             session: None,
             raised: Instant::now(),
+            source_record: None,
         }
     }
 
     /// The rule that keeps two dictations from running together in one box.
     #[test]
     fn a_new_draft_replaces_the_text_in_the_box() {
-        let mut state = ReviewPanelState::default();
+        let mut state = recovery_state();
         let snapshot = ReviewSnapshot {
             drafts: vec![draft(0, "اول")],
             revision: 1,
+            ..Default::default()
         };
 
         // First draft: the box takes its text.
@@ -580,6 +1057,7 @@ mod tests {
         let next = ReviewSnapshot {
             drafts: vec![draft(0, "اول"), draft(1, "دوم")],
             revision: 2,
+            ..Default::default()
         };
         let latest = next.latest().cloned();
         let needs_reload = match (&latest, state.editing) {
@@ -597,6 +1075,7 @@ mod tests {
             history: EditHistory::loaded("متن"),
             built_from: 3,
             opened: None,
+            ..Default::default()
         };
         assert_eq!(state.editing_id(), Some(7));
     }
@@ -618,7 +1097,7 @@ mod tests {
 
     #[test]
     fn a_default_panel_has_no_draft_and_no_text() {
-        let state = ReviewPanelState::default();
+        let state = recovery_state();
         assert_eq!(state.editing_id(), None);
         assert!(state.text.is_empty());
     }
@@ -735,18 +1214,22 @@ mod tests {
     #[test]
     fn history_does_not_cross_drafts() {
         let channel = ReviewChannel::new();
-        let mut state = ReviewPanelState::default();
+        let mut state = recovery_state();
 
         channel.raise(draft(0, "اول"));
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
+        let _ = ctx.run(Default::default(), |ctx| {
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL)
+        });
         state.text = "اول ویرایش‌شده".into();
         state.history.observe(&state.text, Instant::now());
         assert!(state.history.can_undo());
 
         // A second dictation arrives while the first is still in the box.
         channel.raise(draft(1, "دوم"));
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
+        let _ = ctx.run(Default::default(), |ctx| {
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL)
+        });
         assert_eq!(state.text, "دوم");
         assert!(
             !state.history.can_undo(),
@@ -762,11 +1245,13 @@ mod tests {
     #[test]
     fn undo_answers_nothing_and_touches_no_session() {
         let channel = ReviewChannel::new();
-        let mut state = ReviewPanelState::default();
+        let mut state = recovery_state();
         channel.raise(draft(0, "سلام"));
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
+        let _ = ctx.run(Default::default(), |ctx| {
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL)
+        });
         let before = channel.snapshot();
 
         state.text = "سلام ویرایش".into();
@@ -791,19 +1276,23 @@ mod tests {
     #[test]
     fn undo_then_insert_types_the_restored_text_into_the_original_destination() {
         let channel = ReviewChannel::new();
-        let mut state = ReviewPanelState::default();
+        let mut state = recovery_state();
         let destination = crate::output::target::TargetIdentity {
             hwnd: 5,
             pid: 9,
             exe_path: None,
             title_at_capture: "سند".into(),
+            focus_hwnd: None,
+            focus_element: None,
         };
         let mut d = draft(0, "سلام");
         d.destination = Some(destination.clone());
         channel.raise(d);
 
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL));
+        let _ = ctx.run(Default::default(), |ctx| {
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL)
+        });
 
         // The user edits, then takes the edit back.
         state.text = "سلام!".into();
@@ -861,7 +1350,7 @@ mod tests {
     fn both_kinds_draw_without_panicking() {
         for kind in [DraftKind::Review, DraftKind::Undelivered] {
             let channel = ReviewChannel::new();
-            let mut state = ReviewPanelState::default();
+            let mut state = recovery_state();
             let mut d = draft(0, "متن");
             d.kind = kind;
             let output = draw_body(&channel, &mut state, &d);
@@ -879,11 +1368,59 @@ mod tests {
     #[test]
     fn a_draft_with_no_destination_still_draws() {
         let channel = ReviewChannel::new();
-        let mut state = ReviewPanelState::default();
+        let mut state = recovery_state();
         let mut d = draft(0, "متن");
         d.destination = None;
         let output = draw_body(&channel, &mut state, &d);
         assert!(output.shapes.len() > 5);
+    }
+
+    /// The box is drawn **shaped**, which is what the user's "completely reversed
+    /// and unreadable" was about.
+    ///
+    /// Asserted on the shapes egui was actually given, not on the widget's
+    /// arguments: the bug was a `TextEdit` with no layouter, and a test that only
+    /// read `state.text` would have passed all the way through it. Every text
+    /// shape this window draws is checked, so the shaped line has to be in there.
+    #[test]
+    fn the_text_box_is_drawn_shaped_not_raw() {
+        let channel = ReviewChannel::new();
+        let mut state = recovery_state();
+        let mut d = draft(0, "سلام دنیا از پاتون");
+        d.destination = None;
+        // What the loader would have put in the box (see `render_pending`):
+        // `draw_body` draws the box, it does not fill it.
+        state.text = d.text.clone();
+        state.editing = Some(d.id);
+        let output = draw_body(&channel, &mut state, &d);
+
+        let shaped = format_persian_display(&d.text);
+        assert_ne!(
+            shaped, d.text,
+            "the sample has to be text that shaping moves"
+        );
+        let mut drawn: Vec<String> = Vec::new();
+        for clipped in &output.shapes {
+            collect_drawn_text(&clipped.shape, &mut drawn);
+        }
+        assert!(
+            drawn.iter().any(|line| line == &shaped),
+            "the box must be laid out through the Persian shaper; drawn: {drawn:?}"
+        );
+    }
+
+    /// Every string a shape will actually draw, including the ones inside
+    /// [`egui::epaint::Shape::Vec`] — a `TextEdit` draws its text inside one.
+    fn collect_drawn_text(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::epaint::Shape::Vec(shapes) => {
+                for inner in shapes {
+                    collect_drawn_text(inner, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A destination **with** a title must draw too: that arm formats and
@@ -892,20 +1429,254 @@ mod tests {
     #[test]
     fn a_named_destination_draws() {
         let channel = ReviewChannel::new();
-        let mut state = ReviewPanelState::default();
+        let mut state = recovery_state();
         let mut d = draft(0, "متن");
         d.destination = Some(crate::output::target::TargetIdentity {
             hwnd: 1,
             pid: 1,
             exe_path: None,
             title_at_capture: "سندImportant".into(),
+            focus_hwnd: None,
+            focus_element: None,
         });
         let output = draw_body(&channel, &mut state, &d);
         assert!(output.shapes.len() > 5);
     }
 
+    // ── the window's own life: open, close, and stay closed ──────────────
+
+    /// The table the user experiences. Nothing pending and nothing kept: no
+    /// window. A draft: the pending window. Kept text the user has not closed the
+    /// window for: the archive.
+    #[test]
+    fn the_window_shows_what_is_worth_showing() {
+        let pending = draft(4, "متن");
+        let archived = vec![ArchivedDraft {
+            draft: draft(3, "کهنه"),
+            expired_at: Instant::now(),
+        }];
+        let none = BTreeSet::new();
+
+        assert_eq!(plan_window(None, &[], &none, &none), WindowPlan::Hidden);
+        assert_eq!(
+            plan_window(Some(&pending), &[], &none, &none),
+            WindowPlan::Pending(4)
+        );
+        assert_eq!(
+            plan_window(Some(&pending), &archived, &none, &none),
+            WindowPlan::Pending(4),
+            "a live draft outranks the archive"
+        );
+        assert_eq!(
+            plan_window(None, &archived, &none, &none),
+            WindowPlan::Archive
+        );
+    }
+
+    /// The defect the user hit: closing the window did nothing, because the
+    /// window was drawn again on the very next frame. Closing it must hold for
+    /// the text it was closed for.
+    #[test]
+    fn a_closed_window_stays_closed_for_what_it_was_closed_for() {
+        let pending = draft(4, "متن");
+        let archived = vec![ArchivedDraft {
+            draft: draft(3, "کهنه"),
+            expired_at: Instant::now(),
+        }];
+
+        let mut closed_pending = BTreeSet::new();
+        closed_pending.insert(4);
+        assert_eq!(
+            plan_window(Some(&pending), &archived, &closed_pending, &BTreeSet::new()),
+            WindowPlan::Hidden,
+            "the user closed the window for this draft"
+        );
+
+        let mut closed_archive = BTreeSet::new();
+        closed_archive.insert(3);
+        assert_eq!(
+            plan_window(None, &archived, &BTreeSet::new(), &closed_archive),
+            WindowPlan::Hidden
+        );
+    }
+
+    /// Closing is not a lock-out: a *new* text re-opens the window, which is how
+    /// "your text was kept" still reaches the user after they closed the window.
+    #[test]
+    fn a_new_text_reopens_the_window_the_user_closed() {
+        let mut closed_archive = BTreeSet::new();
+        closed_archive.insert(3);
+        let fresh = vec![
+            ArchivedDraft {
+                draft: draft(3, "کهنه"),
+                expired_at: Instant::now(),
+            },
+            ArchivedDraft {
+                draft: draft(9, "تازه"),
+                expired_at: Instant::now(),
+            },
+        ];
+        assert_eq!(
+            plan_window(None, &fresh, &BTreeSet::new(), &closed_archive),
+            WindowPlan::Archive,
+            "an entry the user has not seen must be offered"
+        );
+
+        let mut closed_pending = BTreeSet::new();
+        closed_pending.insert(3);
+        let next = draft(9, "دیکتهٔ بعدی");
+        assert_eq!(
+            plan_window(Some(&next), &[], &closed_pending, &BTreeSet::new()),
+            WindowPlan::Pending(9),
+            "a different draft is a different decision"
+        );
+    }
+
+    /// Closing the archive marks every text on screen as seen — otherwise the
+    /// very next frame would compute the same plan and re-open the window.
+    #[test]
+    fn closing_the_archive_marks_everything_on_screen_as_seen() {
+        let channel = ReviewChannel::new();
+        let mut state = recovery_state();
+        let archived = vec![
+            ArchivedDraft {
+                draft: draft(2, "اول"),
+                expired_at: Instant::now(),
+            },
+            ArchivedDraft {
+                draft: draft(5, "دوم"),
+                expired_at: Instant::now(),
+            },
+        ];
+        assert!(!archived.is_empty() && archived.len() == 2);
+        state.close_archive(&archived);
+        assert_eq!(
+            plan_window(None, &archived, &BTreeSet::new(), &state.closed_archive),
+            WindowPlan::Hidden
+        );
+        let _ = channel;
+    }
+
+    /// The bound on that memory: ids are handed out in increasing order, so the
+    /// smallest is the oldest, and it is the one forgotten first.
+    #[test]
+    fn the_closed_memory_forgets_the_oldest_first() {
+        let mut set = BTreeSet::new();
+        for id in 0..(CLOSED_MEMORY as u64 + 5) {
+            forget_oldest(&mut set, CLOSED_MEMORY);
+            set.insert(id);
+        }
+        assert!(set.len() < CLOSED_MEMORY + 1, "the set is bounded");
+        assert!(!set.contains(&0), "the oldest id was forgotten");
+        assert!(
+            set.contains(&(CLOSED_MEMORY as u64 + 4)),
+            "the newest is kept"
+        );
+    }
+
+    // ── the click that had to wait: «درج» ────────────────────────────────
+
+    /// A click on «درج» hides the window and holds the command back.
+    ///
+    /// Both halves matter, and both are what the user's build was missing. The
+    /// window has to go: a destination is judged against the window in front, and
+    /// the window in front at the moment of the click is this one — which is how
+    /// four presses of the button turned into four `validity=Changed` refusals.
+    /// And the command has to wait, because sending it now would be judged *while*
+    /// this window is still up.
+    #[test]
+    fn an_insert_gets_the_window_out_of_the_way_and_waits() {
+        let mut state = recovery_state();
+        let clicked = Instant::now();
+        state.defer_insert(7, "سلام".into(), clicked);
+
+        assert!(
+            state.take_due_answer(clicked).is_none(),
+            "the loop must not be asked while this window is still in front"
+        );
+        let draft = draft(7, "سلام");
+        assert_eq!(
+            plan_for_frame(&state, Some(&draft), &[]),
+            WindowPlan::Hidden,
+            "the window steps out of the way"
+        );
+
+        let due = clicked + STEP_ASIDE;
+        assert_eq!(
+            state.take_due_answer(due),
+            Some(ReviewCommand::Insert {
+                id: 7,
+                text: "سلام".into()
+            })
+        );
+        assert!(
+            state.take_due_answer(due + STEP_ASIDE).is_none(),
+            "an answer is sent exactly once"
+        );
+        assert_eq!(
+            plan_for_frame(&state, Some(&draft), &[]),
+            WindowPlan::Pending(7),
+            "and afterwards the ordinary rule decides again"
+        );
+    }
+
+    /// The text the loop is about to type must survive the moment the window is
+    /// out of the way.
+    ///
+    /// "Nothing on screen" normally clears the box — a new draft must not inherit
+    /// an old one's text — but an answer in flight is not that case: the box holds
+    /// what the insert is about to type, and clearing it here would send the
+    /// *empty* text the loop would then refuse.
+    #[test]
+    fn the_box_keeps_the_text_while_the_window_is_out_of_the_way() {
+        let channel = ReviewChannel::new();
+        let mut state = recovery_state();
+        channel.raise(draft(0, "سلام دنیا"));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL)
+        });
+        assert_eq!(state.text, "سلام دنیا");
+        // The store owns numbering, so the id the buttons must name is the one
+        // the box was loaded with.
+        let id = state.editing_id().expect("a draft is loaded");
+
+        state.text = "سلام دنیا!".into();
+        state.defer_insert(id, state.text.clone(), Instant::now());
+        let _ = ctx.run(Default::default(), |ctx| {
+            render(ctx, &channel, &mut state, DEFAULT_DRAFT_TTL)
+        });
+        assert_eq!(
+            state.editing_id(),
+            Some(id),
+            "the draft is still the one in hand"
+        );
+        assert_eq!(
+            state.text, "سلام دنیا!",
+            "what the loop was asked to type must still be in the box"
+        );
+    }
+
+    /// Closing the pending window is not an answer: the draft is still there for
+    /// the store, and it is still offered once it becomes archived text — which
+    /// is the difference between "stop showing me this" and "throw this away".
+    #[test]
+    fn closing_the_window_answers_nothing_about_the_text() {
+        let channel = ReviewChannel::new();
+        let mut state = recovery_state();
+        channel.raise(draft(0, "سلام"));
+        let before = channel.snapshot();
+
+        state.close_pending(0);
+
+        let after = channel.snapshot();
+        assert_eq!(after.drafts.len(), before.drafts.len());
+        assert_eq!(after.drafts[0].text, "سلام");
+        assert_eq!(after.revision, before.revision, "closing is not an answer");
+    }
+
     /// The loader: a pending draft must land in the box, because the box is what
-/// the buttons would type.
+    /// the buttons would type.
     ///
     /// Driven through [`render`], not [`render_body`]: loading happens
     /// *before* the viewport is opened, so this half does run headlessly and is
@@ -914,10 +1685,15 @@ mod tests {
     #[test]
     fn loading_a_draft_puts_its_text_in_the_box() {
         let channel = ReviewChannel::new();
-        let mut state = ReviewPanelState::default();
+        let mut state = recovery_state();
 
         // Nothing pending: nothing is loaded.
-        render(&egui::Context::default(), &channel, &mut state, DEFAULT_DRAFT_TTL);
+        render(
+            &egui::Context::default(),
+            &channel,
+            &mut state,
+            DEFAULT_DRAFT_TTL,
+        );
         assert_eq!(state.editing_id(), None);
 
         channel.raise(draft(0, "سلام دنیا"));

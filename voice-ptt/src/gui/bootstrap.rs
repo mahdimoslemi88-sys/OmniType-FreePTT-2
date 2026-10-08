@@ -128,6 +128,17 @@ pub fn native_options(settings: &Settings) -> eframe::NativeOptions {
             .with_transparent(true)
             .with_always_on_top()
             .with_resizable(false)
+            // The overlay is a control, not a window the user works in, and it
+            // must never be the window in front: a dictation captures the
+            // foreground window as its destination, so a launch that stole the
+            // focus made every dictation start with this program as the target.
+            // `WS_EX_NOACTIVATE` (in `window_shape`) stops a *click* from
+            // activating the orb, but it cannot undo an activation that already
+            // happened while the window was being created — which is exactly
+            // what the user's log shows: `main window set to never activate`
+            // milliseconds after the window appeared, and then four orb clicks
+            // with `the window in front belongs to this program`.
+            .with_active(false)
             .with_visible(settings.gui.show_overlay)
             .with_position(origin)
             .with_inner_size([side, side])
@@ -332,6 +343,25 @@ mod tests {
             native_options(&settings).viewport.position,
             Some(egui::pos2(expected[0], expected[1])),
             "the viewport must be positioned by orb_window_origin, not by a second copy of the math"
+        );
+    }
+
+    /// The orb must not be the window in front when it opens.
+    ///
+    /// A dictation captures the foreground window as its destination; a launch
+    /// that stole the focus made this program the destination of every dictation
+    /// started from the orb, and each one was refused with
+    /// `destination unknown`. `WS_EX_NOACTIVATE` stops a *click* from activating
+    /// the orb, but cannot undo the activation that happens while the window is
+    /// being created — which is why this flag, and not only that style, is the
+    /// contract.
+    #[test]
+    fn the_overlay_never_takes_the_foreground_when_it_opens() {
+        let settings = Settings::default();
+        assert_eq!(
+            native_options(&settings).viewport.active,
+            Some(false),
+            "a launch that takes the foreground steals the destination of the next dictation"
         );
     }
 

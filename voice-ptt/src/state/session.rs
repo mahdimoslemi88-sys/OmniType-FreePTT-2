@@ -249,6 +249,7 @@ struct SessionRecord {
 pub(crate) struct SessionDriver {
     latch: LatchPolicy,
     recording: bool,
+    mouse_latched: bool,
     /// Sessions that can still produce a valid result: the one being recorded and
     /// any earlier one still waiting for its last chunk.
     ///
@@ -266,6 +267,7 @@ impl SessionDriver {
         Self {
             latch: LatchPolicy::new(hotkey),
             recording: false,
+            mouse_latched: false,
             open: Vec::new(),
             closed: Vec::new(),
             next_session: 0,
@@ -279,7 +281,22 @@ impl SessionDriver {
 
     /// Whether the hands-free badge should be showing.
     pub fn latched(&self) -> bool {
-        self.latch.is_latched()
+        self.mouse_latched || self.latch.is_latched()
+    }
+
+    pub fn mouse_latched(&self) -> bool {
+        self.mouse_latched
+    }
+
+    /// Mouse clicks have their own toggle; keyboard tap deadlines do not apply.
+    pub fn on_orb_toggle(&mut self) -> Vec<Effect> {
+        if self.recording {
+            vec![Effect::FinishSession]
+        } else {
+            self.latch.reset();
+            self.mouse_latched = true;
+            vec![Effect::BeginRecording]
+        }
     }
 
     /// The session currently being recorded, if any.
@@ -339,11 +356,12 @@ impl SessionDriver {
     /// whoever answers the "which session?" question later.
     pub fn open_session(&mut self, capture_open: bool) -> Option<SessionId> {
         if !capture_open {
+            self.mouse_latched = false;
             return None;
         }
         self.next_session += 1;
         let id = SessionId(self.next_session);
-        let kind = if self.latch.is_latched() {
+        let kind = if self.latched() {
             SessionKind::HandsFree
         } else {
             SessionKind::PushToTalk
@@ -361,6 +379,7 @@ impl SessionDriver {
     /// The microphone stopped. The session is **not** closed: it is waiting for
     /// the last result, which is what almost every dictation does.
     pub fn recording_stopped(&mut self, id: SessionId) {
+        self.mouse_latched = false;
         if let Some(record) = self.open.iter_mut().find(|s| s.id == id) {
             record.phase = SessionPhase::AwaitingResult;
         }
@@ -389,6 +408,7 @@ impl SessionDriver {
             .any(|s| s.id == id && matches!(s.phase, SessionPhase::Recording));
         self.close(id, SessionPhase::Cancelled);
         if was_recording {
+            self.mouse_latched = false;
             self.recording = false;
             self.latch.reset();
         }
@@ -413,18 +433,25 @@ impl SessionDriver {
 
     /// The record key went down.
     pub fn on_record_down(&mut self, now: Instant) -> Vec<Effect> {
+        if self.mouse_latched {
+            return Vec::new();
+        }
         let action = self.latch.press(now, self.recording);
         self.decide(action)
     }
 
     /// The record key came up.
     pub fn on_record_up(&mut self, now: Instant) -> Vec<Effect> {
+        if self.mouse_latched {
+            return Vec::new();
+        }
         let action = self.latch.release(now, self.recording);
         self.decide(action)
     }
 
     /// The user asked to abandon the utterance (Escape / tray).
     pub fn on_cancel(&mut self) -> Vec<Effect> {
+        self.mouse_latched = false;
         // Cancel has to reach a session that has already stopped recording and is
         // waiting for its last result. That is the ordinary case for the moment a
         // user reaches for Escape: the app is busy *because* it is converting. A
@@ -445,6 +472,9 @@ impl SessionDriver {
     /// While idle it only ages the latch out, so a session that ended on some
     /// other path (VAD endpoint, cap, cancel) leaves no stale latch behind.
     pub fn on_tick(&mut self, now: Instant) -> Vec<Effect> {
+        if self.recording && self.mouse_latched {
+            return vec![Effect::PollAudio];
+        }
         if !self.recording {
             self.latch.tick(now, false);
             return Vec::new();
@@ -685,6 +715,34 @@ mod tests {
 
     fn hotkey() -> HotkeySettings {
         HotkeySettings::default()
+    }
+
+    #[test]
+    fn mouse_recording_survives_keyboard_release_and_tap_deadline() {
+        let mut d = SessionDriver::new(&hotkey());
+        let now = Instant::now();
+        assert_eq!(d.on_orb_toggle(), vec![Effect::BeginRecording]);
+        let id = d.open_session(true).unwrap();
+        assert!(d.latched());
+        assert_eq!(d.kind_of(id), Some(SessionKind::HandsFree));
+        assert!(d.on_record_up(now).is_empty());
+        assert!(d.on_record_down(now).is_empty());
+        assert_eq!(
+            d.on_tick(now + Duration::from_secs(60)),
+            vec![Effect::PollAudio]
+        );
+        assert_eq!(d.on_orb_toggle(), vec![Effect::FinishSession]);
+        d.ended_session(id);
+        assert_quiet(&d);
+        assert_eq!(d.phase_of(id), Some(SessionPhase::AwaitingResult));
+    }
+
+    #[test]
+    fn failed_mouse_capture_does_not_leave_a_latched_badge() {
+        let mut d = SessionDriver::new(&hotkey());
+        d.on_orb_toggle();
+        assert_eq!(d.open_session(false), None);
+        assert_quiet(&d);
     }
 
     /// Presses the record key and then reports that the microphone opened — what
