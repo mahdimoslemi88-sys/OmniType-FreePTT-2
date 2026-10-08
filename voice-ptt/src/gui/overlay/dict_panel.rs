@@ -165,8 +165,12 @@ pub(crate) fn render(
                         state.new_from.clear();
                         state.new_to.clear();
                         state.new_cat.clear();
+                        // Raw, not shaped: `success_banner` is the shaping
+                        // boundary (it formats its own text). A pre-formatted
+                        // string here was shaped a second time and drawn
+                        // backwards.
                         state.msg = Some((
-                            format_persian_display("قاعده با موفقیت ثبت و ذخیره شد!"),
+                            "قاعده با موفقیت ثبت و ذخیره شد!".to_string(),
                             Instant::now(),
                         ));
                     }
@@ -398,9 +402,7 @@ pub(crate) fn render(
                                                             dict.add_rule(from, to, cat);
                                                             let _ = dict.save_to_file();
                                                             state.msg = Some((
-                                                                format_persian_display(
-                                                                    "قاعده به‌روزرسانی شد",
-                                                                ),
+                                                                "قاعده به‌روزرسانی شد".to_string(),
                                                                 Instant::now(),
                                                             ));
                                                         }
@@ -515,10 +517,7 @@ pub(crate) fn render(
         if let Ok(mut dict) = dictionary.write() {
             dict.remove_by_from(&target_from);
             let _ = dict.save_to_file();
-            state.msg = Some((
-                format_persian_display("کلمه از دیکشنری حذف شد"),
-                Instant::now(),
-            ));
+            state.msg = Some(("کلمه از دیکشنری حذف شد".to_string(), Instant::now()));
         }
     }
 
@@ -541,10 +540,7 @@ pub(crate) fn render(
         {
             if let Ok(dict) = dictionary.read() {
                 if dict.save_to_file().is_ok() {
-                    state.msg = Some((
-                        format_persian_display("دیکشنری با موفقیت ذخیره شد"),
-                        Instant::now(),
-                    ));
+                    state.msg = Some(("دیکشنری با موفقیت ذخیره شد".to_string(), Instant::now()));
                 }
             }
         }
@@ -562,10 +558,7 @@ pub(crate) fn render(
         {
             if let Ok(mut dict) = dictionary.write() {
                 if dict.reload_from_file().is_ok() {
-                    state.msg = Some((
-                        format_persian_display("دیکشنری از دیسک بازخوانی شد"),
-                        Instant::now(),
-                    ));
+                    state.msg = Some(("دیکشنری از دیسک بازخوانی شد".to_string(), Instant::now()));
                 }
             }
         }

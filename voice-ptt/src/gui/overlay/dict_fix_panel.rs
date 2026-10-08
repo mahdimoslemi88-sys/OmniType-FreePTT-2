@@ -501,31 +501,36 @@ pub(crate) fn render(
             },
         );
 
+        // Every line below is handed to `callout` **unshaped**: `callout` is the
+        // shaping boundary (it formats its body itself), so a string that had
+        // already been through `format_persian_display` used to be shaped twice
+        // and rendered backwards. This is the warning box the user red-circled in
+        // the dictionary tab.
         if let Some(reason) = no_effect {
             ui.add_space(4.0);
             let text = match reason {
-                NoEffect::SampleDoesNotContainTheWord => format_persian_display(&format!(
+                NoEffect::SampleDoesNotContainTheWord => format!(
                     "واژهٔ «{}» در جملهٔ نمونه نیست، پس این پیش‌نمایش دربارهٔ قاعده چیزی نمی‌گوید. جملهٔ دیگری را بگذارید یا واژه را در همین جمله درست بنویسید.",
                     state.from.trim()
-                )),
-                NoEffect::RawDestinationIgnoresGeneral => format_persian_display(
+                ),
+                NoEffect::RawDestinationIgnoresGeneral =>
                     "این برنامه در حالت خام است و واژه‌نامهٔ عمومی روی آن اجرا نمی‌شود. \
-                     برای اثر کردن، محدوده را روی همان پروفایل بگذارید.",
-                ),
-                NoEffect::AlreadyCorrect => format_persian_display(
-                    "متن نمونه از قبل همین را می‌دهد؛ قاعده لازم نیست.",
-                ),
+                     برای اثر کردن، محدوده را روی همان پروفایل بگذارید."
+                        .to_string(),
+                NoEffect::AlreadyCorrect => {
+                    "متن نمونه از قبل همین را می‌دهد؛ قاعده لازم نیست.".to_string()
+                }
             };
             callout(ui, CalloutKind::Info, &text);
         }
 
         for warning in &assessment.warnings {
             ui.add_space(4.0);
-            callout(ui, CalloutKind::Warning, &format_persian_display(&describe(warning)));
+            callout(ui, CalloutKind::Warning, &describe(warning));
         }
         for objection in &assessment.objections {
             ui.add_space(4.0);
-            callout(ui, CalloutKind::Warning, &format_persian_display(&refuse(objection)));
+            callout(ui, CalloutKind::Warning, &refuse(objection));
         }
 
         ui.add_space(6.0);

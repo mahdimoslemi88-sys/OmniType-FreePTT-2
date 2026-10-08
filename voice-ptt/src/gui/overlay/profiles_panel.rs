@@ -275,9 +275,11 @@ pub(crate) fn validate_binding(
 ) -> Result<(), String> {
     let trimmed = binding.trim();
     if trimmed.is_empty() {
-        return Err(format_persian_display(
-            "نام برنامه خالی است؛ مثل code.exe یا مسیر کامل آن را بنویسید",
-        ));
+        // **Raw text.** The caller draws this through `callout`, which shapes its
+        // body; shaping it here as well produced the backwards box the user
+        // red-circled under «برنامه:» — the Latin token `code.exe` ended up at the
+        // wrong end of the sentence.
+        return Err("نام برنامه خالی است؛ مثل code.exe یا مسیر کامل آن را بنویسید".to_string());
     }
     let key = binding_key(trimmed);
     let clash = set
@@ -291,9 +293,9 @@ pub(crate) fn validate_binding(
         } else {
             other.name.trim()
         };
-        return Err(format_persian_display(&format!(
+        return Err(format!(
             "این برنامه همین حالا به پروفایل «{name}» بسته شده است"
-        )));
+        ));
     }
     Ok(())
 }
@@ -462,8 +464,13 @@ pub(crate) fn render(
                             ui.set_min_width(ui.available_width());
                             if let Some((text, at)) = state.msg.clone() {
                                 if at.elapsed().as_secs() < 6 {
+                                    // Shaped here, at the only place that draws
+                                    // it: `flash` stores raw text, so a label
+                                    // that drew it untouched showed Persian
+                                    // unconnected and in reading order
+                                    // left-to-right — backwards.
                                     ui.label(
-                                        egui::RichText::new(text)
+                                        egui::RichText::new(format_persian_display(&text))
                                             .size(10.0)
                                             .color(palette::SUCCESS),
                                     );
@@ -912,12 +919,13 @@ pub(crate) fn render(
                             );
                             if !effect.changes_anything() {
                                 ui.add_space(3.0);
+                                // Unshaped on purpose: `callout` formats its body,
+                                // and shaping it here as well is what drew this
+                                // box backwards.
                                 callout(
                                     ui,
                                     CalloutKind::Info,
-                                    &format_persian_display(
-                                        "این پروفایل این جمله را تغییر نمی‌دهد؛ یا قاعده‌ای نگرفته و حالتش هم مثل مقدار عمومی است، یا واژه‌های این جمله در آن نیستند.",
-                                    ),
+                                    "این پروفایل این جمله را تغییر نمی‌دهد؛ یا قاعده‌ای نگرفته و حالتش هم مثل مقدار عمومی است، یا واژه‌های این جمله در آن نیستند.",
                                 );
                             }
 
