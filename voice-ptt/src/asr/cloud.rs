@@ -25,10 +25,42 @@ use crate::config::settings::CloudConfig;
 
 /// Cloud transcription engine (blocking client; the router offloads it to
 /// the blocking pool, same as the local whisper engine).
+/// Where the key this engine is using actually came from.
+///
+/// Exists because "the engine has a key" and "the key you are editing is the
+/// one being used" are different statements, and a user who edits a settings
+/// field while an environment variable or the credential store overrides it
+/// needs to be told *that* rather than blaming the field. It is also what makes
+/// the store → engine wiring observable from outside this module without a
+/// public accessor that hands out the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKeySource {
+    /// `VOICE_PTT_CLOUD_KEY` — built-in cloud engine only.
+    Environment,
+    /// The credential store, keyed by service name or provider id.
+    Store,
+    /// `config.toml` / the provider's settings entry — the pre-migration fallback.
+    Settings,
+    /// No key anywhere; the engine will report "not configured".
+    Missing,
+}
+
+impl EngineKeySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Environment => "environment variable",
+            Self::Store => "Windows Credential Manager",
+            Self::Settings => "config.toml",
+            Self::Missing => "nowhere",
+        }
+    }
+}
+
 pub struct CloudEngine {
     client: Client,
     config: CloudConfig,
     resolved_key: String,
+    key_source: EngineKeySource,
     quota: Arc<DailyQuota>,
     engine_id: String,
     display_name: String,
@@ -53,15 +85,20 @@ impl CloudEngine {
     /// write the plaintext straight back to `config.toml` on the next save.
     /// `usage_path` persists the daily request counter across restarts.
     pub fn new(mut config: CloudConfig, usage_path: PathBuf) -> Self {
+        let mut key_source = EngineKeySource::Missing;
         if let Ok(key) = std::env::var("VOICE_PTT_CLOUD_KEY") {
             if !key.trim().is_empty() {
                 config.api_key = key;
+                key_source = EngineKeySource::Environment;
             }
         }
         if config.api_key.trim().is_empty() {
             if let Some(stored) = crate::credentials_resolver::cloud_key() {
                 config.api_key = stored.expose_secret().to_string();
+                key_source = EngineKeySource::Store;
             }
+        } else if key_source == EngineKeySource::Missing {
+            key_source = EngineKeySource::Settings;
         }
         let resolved_key = config.api_key.trim().to_string();
 
@@ -82,6 +119,7 @@ impl CloudEngine {
             client,
             config,
             resolved_key,
+            key_source,
             quota,
             engine_id: "groq".to_string(),
             display_name: "Groq Cloud".to_string(),
@@ -90,12 +128,40 @@ impl CloudEngine {
     }
 
     /// Builds a custom cloud provider engine (e.g. user-added OpenAI-compatible endpoint).
-    pub fn new_custom(provider: &crate::config::settings::CustomProvider, usage_path: PathBuf) -> Self {
+    ///
+    /// The key is resolved **store first, settings second**: the credential store
+    /// entry is keyed by the provider's stable `id`, and `provider.api_key` is
+    /// only a fallback for a machine where the migration could not run (no
+    /// Credential Manager, or a conflict it refused to overwrite). Custom
+    /// providers deliberately have **no environment override** — the built-in
+    /// cloud key has `VOICE_PTT_CLOUD_KEY` as an escape hatch, but inventing one
+    /// environment variable per provider would create a configuration surface
+    /// the panel never shows.
+    ///
+    /// `provider.api_key` is not written back into the engine's config: the
+    /// engine holds the resolved key in memory only, so `Settings::save` can
+    /// never put it back on disk.
+    pub fn new_custom(
+        provider: &crate::config::settings::CustomProvider,
+        usage_path: PathBuf,
+    ) -> Self {
+        let (resolved, key_source) =
+            match crate::credentials_resolver::stored_custom_key(&provider.id) {
+                Some(stored) => (stored.expose_secret().to_string(), EngineKeySource::Store),
+                None => (
+                    provider.api_key.trim().to_string(),
+                    if provider.api_key.trim().is_empty() {
+                        EngineKeySource::Missing
+                    } else {
+                        EngineKeySource::Settings
+                    },
+                ),
+            };
         let config = CloudConfig {
             enabled: true,
             provider: provider.id.clone(),
             base_url: provider.base_url.clone(),
-            api_key: provider.api_key.clone(),
+            api_key: resolved,
             model: provider.model.clone(),
             language: provider.language.clone(),
             daily_limit: 10_000,
@@ -118,11 +184,22 @@ impl CloudEngine {
             client,
             config,
             resolved_key,
+            key_source,
             quota,
             engine_id: provider.id.clone(),
             display_name: provider.name.clone(),
             engine_kind: "Cloud (Custom)",
         }
+    }
+
+    /// Where the key this engine is using came from. Never the key itself.
+    pub fn key_source(&self) -> EngineKeySource {
+        self.key_source
+    }
+
+    /// Whether a key is present at all. Says nothing about which one.
+    pub fn has_key(&self) -> bool {
+        !self.resolved_key.is_empty()
     }
 
     /// Requests remaining in today's cloud budget (for the UI).
@@ -271,10 +348,7 @@ impl AsrEngine for CloudEngine {
 
         // Count only successful, accepted requests against the budget.
         self.quota.record_request();
-        tracing::debug!(
-            remaining = self.quota.remaining(),
-            "cloud quota consumed"
-        );
+        tracing::debug!(remaining = self.quota.remaining(), "cloud quota consumed");
         Ok(text)
     }
 }
@@ -328,7 +402,8 @@ mod tests {
     use super::*;
 
     fn temp_usage_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("voice-ptt-cloud-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("voice-ptt-cloud-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("cloud_usage.json")
     }
@@ -389,7 +464,10 @@ mod tests {
         std::env::remove_var("VOICE_PTT_CLOUD_KEY");
         let cfg = CloudConfig::default(); // enabled = false
         let engine = CloudEngine::new(cfg, temp_usage_path("h1"));
-        assert!(!AsrEngine::health(&engine).is_available(), "disabled by default");
+        assert!(
+            !AsrEngine::health(&engine).is_available(),
+            "disabled by default"
+        );
 
         let cfg = CloudConfig {
             enabled: true,
@@ -450,7 +528,10 @@ mod tests {
             s,
             r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for daily requests: 300"}}"#
         ));
-        assert!(CloudEngine::is_daily_limit_response(s, "daily quota exceeded"));
+        assert!(CloudEngine::is_daily_limit_response(
+            s,
+            "daily quota exceeded"
+        ));
         assert!(!CloudEngine::is_daily_limit_response(
             s,
             r#"{"error":{"message":"Rate limit reached for RPM"}}"#

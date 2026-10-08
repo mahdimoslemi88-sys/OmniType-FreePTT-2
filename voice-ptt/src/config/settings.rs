@@ -1,16 +1,72 @@
 //! Application settings: typed config with TOML persistence.
+//!
+//! # Durability contract (F1)
+//!
+//! [`Settings::save`] is **write-to-temp-then-atomic-replace**, not a plain
+//! `std::fs::write`. The settings file holds the user's paid configuration, and
+//! a truncated write — a crash, a full disk, a killed process between the
+//! truncate and the bytes — would leave a `config.toml` with no key in it. The
+//! [`crate::credentials::migration::SettingsPersister`] contract makes that
+//! guarantee explicit, and this is the one implementation of it that the real
+//! app reaches.
+//!
+//! What this does **not** claim: durability across a power cut. It flushes and
+//! `sync_all`s the temp file before the replace, which is what a process can
+//! honestly promise; the filesystem and the disk's own write cache are outside
+//! what any Rust code here can see, so no power-loss guarantee is made.
+//!
+//! # The writer's contract (F1)
+//!
+//! Atomic replace closes the *torn file*: a reader never sees half a
+//! `config.toml`. It does not close the *lost update*: a writer that loads the
+//! file, changes one field in memory and saves it back silently puts back
+//! everything it read — so a change another writer made in between is gone. The
+//! migration that clears a plaintext key is exactly such a writer, and the
+//! dashboard is exactly the other one.
+//!
+//! So every writer of a settings file belongs to one of two forms, and both take
+//! the **same per-file lock**:
+//!
+//! * [`Settings::save`] — "write this whole document". The caller owns the model
+//!   (the dashboard's live `Settings`), and the write is whole and atomic.
+//! * [`Settings::transact`] — "read, change one thing, write". The read and the
+//!   write are **not** assumed to be adjacent: the file's bytes are read once as
+//!   a version, the edit is applied in memory, and the write only happens if the
+//!   file still has those bytes — otherwise it is reloaded and the edit is
+//!   re-applied on top of the newer content.
+//!
+//! A lock private to one writer is not this contract: it serializes that writer
+//! against itself and nothing else. The lock is per **path**, process-wide, and
+//! both forms take it; a different *process* writing the same file is not covered
+//! (that would need an OS file lock), which is why `transact` also compares bytes
+//! rather than trusting the lock alone.
 
+use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Custom cloud ASR provider (OpenAI-compatible speech-to-text API).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `id` is the **stable identity** of the provider: the credential store target
+/// is derived from it (`OmniTypeFreePTT/custom:<id>`) and it is what the settings
+/// file, the router and the migration all agree on. `name` is a label the user
+/// may change at any time; changing it must never move, orphan or lose the key.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomProvider {
     pub id: String,
     pub name: String,
     pub base_url: String,
+    /// Plaintext key, kept **only** as the pre-migration fallback.
+    ///
+    /// Once the migration has stored the key and verified the read-back, this
+    /// field is cleared; a non-empty value here means "the store could not be
+    /// used", which is a state the app keeps working from rather than a state it
+    /// hides. It is never written by the panel's save path.
     #[serde(default)]
     pub api_key: String,
     pub model: String,
@@ -18,6 +74,32 @@ pub struct CustomProvider {
     pub language: String,
     #[serde(default = "default_provider_timeout")]
     pub timeout_secs: u64,
+}
+
+/// Hand-written so the key can never be printed by `{{:?}}`.
+///
+/// A derived `Debug` would put the plaintext into any log line, panic report or
+/// error that formats a provider, which is the leak this whole area exists to
+/// close. Whether a key is present is worth seeing; the key itself is not.
+impl std::fmt::Debug for CustomProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomProvider")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &if self.api_key.trim().is_empty() {
+                    "[none]"
+                } else {
+                    "[REDACTED_SECRET]"
+                },
+            )
+            .field("model", &self.model)
+            .field("language", &self.language)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 fn default_provider_language() -> String {
@@ -692,20 +774,123 @@ impl Settings {
             Ok(settings)
         } else {
             let settings = Settings::default();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let serialized = toml::to_string_pretty(&settings)?;
-            std::fs::write(path, serialized)?;
+            // Under the same lock every other writer takes, so two first-run
+            // callers cannot race to create the file and the file is never
+            // created while another writer is mid-transaction on it.
+            with_file_lock(path, || settings.save_locked(path))?;
             Ok(settings)
         }
     }
 
     /// Saves current settings back to disk.
+    ///
+    /// Write-to-temp-then-atomic-replace, so a failure at any step before the
+    /// replace leaves the previous file byte-for-byte intact — and under the
+    /// settings file's shared lock, so it can never land **inside** another
+    /// writer's read-modify-write. See the module documentation for the two
+    /// forms every writer of this file has to use.
     pub fn save(&self, path: &Path) -> Result<()> {
+        with_file_lock(path, || self.save_locked(path))
+    }
+
+    /// The write itself, without the lock.
+    ///
+    /// Private, and named for it: the two callers are [`Self::save`] and
+    /// [`Self::transact`], which hold the lock across the load, the edit and the
+    /// write it has to cover, and must not take it twice.
+    fn save_locked(&self, path: &Path) -> Result<()> {
         let serialized = toml::to_string_pretty(self)?;
-        std::fs::write(path, serialized)?;
+        write_atomic(path, &serialized)
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
         Ok(())
+    }
+
+    /// Reads the settings file, applies `edit`, and writes the result back
+    /// **without** discarding a change another writer made in between.
+    ///
+    /// This is the form every *read-modify-write* of `config.toml` has to use.
+    /// "Load, edit in memory, save" drops whatever landed between the load and
+    /// the save: the migration that clears a plaintext key would put back an
+    /// unrelated setting the user changed while it was working, and the user
+    /// would have no way to tell that from a lost click. So the write is
+    /// conditional on the file not having moved:
+    ///
+    /// 1. read the file and remember its **bytes**; apply `edit` to a copy;
+    /// 2. take the file's lock and read those bytes again —
+    ///    * unchanged: write the edited copy ([`write_atomic_with`], so the
+    ///      replace is atomic);
+    ///    * changed: another writer landed, so **reload and re-apply `edit` on
+    ///      top of the newer content** and try again.
+    ///
+    /// Two consequences worth stating out loud:
+    ///
+    /// * `edit` may run more than once, so it has to be an absolute assignment
+    ///   ("clear this field", "set that value") and not a delta ("increment",
+    ///   "append") that would be applied twice.
+    /// * `edit` runs **outside** the lock, so a slow edit cannot stall the
+    ///   dashboard; the lock is only held for the read and the replace.
+    ///
+    /// A file that keeps changing under it — the limit exists for a writer that
+    /// is *itself* the moving part — is reported as an error rather than
+    /// overwritten with a stale snapshot.
+    pub fn transact(path: &Path, edit: impl Fn(&mut Settings)) -> Result<Settings> {
+        Self::transact_with(path, edit, None)
+    }
+
+    /// [`Self::transact`] with a **gate** run inside the transaction: after the
+    /// file has been read and the edit applied, and before the write decides
+    /// whether its read is still current.
+    ///
+    /// A test seam, not product surface. It exists so the interleaving this
+    /// function protects against can be placed **deterministically** — the gate
+    /// is another writer's change, arriving at exactly the moment the old code
+    /// would have lost it — instead of being hoped for by sleeping. It runs
+    /// before every attempt, so a gate that always writes exercises the retry
+    /// bound; production passes `None`.
+    pub(crate) fn transact_with(
+        path: &Path,
+        edit: impl Fn(&mut Settings),
+        gate: Option<&dyn Fn()>,
+    ) -> Result<Settings> {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let (version, current) = with_file_lock(path, || read_snapshot(path))?;
+
+            let mut working = current.clone();
+            edit(&mut working);
+            if let Some(gate) = gate {
+                gate();
+            }
+            let serialized = toml::to_string_pretty(&working)?;
+
+            let settled = with_file_lock(path, || -> Result<bool> {
+                if file_bytes(path)? != version {
+                    // Another writer landed between the read and here. Its
+                    // change is the newer truth; the answer is to reload and
+                    // apply this edit on top of it, never to overwrite it.
+                    return Ok(false);
+                }
+                if serialized.as_bytes() == version.as_slice() {
+                    // The edit left the file exactly as the file already is, so
+                    // there is nothing to write. A no-op transaction — clearing
+                    // a key that is not there — must not touch the user's file.
+                    return Ok(true);
+                }
+                write_atomic(path, &serialized)
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+                Ok(true)
+            })?;
+            if settled {
+                return Ok(working);
+            }
+            if attempt >= MAX_TRANSACTION_ATTEMPTS {
+                anyhow::bail!(
+                    "cannot write {}: the file kept changing while this change was being applied ({attempt} attempts)",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// Resolves the actual whisper model to use, applying the "auto" policy:
@@ -750,6 +935,184 @@ impl Settings {
             false
         }
     }
+}
+
+/// How many times a transaction will re-apply its edit before giving up.
+///
+/// Reaching it means the file moved under the transaction on every single
+/// attempt — with the lock held by compliant writers, that is a writer that is
+/// itself the moving part (or another process). Eight is far beyond the "one
+/// other writer" case the retry exists for, and the failure is loud rather than a
+/// silent overwrite of somebody else's change.
+const MAX_TRANSACTION_ATTEMPTS: usize = 8;
+
+/// The lock every writer of one settings file takes.
+///
+/// Keyed by **path**, not by writer: a lock the migration took and the dashboard
+/// did not would serialize exactly the two writes that never raced. The key is
+/// the canonical path, so two spellings of the same file share one lock; a file
+/// that does not exist yet (the first-run case) falls back to the path as given,
+/// which is the best identity available before it is created.
+fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut registry = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A `Mutex<()>` per path, never removed: the map holds one small value per
+    // settings file the process has ever written, which is one value.
+    registry.entry(key).or_default().clone()
+}
+
+/// Runs `body` holding the settings file's lock.
+///
+/// A closure rather than a returned guard: the mutex lives in the registry, so a
+/// guard handed back would have to borrow the registry's `'static` contents
+/// through a transmute. Here the `Arc` lives inside this function for exactly as
+/// long as the guard does, and the borrow checker proves it — a lock that needs
+/// an unsafe trick to be taken is a lock nobody should trust.
+///
+/// A poisoned lock is deliberately not an error: a panicking writer must not turn
+/// every later write into a failure of its own, and the invariant the lock
+/// protects belongs to the file, which is checked by its own bytes as well.
+fn with_file_lock<T>(path: &Path, body: impl FnOnce() -> T) -> T {
+    let lock = file_lock(path);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    body()
+}
+
+/// The file's exact bytes, as the version a transaction compares.
+///
+/// Bytes rather than a modification time or a length: two changes in the same
+/// clock tick, or one that keeps the length identical, are exactly the cases a
+/// version check exists for.
+fn file_bytes(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))
+}
+
+/// The file's bytes **and** what they parse to, creating a default file on first
+/// run so the version it records is a version that exists.
+///
+/// Callers hold the file's lock: the pair has to be the pair of one file state,
+/// and a state that changed between the two reads is precisely what the version
+/// check would then not notice.
+fn read_snapshot(path: &Path) -> Result<(Vec<u8>, Settings)> {
+    if !path.exists() {
+        let defaults = Settings::default();
+        let serialized = toml::to_string_pretty(&defaults)?;
+        write_atomic(path, &serialized)
+            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display()))?;
+    }
+    let bytes = file_bytes(path)?;
+    let settings: Settings = toml::from_str(&String::from_utf8_lossy(&bytes))
+        .map_err(|e| anyhow::anyhow!("invalid {}: {e}", path.display()))?;
+    Ok((bytes, settings))
+}
+
+/// Which step of [`write_atomic_with`] a test wants to fail on.
+///
+/// Fault injection, not a disk simulator: the point is to prove the *ordering*
+/// contract — the original file is only ever touched by the final replace —
+/// which is the property a real crash, a full disk or an access denial would
+/// all exercise the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicFault {
+    /// Run every step for real.
+    None,
+    /// Fail after the temp file is created but before the bytes are written.
+    Write,
+    /// Fail after the bytes are written but before they are flushed to the OS.
+    Sync,
+    /// Fail after a durable temp file exists but before it replaces the target.
+    Replace,
+}
+
+/// Process-wide counter so two writers never choose the same temp name.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The temp file that will be renamed over `path`.
+///
+/// A **sibling** of the target, in the same directory, because a rename is only
+/// atomic within one filesystem and a temp directory on another volume would
+/// make the replace a copy. The name carries the pid and a counter so two
+/// processes — and two threads of one process — cannot collide, and a stale temp
+/// is never mistaken for someone else's in-flight write.
+fn temp_sibling(path: &Path, unique: u64) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let temp_name = format!(".{name}.{}.{}.tmp", std::process::id(), unique);
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(temp_name),
+        _ => PathBuf::from(temp_name),
+    }
+}
+
+/// Writes `contents` to `path` so that a failure before the final step leaves
+/// the existing file exactly as it was.
+///
+/// Order — and it is the whole guarantee:
+///
+/// 1. write every byte to a temp file in the **same directory**;
+/// 2. `flush` and `sync_all` it, so the bytes are on the OS before the rename;
+/// 3. `rename` it over the target, which replaces the old file without an
+///    intermediate state where neither exists.
+///
+/// The original is **never deleted first**. On any error the temp file is
+/// removed and the target is untouched. `fault` exists so tests can drive the
+/// failure at each step; production always passes [`AtomicFault::None`].
+pub(crate) fn write_atomic_with(
+    path: &Path,
+    contents: &str,
+    fault: AtomicFault,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = temp_sibling(path, unique);
+
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        if fault == AtomicFault::Write {
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        if fault == AtomicFault::Sync {
+            return Err(std::io::Error::other("injected sync failure"));
+        }
+        file.sync_all()?;
+        drop(file);
+        if fault == AtomicFault::Replace {
+            return Err(std::io::Error::other("injected replace failure"));
+        }
+        // `rename` replaces an existing destination on both Unix and Windows
+        // (Rust's Windows implementation uses `MoveFileExW` with
+        // `MOVEFILE_REPLACE_EXISTING`), so there is no window in which the
+        // settings file is missing.
+        std::fs::rename(&temp, path)
+    };
+
+    let result = write();
+    if result.is_err() {
+        // Bounded cleanup: exactly the one temp file this call created, and
+        // only when the write did not complete. Never a directory sweep.
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// The production entry point: [`write_atomic_with`] with no injected fault.
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_atomic_with(path, contents, AtomicFault::None)
 }
 
 /// App data directory: `%APPDATA%\voice-ptt` on Windows, cwd elsewhere.
@@ -832,9 +1195,15 @@ mod tests {
         s.gui.orb_scale_percent = 100;
         assert!((s.gui.orb_scale() - 1.0).abs() < 0.001);
         s.gui.orb_scale_percent = 0;
-        assert!(s.gui.orb_scale() >= 0.6, "too small to click must be raised");
+        assert!(
+            s.gui.orb_scale() >= 0.6,
+            "too small to click must be raised"
+        );
         s.gui.orb_scale_percent = 5000;
-        assert!(s.gui.orb_scale() <= 2.0, "a screen-filling orb must be refused");
+        assert!(
+            s.gui.orb_scale() <= 2.0,
+            "a screen-filling orb must be refused"
+        );
     }
 
     /// The typing step is likewise clamped: a `0` characters per step would make
@@ -920,7 +1289,10 @@ mod tests {
         .unwrap();
 
         let loaded = Settings::load_or_create(&path).unwrap();
-        assert!(loaded.gui.orb_return_enabled, "legacy file must not opt out");
+        assert!(
+            loaded.gui.orb_return_enabled,
+            "legacy file must not opt out"
+        );
         assert!(!loaded.gui.orb_pinned);
         assert_eq!(loaded.gui.orb_return_after_idle_secs, 0);
         assert_eq!(loaded.vad.threshold, 0.5, "the rest still loads");
@@ -1009,7 +1381,11 @@ mod tests {
         s.save(&path).unwrap();
 
         let loaded = Settings::load_or_create(&path).unwrap();
-        assert_eq!(loaded.profiles.len(), 2, "a profile did not survive the file");
+        assert_eq!(
+            loaded.profiles.len(),
+            2,
+            "a profile did not survive the file"
+        );
 
         // What the coordinator asks, against the file that was just read: the
         // whole point is that the *loaded* set resolves, not the one in memory.
@@ -1139,6 +1515,289 @@ mod tests {
         assert!(
             groups.mixed_spacing,
             "the other group keeps the shipped default"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F1: the atomic settings write ────────────────────────────────────
+
+    fn f1_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "omnitype-f1-{tag}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The happy path: the bytes land, and no temp file is left behind.
+    #[test]
+    fn save_writes_the_bytes_and_leaves_no_temp_file() {
+        let dir = f1_dir("happy");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "OLD").unwrap();
+
+        let settings = Settings::default();
+        settings.save(&path).expect("the save succeeds");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[cloud]"), "the new content is there");
+        assert!(!written.contains("OLD"));
+
+        // Exactly the one file: a leftover `.config.toml.*.tmp` would be an
+        // accumulating artifact of every save.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The contract's core promise: a failure at **any** step before the
+    /// replace leaves the previous file byte-for-byte identical, and cleans up
+    /// its own temp file.
+    ///
+    /// This is the property a truncated `std::fs::write` breaks: it can leave
+    /// a half-written or empty settings file. Injecting the fault at each of
+    /// the three steps proves the ordering, not a simulated disk — a real
+    /// crash, a full disk and an access denial all fail the same places.
+    #[test]
+    fn an_injected_failure_at_each_step_leaves_the_previous_bytes_intact() {
+        for fault in [AtomicFault::Write, AtomicFault::Sync, AtomicFault::Replace] {
+            let dir = f1_dir(&format!("fault-{fault:?}"));
+            let path = dir.join("config.toml");
+            let original = "[cloud]\napi_key = \"keep-me\"\n";
+            std::fs::write(&path, original).unwrap();
+
+            let err = write_atomic_with(&path, "[cloud]\napi_key = \"new\"\n", fault)
+                .expect_err("{fault:?} must fail");
+            assert!(!err.to_string().is_empty());
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                after, original,
+                "{fault:?}: the previous file must be byte-for-byte intact"
+            );
+
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "{fault:?}: the failed write must clean up its temp file, saw {leftovers:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Replacing an **existing** file is exercised, not just creating a new
+    /// one — a plain rename or a delete-then-move would differ here.
+    #[test]
+    fn a_second_save_replaces_the_first_without_a_missing_window() {
+        let dir = f1_dir("replace");
+        let path = dir.join("config.toml");
+
+        let mut first = Settings::default();
+        first.cloud.api_key = "first".into();
+        first.save(&path).unwrap();
+
+        let mut second = Settings::default();
+        second.cloud.api_key = "second".into();
+        second.save(&path).unwrap();
+
+        let s = Settings::load_or_create(&path).unwrap();
+        assert_eq!(s.cloud.api_key, "second");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Creating a file that does not exist yet works too — the first-run path.
+    #[test]
+    fn the_first_run_write_creates_the_file_in_a_missing_directory() {
+        let dir = f1_dir("first-run").join("nested");
+        let path = dir.join("config.toml");
+
+        let s = Settings::load_or_create(&path).expect("first run creates it");
+        assert!(path.exists());
+        assert_eq!(s.cloud.api_key, "");
+
+        // And it is a real, re-readable config file, not an empty one.
+        let reread = Settings::load_or_create(&path).unwrap();
+        assert_eq!(reread.asr.model, s.asr.model);
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    // ── F1, the lost-update half: a transaction is not a load-then-save ─
+
+    /// The edit is re-applied on the newer file, and the other writer's change
+    /// survives. This is the whole reason the write is conditional: "load, edit,
+    /// save" would have written the snapshot it read and taken the user's change
+    /// with it.
+    #[test]
+    fn a_change_made_while_a_transaction_edits_is_not_lost() {
+        let dir = f1_dir("transact-interleave");
+        let path = dir.join("config.toml");
+        let mut start = Settings::default();
+        start.cloud.api_key = "secret-to-clear".into();
+        start.gui.draft_ttl_secs = 30;
+        start.save(&path).unwrap();
+
+        // The other writer, landing in the exact window: after this transaction
+        // read the file, before it writes.
+        let edits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate_edits = edits.clone();
+        let live = path.clone();
+        let gate = move || {
+            gate_edits.fetch_add(1, Ordering::SeqCst);
+            Settings::transact(&live, |settings| settings.gui.draft_ttl_secs = 90)
+                .expect("the other writer's transaction succeeds");
+        };
+
+        let result = Settings::transact_with(
+            &path,
+            |settings| settings.cloud.api_key.clear(),
+            Some(&gate),
+        )
+        .expect("the transaction succeeds");
+
+        assert!(result.cloud.api_key.is_empty());
+        assert_eq!(
+            result.gui.draft_ttl_secs, 90,
+            "the transaction's own copy carries the other writer's change: {result:?}"
+        );
+
+        let after = Settings::load_or_create(&path).unwrap();
+        assert!(after.cloud.api_key.is_empty(), "the edit reached the file");
+        assert_eq!(
+            after.gui.draft_ttl_secs, 90,
+            "and the other writer's change is still there"
+        );
+        assert!(
+            edits.load(Ordering::SeqCst) >= 1,
+            "the gate has to have run, or this test proves nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-applying means the edit runs again — which is why it has to be an
+    /// absolute assignment. Stated as a test because a caller who wrote a delta
+    /// would find out the expensive way.
+    #[test]
+    fn the_edit_runs_again_on_the_reloaded_file_and_writes_only_then() {
+        let dir = f1_dir("transact-reapply");
+        let path = dir.join("config.toml");
+        Settings::default().save(&path).unwrap();
+
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate_runs = runs.clone();
+        let live = path.clone();
+        let gate = move || {
+            if gate_runs.load(Ordering::SeqCst) == 1 {
+                // Exactly one other write, on the first attempt only.
+                Settings::transact(&live, |settings| settings.gui.draft_ttl_secs = 77)
+                    .expect("the other writer succeeds");
+            }
+        };
+
+        Settings::transact_with(
+            &path,
+            |settings| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                settings.asr.model = "small".into();
+            },
+            Some(&gate),
+        )
+        .expect("the transaction succeeds");
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the edit ran once for the stale read and once for the reload"
+        );
+        let after = Settings::load_or_create(&path).unwrap();
+        assert_eq!(after.asr.model, "small");
+        assert_eq!(after.gui.draft_ttl_secs, 77);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transaction that changes nothing does not touch the file: "clear a key
+    /// that is not there" is a no-op, not a rewrite of the user's config.
+    #[test]
+    fn a_transaction_that_changes_nothing_leaves_the_bytes_alone() {
+        let dir = f1_dir("transact-noop");
+        let path = dir.join("config.toml");
+        let mut start = Settings::default();
+        start.gui.draft_ttl_secs = 45;
+        start.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        Settings::transact(&path, |_| {}).expect("an empty edit is not a failure");
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a no-op transaction must not rewrite the file"
+        );
+        let after = Settings::load_or_create(&path).unwrap();
+        assert_eq!(after.gui.draft_ttl_secs, 45);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that keeps moving under the transaction is **reported**, never
+    /// overwritten: the bounded retry gives up out loud, and the file is left as
+    /// the other writer left it.
+    #[test]
+    fn a_file_that_keeps_changing_is_reported_rather_than_overwritten() {
+        let dir = f1_dir("transact-give-up");
+        let path = dir.join("config.toml");
+        let mut start = Settings::default();
+        start.gui.draft_ttl_secs = 10;
+        start.save(&path).unwrap();
+
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate_writes = writes.clone();
+        let live = path.clone();
+        let gate = move || {
+            // A writer that moves the file on **every** attempt: the case the
+            // retry bound exists for.
+            let next = gate_writes.fetch_add(1, Ordering::SeqCst) as u64 + 11;
+            Settings::transact(&live, move |settings| settings.gui.draft_ttl_secs = next)
+                .expect("the other writer succeeds");
+        };
+
+        let err = Settings::transact_with(
+            &path,
+            |settings| settings.cloud.api_key = "never-written".into(),
+            Some(&gate),
+        )
+        .expect_err("a file that keeps moving cannot be written safely");
+        assert!(
+            err.to_string().contains("kept changing"),
+            "the failure has to say why: {err}"
+        );
+
+        let after = Settings::load_or_create(&path).unwrap();
+        assert!(
+            after.cloud.api_key.is_empty(),
+            "a transaction that failed must not have written a partial edit: {after:?}"
+        );
+        assert!(
+            after.gui.draft_ttl_secs >= 10,
+            "the file is the other writer's"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

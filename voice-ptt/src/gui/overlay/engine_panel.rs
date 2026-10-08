@@ -166,8 +166,11 @@ pub(crate) fn render(
                             s.active_engine = "auto".to_string();
                             let _ = s.save(config_path);
                         }
+                        // Raw, not shaped: `success_banner` is the shaping
+                        // boundary, so text formatted here as well was drawn
+                        // backwards.
                         state.msg = Some((
-                            format_persian_display("حالت خودکار هوشمند (Auto) فعال شد."),
+                            "حالت خودکار هوشمند (Auto) فعال شد.".to_string(),
                             Instant::now(),
                         ));
                     }
@@ -237,10 +240,7 @@ pub(crate) fn render(
                                     let _ = s.save(config_path);
                                 }
                                 state.msg = Some((
-                                    format_persian_display(&format!(
-                                        "موتور {} فعال شد.",
-                                        display_name
-                                    )),
+                                    format!("موتور {} فعال شد.", display_name),
                                     Instant::now(),
                                 ));
                             }
@@ -290,6 +290,42 @@ pub(crate) fn render(
                                         .size(9.5)
                                         .color(palette::TEXT_FAINT),
                                 );
+
+                                // Where the key really comes from. A user who
+                                // pastes a key into the field while the store
+                                // already holds one is editing something the
+                                // engine is not using, and "rejected" without a
+                                // source would send them looking in the wrong
+                                // place.
+                                if *kind == "Cloud (Custom)" {
+                                    let in_store =
+                                        crate::credentials_resolver::stored_custom_key(id)
+                                            .is_some();
+                                    let in_settings = settings
+                                        .read()
+                                        .map(|s| {
+                                            s.custom_providers.iter().any(|p| {
+                                                p.id == *id && !p.api_key.trim().is_empty()
+                                            })
+                                        })
+                                        .unwrap_or(false);
+                                    let source = if in_store {
+                                        "کلید: مخزن امن ویندوز"
+                                    } else if in_settings {
+                                        "کلید: config.toml (مهاجرت‌نشده)"
+                                    } else {
+                                        "کلید: ثبت نشده؛ درج ممکن نیست"
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format_persian_display(source))
+                                            .size(9.5)
+                                            .color(if in_store {
+                                                palette::TEXT_FAINT
+                                            } else {
+                                                palette::WARNING
+                                            }),
+                                    );
+                                }
                             });
 
                             // Left side: Delete button (if custom) and Active status chip
@@ -339,10 +375,22 @@ pub(crate) fn render(
                     }
                     let _ = s.save(config_path);
                 }
-                state.msg = Some((
-                    format_persian_display("مدل اختصاصی حذف گردید."),
-                    Instant::now(),
-                ));
+                // Remove **only** this provider's key from the store, keyed by
+                // its id. `NotFound` means there was no key to remove, which is
+                // the normal case for a provider added without one; any other
+                // failure is reported rather than leaving an orphaned secret
+                // behind with no way for the user to know.
+                match crate::credentials_resolver::delete_custom_key(&del_id) {
+                    Ok(()) | Err(crate::credentials::CredentialError::NotFound(_)) => {
+                        state.msg = Some(("مدل اختصاصی حذف گردید.".to_string(), Instant::now()));
+                    }
+                    Err(err) => {
+                        state.msg = Some((
+                            format!("مدل حذف شد، ولی کلید آن از مخزن امن پاک نشد ({err})."),
+                            Instant::now(),
+                        ));
+                    }
+                }
             }
         });
 
@@ -478,7 +526,8 @@ pub(crate) fn render(
                                         let url = state.new_url.trim().to_string();
                                         if id.is_empty() || url.is_empty() {
                                             state.msg = Some((
-                                                format_persian_display("خطا: شناسه (ID) و آدرس URL الزامی هستند."),
+                                                "خطا: شناسه (ID) و آدرس URL الزامی هستند."
+                                                    .to_string(),
                                                 Instant::now(),
                                             ));
                                         } else {
@@ -497,35 +546,74 @@ pub(crate) fn render(
                                             } else {
                                                 state.new_lang.trim().to_string()
                                             };
-                                            let provider = CustomProvider {
-                                                id: id.clone(),
-                                                name,
-                                                base_url: url,
-                                                api_key: state.new_key.trim().to_string(),
-                                                model,
-                                                language: lang,
-                                                timeout_secs: 20,
+                                            let submitted_key = state.new_key.trim().to_string();
+                                            // Store the key **first**, keyed by the provider's
+                                            // stable id. The engine resolves its key from the
+                                            // store, so storing before registering is what makes
+                                            // the value the user just typed the one the engine
+                                            // actually uses.
+                                            let key_result = if submitted_key.is_empty() {
+                                                Ok(())
+                                            } else {
+                                                crate::credentials_resolver::store_custom_key(
+                                                    &id,
+                                                    &crate::credentials::SecretString::new(
+                                                        submitted_key.clone(),
+                                                    ),
+                                                )
+                                                .map(|_target| ())
                                             };
 
-                                            let usage_path = crate::paths::resolve_usage_path();
-                                            let engine = Arc::new(crate::asr::CloudEngine::new_custom(&provider, usage_path));
-                                            router.register_engine(engine);
-                                            router.set_active_engine(&id);
+                                            match key_result {
+                                                Ok(()) => {
+                                                    // `api_key` stays empty in the *public*
+                                                    // settings: the store holds the secret, the
+                                                    // file holds only the identity.
+                                                    let provider = CustomProvider {
+                                                        id: id.clone(),
+                                                        name,
+                                                        base_url: url,
+                                                        api_key: String::new(),
+                                                        model,
+                                                        language: lang,
+                                                        timeout_secs: 20,
+                                                    };
 
-                                            if let Ok(mut s) = settings.write() {
-                                                s.active_engine = id.clone();
-                                                s.add_or_update_provider(provider);
-                                                let _ = s.save(config_path);
+                                                    let usage_path = crate::paths::resolve_usage_path();
+                                                    let engine = Arc::new(crate::asr::CloudEngine::new_custom(&provider, usage_path));
+                                                    router.register_engine(engine);
+                                                    router.set_active_engine(&id);
+
+                                                    if let Ok(mut s) = settings.write() {
+                                                        s.active_engine = id.clone();
+                                                        s.add_or_update_provider(provider);
+                                                        let _ = s.save(config_path);
+                                                    }
+
+                                                    state.msg = Some((
+                                                        "مدل جدید ثبت و به عنوان موتور فعال انتخاب شد."
+                                                            .to_string(),
+                                                        Instant::now(),
+                                                    ));
+                                                    state.new_id.clear();
+                                                    state.new_name.clear();
+                                                    state.new_url.clear();
+                                                    state.new_key.clear();
+                                                }
+                                                Err(err) => {
+                                                    // Nothing was registered and nothing was
+                                                    // written: a provider whose key did not land
+                                                    // would be an engine the user cannot
+                                                    // authenticate, and silently saving an empty
+                                                    // key would look like success.
+                                                    state.msg = Some((
+                                                        format!(
+                                                            "خطا: کلید API در مخزن امن ذخیره نشد ({err}); موتور ثبت نشد."
+                                                        ),
+                                                        Instant::now(),
+                                                    ));
+                                                }
                                             }
-
-                                            state.msg = Some((
-                                                format_persian_display("مدل جدید ثبت و به عنوان موتور فعال انتخاب شد."),
-                                                Instant::now(),
-                                            ));
-                                            state.new_id.clear();
-                                            state.new_name.clear();
-                                            state.new_url.clear();
-                                            state.new_key.clear();
                                         }
                                     }
 

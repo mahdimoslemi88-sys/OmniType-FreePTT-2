@@ -55,8 +55,8 @@ mod imp {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::Security::Credentials::{
-        CredDeleteW, CredFree, CredReadW, CredWriteW, CRED_PERSIST_LOCAL_MACHINE,
-        CRED_TYPE_GENERIC, CREDENTIALW, CRED_FLAGS,
+        CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
     };
 
     /// `ERROR_NOT_FOUND` (1168) — the target simply is not stored yet.
@@ -252,12 +252,27 @@ mod tests {
     /// An empty key must be refused rather than stored, because a stored empty
     /// credential and an absent one mean different things to the engine picker
     /// — and `delete` is how a user says "I have no key".
+    ///
+    /// The target is deliberately a unique probe rather than the app's real
+    /// `cloud` one. The refusal happens before any OS call, so today this could
+    /// not touch the user's key — but a test that *names* the user's credential
+    /// is one guard-removal away from overwriting it, and no test should be able
+    /// to reach the real target even by accident.
     #[test]
     fn an_empty_secret_is_refused_without_touching_the_store() {
         let store = WindowsCredentialStore::new();
+        let target = format!(
+            "{}/empty-secret-probe-{}",
+            target_for("probe"),
+            std::process::id()
+        );
         assert_eq!(
-            store.save(&target_for("cloud"), &SecretString::new("   ")),
+            store.save(&target, &SecretString::new("   ")),
             Err(CredentialError::EmptySecret)
+        );
+        assert!(
+            matches!(store.load(&target), Err(CredentialError::NotFound(_))),
+            "a refused save must leave nothing behind, not even an empty credential"
         );
     }
 
@@ -310,8 +325,13 @@ mod tests {
         store
             .save(&target, &secret)
             .expect("saving a fresh credential must work");
-        let read_back = store.load(&target).expect("the credential was just written");
-        assert_eq!(read_back, secret, "the blob encoding must round-trip exactly");
+        let read_back = store
+            .load(&target)
+            .expect("the credential was just written");
+        assert_eq!(
+            read_back, secret,
+            "the blob encoding must round-trip exactly"
+        );
         assert_eq!(read_back.expose_secret(), "gsk_round-trip-Ω-12345");
 
         store.delete(&target).expect("deleting must work");

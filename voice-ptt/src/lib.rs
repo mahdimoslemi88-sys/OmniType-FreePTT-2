@@ -143,13 +143,7 @@ pub fn run_doctor() -> std::path::PathBuf {
     // asking what is wrong is exactly the wrong time. It only needs to know
     // whether a key is already in the store, which is a plain read.
     let store_has_key = credentials_resolver::store_holds_cloud_key();
-    let diagnosis = doctor::diagnose(
-        &settings,
-        &hotkeys,
-        env_key,
-        store_has_key,
-        &config_path,
-    );
+    let diagnosis = doctor::diagnose(&settings, &hotkeys, env_key, store_has_key, &config_path);
     doctor::write_default(&diagnosis)
 }
 
@@ -194,21 +188,38 @@ pub fn run() -> Result<()> {
     // run leaves the key in both places rather than in neither. The resolved
     // key lands in the resolver's process slot, which is what the engine
     // planner and `asr::cloud` read from.
-    let migration = credentials_resolver::migrate_on_startup(&config_path, &settings.cloud.api_key);
-    if migration.migrated || migration.conflict.is_some() || migration.store_failed.is_some() {
+    let migration = credentials_resolver::migrate_on_startup(&config_path, &settings);
+    let custom_migrated = !migration.custom_migrated.is_empty();
+    let custom_failed =
+        !migration.custom_conflict.is_empty() || !migration.custom_store_failed.is_empty();
+    if migration.migrated
+        || migration.conflict.is_some()
+        || migration.store_failed.is_some()
+        || custom_migrated
+        || custom_failed
+    {
         tracing::info!(summary = %migration.summary(), "credential migration");
         logging::stage("credentials", &migration.summary());
     }
     // A migrated key must also disappear from the in-memory copy, or the rest
     // of this process would keep logging and re-saving the plaintext we just
-    // removed from disk.
-    if migration.migrated {
-        settings_rwlock
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .cloud
-            .api_key
-            .clear();
+    // removed from disk. The same holds for every custom provider whose key
+    // moved: leaving it in `settings_rwlock` would put it straight back into
+    // `config.toml` on the next save.
+    if migration.migrated || custom_migrated {
+        let mut live = settings_rwlock.write().unwrap_or_else(|e| e.into_inner());
+        if migration.migrated {
+            live.cloud.api_key.clear();
+        }
+        for provider in live.custom_providers.iter_mut() {
+            if migration
+                .custom_migrated
+                .iter()
+                .any(|id| id == &provider.id)
+            {
+                provider.api_key.clear();
+            }
+        }
     }
 
     // ---- models (the only network access in the app) ----------------------
