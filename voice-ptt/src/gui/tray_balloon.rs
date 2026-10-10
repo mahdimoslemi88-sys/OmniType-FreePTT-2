@@ -30,6 +30,16 @@
 //!    keystrokes; here it would corrupt a message instead of garbling input.
 //! 4. **The balloon says what clicking does.** A balloon that appears with no
 //!    stated consequence is a notification the user has to interpret.
+//! 5. **"Shown" means the shell accepted it.** The dedup is only safe if the
+//!    record follows a balloon that really appeared. The notifier therefore
+//!    answers every queued balloon with the verdict of `Shell_NotifyIconW`, and
+//!    [`BalloonHandle::show`] returns that verdict instead of "the thread was
+//!    alive". Otherwise a refused balloon (notifications off, a full queue, an
+//!    icon the shell would not add) would be recorded as announced and that
+//!    release would never be mentioned again — the exact failure this module
+//!    exists to prevent. What no API can report is *suppression*: Focus Assist
+//!    and Do Not Disturb still answer `TRUE` while showing nothing, so the
+//!    recorded version is honest about the shell, not about the screen.
 
 use crate::updates::UpdateInfo;
 
@@ -369,24 +379,158 @@ mod tests {
         assert_eq!(cut.encode_utf16().count(), 10);
         assert!(s.starts_with(&cut), "truncation did not keep a prefix: {cut}");
     }
+
+    /// The balloon the fake notifier below is handed.
+    #[cfg(windows)]
+    fn balloon() -> UpdateBalloon {
+        decide(true, "", &info("0.3.0", "0.4.0"))
+            .expect("a never-announced update should produce a balloon")
+    }
+
+    /// The bug this pins.
+    ///
+    /// `show` used to answer "the notifier channel is open", which is a
+    /// different question from "the user was told". A balloon the shell
+    /// refused (`Shell_NotifyIconW` returning `FALSE`) therefore came back as
+    /// success, `announce` recorded the version, and that release was never
+    /// mentioned again on that machine. The notifier now answers with the
+    /// shell's verdict, so a refusal has to arrive as `false`.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_balloon_is_not_reported_as_shown() {
+        let (tx, rx) = std::sync::mpsc::channel::<QueuedBalloon>();
+        let handle = BalloonHandle { tx };
+        let notifier = std::thread::spawn(move || {
+            let queued = rx.recv().expect("the balloon was queued");
+            // Exactly what the notifier does when the shell says no.
+            queued.reply.send(false).expect("the waiter is still listening");
+        });
+
+        assert!(
+            !handle.show(balloon()),
+            "a balloon the shell refused was reported as shown, so the release \
+             would have been recorded and never offered again"
+        );
+        notifier.join().expect("the fake notifier finished");
+    }
+
+    /// The other half, without which the test above passes for the wrong
+    /// reason (a `show` that always returned `false` would satisfy it).
+    #[cfg(windows)]
+    #[test]
+    fn an_accepted_balloon_is_reported_as_shown() {
+        let (tx, rx) = std::sync::mpsc::channel::<QueuedBalloon>();
+        let handle = BalloonHandle { tx };
+        let notifier = std::thread::spawn(move || {
+            let queued = rx.recv().expect("the balloon was queued");
+            assert!(
+                queued.balloon.title.contains("0.4.0"),
+                "the queued balloon lost its text on the way over: {:?}",
+                queued.balloon.title
+            );
+            queued.reply.send(true).expect("the waiter is still listening");
+        });
+
+        assert!(
+            handle.show(balloon()),
+            "an accepted balloon was reported as refused, so the same release \
+             would be announced on every check"
+        );
+        notifier.join().expect("the fake notifier finished");
+    }
+
+    /// A notifier that never answers — hung inside the shell, or killed
+    /// mid-call — must not count as an announcement either. Silence is the one
+    /// answer that cannot be mistaken for consent, because the opposite choice
+    /// is the spam the persisted dedup exists to prevent.
+    #[cfg(windows)]
+    #[test]
+    fn a_notifier_that_never_answers_is_not_an_announcement() {
+        let (tx, rx) = std::sync::mpsc::channel::<QueuedBalloon>();
+        let handle = BalloonHandle { tx };
+        let notifier = std::thread::spawn(move || {
+            let _queued = rx.recv().expect("the balloon was queued");
+            // Deliberately never replies; holds the channel open instead of
+            // dropping it, so this exercises the timeout and not a disconnect.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        });
+
+        assert!(
+            !handle.show_within(balloon(), std::time::Duration::from_millis(50)),
+            "a notifier that never answered was treated as a shown balloon"
+        );
+        notifier.join().expect("the fake notifier finished");
+    }
+
+    /// A notifier thread that is already gone must answer immediately rather
+    /// than wait out [`SHOW_TIMEOUT`]: the watcher calls this on a 5 s tick, and
+    /// blocking for 30 s per check would stall the thread it runs on.
+    #[cfg(windows)]
+    #[test]
+    fn a_dead_notifier_answers_without_waiting_for_the_timeout() {
+        let (tx, rx) = std::sync::mpsc::channel::<QueuedBalloon>();
+        drop(rx);
+        let handle = BalloonHandle { tx };
+
+        let started = std::time::Instant::now();
+        assert!(!handle.show(balloon()), "a dead notifier is not an announcement");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the dead-notifier path waited {:?}, which is the timeout path",
+            started.elapsed()
+        );
+    }
 }
 
 /// A handle to the balloon notifier thread. Cloneable and cheap.
 #[cfg(windows)]
 #[derive(Clone)]
 pub struct BalloonHandle {
-    tx: std::sync::mpsc::Sender<UpdateBalloon>,
+    tx: std::sync::mpsc::Sender<QueuedBalloon>,
 }
+
+/// A balloon on its way to the notifier thread, with the way back for the
+/// answer.
+///
+/// The reply channel is what lets `show` mean "the shell accepted it" instead
+/// of "the notifier thread was alive". A `true` here is what licenses
+/// `announce` to write `last_notified_version`.
+#[cfg(windows)]
+struct QueuedBalloon {
+    balloon: UpdateBalloon,
+    reply: std::sync::mpsc::Sender<bool>,
+}
+
+/// How long `show` waits for the notifier's answer.
+///
+/// The three `Shell_NotifyIconW` calls take milliseconds; the shell can stall
+/// under load, and the two mistakes are not symmetric. Waiting too long costs a
+/// blocked watcher thread that sleeps five seconds between checks anyway, while
+/// giving up too early re-announces a balloon the user already saw. The
+/// generous side is the safe one.
+#[cfg(windows)]
+const SHOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(windows)]
 impl BalloonHandle {
-    /// Queues a balloon for display.
+    /// Queues a balloon and waits for the shell's verdict.
     ///
-    /// Returns `false` if the notifier thread is gone, which is the one case
-    /// the caller must not ignore: a `false` here means the update was *not*
-    /// announced, so the caller must not record it as notified.
+    /// Returns `true` only when the notifier reports that the shell accepted
+    /// the balloon. `false` covers both "the notifier is gone" and "the shell
+    /// refused", and the caller must treat them alike: neither is an
+    /// announcement, so neither may be recorded as notified.
     pub fn show(&self, balloon: UpdateBalloon) -> bool {
-        self.tx.send(balloon).is_ok()
+        self.show_within(balloon, SHOW_TIMEOUT)
+    }
+
+    /// [`show`](Self::show) with the wait made explicit, so the timeout path is
+    /// testable without sitting out [`SHOW_TIMEOUT`].
+    fn show_within(&self, balloon: UpdateBalloon, timeout: std::time::Duration) -> bool {
+        let (reply, answer) = std::sync::mpsc::channel();
+        if self.tx.send(QueuedBalloon { balloon, reply }).is_err() {
+            return false;
+        }
+        answer.recv_timeout(timeout).unwrap_or(false)
     }
 }
 
@@ -402,7 +546,7 @@ const BALLOON_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60)
 /// On a non-Windows build the handle does not exist and callers get `None`.
 #[cfg(windows)]
 pub fn spawn_notifier(flags: crate::gui::flags::DashboardFlags) -> Option<BalloonHandle> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel::<QueuedBalloon>();
     std::thread::Builder::new()
         .name("update-balloon".into())
         .spawn(move || imp::run(flags, rx))
@@ -569,7 +713,7 @@ mod imp {
 
     /// The notifier's whole lifetime: own the window, own the icon, own the
     /// pump that turns a balloon click into an opened dashboard.
-    pub(super) fn run(flags: DashboardFlags, rx: mpsc::Receiver<UpdateBalloon>) {
+    pub(super) fn run(flags: DashboardFlags, rx: mpsc::Receiver<QueuedBalloon>) {
         let hwnd = unsafe {
             let hinstance = match GetModuleHandleW(None) {
                 Ok(h) => h,
@@ -622,10 +766,17 @@ mod imp {
             // balloons to this thread, and a tight loop would burn a core, so
             // the thread waits on the channel and peeks in between.
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(balloon) => {
-                    if show(hwnd, &balloon) {
-                        registered_until = Some(Instant::now() + BALLOON_LIFETIME);
-                    }
+                Ok(queued) => {
+                    let shown = show(hwnd, &queued.balloon);
+                    // Armed even on a refusal: `NIM_ADD` can succeed while
+                    // `NIM_MODIFY` fails, and the icon it created would
+                    // otherwise stay in the notification area until the process
+                    // exits. Deleting an icon that was never added is a debug
+                    // line, which is the cheaper of the two mistakes.
+                    registered_until = Some(Instant::now() + BALLOON_LIFETIME);
+                    // The waiting caller records the release off this value, so
+                    // it carries the shell's verdict — never "we got this far".
+                    let _ = queued.reply.send(shown);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 // The last handle is gone, so the app is shutting down.
@@ -757,12 +908,14 @@ pub fn spawn_watcher(
         .ok();
 }
 
-/// Decides, shows, and — only on success — records what was announced.
+/// Decides, shows, and — only on the shell's word — records what was announced.
 ///
-/// The ordering matters and is the point of this function: if the shell
-/// refuses the balloon, `last_notified_version` is **not** written, so the next
-/// check tries again. Recording first would mean a refused balloon is never
-/// retried and the user never hears about the release at all.
+/// The ordering matters and is the point of this function: `show` does not
+/// return until the notifier thread has heard from `Shell_NotifyIconW`, and a
+/// refusal leaves `last_notified_version` **unwritten**, so the next check tries
+/// again. Recording first (or on the weaker "the thread accepted the message"
+/// signal) means a refused balloon is never retried and the user never hears
+/// about the release at all.
 fn announce(
     handle: &BalloonHandle,
     settings: &std::sync::Arc<std::sync::RwLock<crate::config::settings::Settings>>,
@@ -785,7 +938,10 @@ fn announce(
     };
 
     if !handle.show(balloon) {
-        tracing::warn!("balloon notifier is gone; will retry on the next check");
+        tracing::warn!(
+            "the update balloon was not shown (the shell refused it or the \
+             notifier is gone); will retry after the next check"
+        );
         return;
     }
 

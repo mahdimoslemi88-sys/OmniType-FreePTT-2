@@ -132,10 +132,17 @@ fn the_shell_accepts_the_balloon_we_build() {
 
     let balloon = tray_balloon::decide(true, "", &release("0.4.0"))
         .expect("a never-announced update should produce a balloon");
-    assert!(handle.show(balloon), "the notifier channel closed immediately");
+    // `show` waits for the shell's verdict, so this asserts the thing the
+    // feature depends on — that a balloon really appeared — and not merely that
+    // a channel was open. It is also exactly the value `announce` reads before
+    // it writes `last_notified_version`.
+    assert!(
+        handle.show(balloon),
+        "the shell refused the balloon, so nothing would appear and the release \
+         would stay unannounced"
+    );
 
-    // The notifier does the shell calls on its own thread; give it longer than
-    // the 50 ms poll it is sitting in, so this is not a race against the test.
+    // One poll interval of slack for the notifier's own loop bookkeeping.
     std::thread::sleep(std::time::Duration::from_millis(1_500));
 
     let lines = capture.lock().expect("capture lock").clone();
