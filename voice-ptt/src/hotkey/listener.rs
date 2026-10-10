@@ -41,6 +41,16 @@ pub struct HotkeyConfig {
     record: ResolvedBinding,
     toggle_overlay: ResolvedBinding,
     quit: ResolvedBinding,
+    /// Whether the record key can latch hands-free on a double-tap.
+    ///
+    /// The listener needs this one setting because it changes what a *short tap*
+    /// means here: with the latch off, a quick tap is the long-standing
+    /// "tap to cancel" and is sent as [`HotkeyEvent::Cancel`] right away; with it
+    /// on, the tap must instead be handed over as a plain [`HotkeyEvent::RecordUp`]
+    /// so the session's latch can watch the double-tap window and only cancel once
+    /// the second tap has not arrived. Sending the cancel here would throw the
+    /// session away before the second tap could ever latch it.
+    latch_enabled: bool,
     /// Every setting that could not be used as written, in the order they
     /// were resolved. Empty means the user's config was honoured exactly.
     problems: Vec<HotkeyProblem>,
@@ -57,6 +67,9 @@ impl Default for HotkeyConfig {
             record: resolve_or_default("CapsLock", HotkeyRole::Record).binding,
             toggle_overlay: resolve_or_default("Ctrl+Alt+S", HotkeyRole::ToggleOverlay).binding,
             quit: resolve_or_default("Ctrl+Alt+Q", HotkeyRole::Quit).binding,
+            // Matches `HotkeySettings::default()` and the fallback used for a
+            // config that failed to load: the latch is on unless asked off.
+            latch_enabled: true,
             problems: Vec::new(),
         };
         // The built-ins are known-good; anything here would be a typo in this
@@ -84,6 +97,7 @@ impl HotkeyConfig {
                 HotkeyRole::ToggleOverlay,
             )),
             quit: take(resolve_or_default(&settings.quit, HotkeyRole::Quit)),
+            latch_enabled: settings.double_tap_latch,
             problems,
         };
         for problem in &config.problems {
@@ -294,7 +308,8 @@ fn run_loop(
 
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
     // A press shorter than this cancels the recording instead of transcribing
-    // it (keeps the original "tap CapsLock to cancel" behavior).
+    // it (the original "tap CapsLock to cancel" behavior). Only consulted when
+    // the hands-free latch is off — see `latch_enabled`.
     const CANCEL_MS: u128 = 300;
     // How long a capture waits for the user to press something.
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -386,11 +401,19 @@ fn run_loop(
             record_down_at = Some(std::time::Instant::now());
             let _ = sender.send(HotkeyEvent::RecordDown);
         } else if !record_is_down && record_was_down {
-            let cancel = record_down_at
-                .map(|t| t.elapsed().as_millis() < CANCEL_MS)
-                .unwrap_or(false);
-            if cancel {
-                let _ = sender.send(HotkeyEvent::Cancel);
+            // With the hands-free latch on, a short tap is *not* cancelled here:
+            // it is handed to the session as a plain release, so the latch can
+            // hold the decision open for the double-tap window and only cancel
+            // (or finalise) once the second tap has not come. Cancelling here
+            // would discard the session before a second tap could ever latch it —
+            // which is exactly why the double-tap never worked.
+            if !config.latch_enabled {
+                let cancel = record_down_at
+                    .map(|t| t.elapsed().as_millis() < CANCEL_MS)
+                    .unwrap_or(false);
+                if cancel {
+                    let _ = sender.send(HotkeyEvent::Cancel);
+                }
             }
             let _ = sender.send(HotkeyEvent::RecordUp);
             record_down_at = None;
@@ -615,6 +638,24 @@ mod tests {
             key_vk_code(Key::Fn(5)).expect("F5 must resolve on Windows")
         );
         assert_eq!(live.record.mods, vec![modifier_vk_code(Modifier::Shift)]);
+    }
+
+    /// The latch switch must reach the poll thread, because it decides whether a
+    /// short tap is cancelled here or handed to the session to await a second
+    /// tap. Getting this wrong is silent in both directions: with it stuck on,
+    /// tap-to-cancel never fires; with it stuck off, a double-tap cancels on its
+    /// first tap and can never latch.
+    #[test]
+    fn config_carries_the_latch_switch_from_settings() {
+        let on = HotkeyConfig::from_settings(&HotkeySettings::default());
+        assert!(on.latch_enabled, "the default latch must be on");
+        assert!(HotkeyConfig::default().latch_enabled);
+
+        let settings = HotkeySettings {
+            double_tap_latch: false,
+            ..HotkeySettings::default()
+        };
+        assert!(!HotkeyConfig::from_settings(&settings).latch_enabled);
     }
 
     /// A capture must always answer the UI (here: a cancel) instead of leaving

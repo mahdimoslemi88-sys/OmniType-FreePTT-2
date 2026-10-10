@@ -37,15 +37,19 @@ enum LatchAction {
     /// A short tap ended: keep recording, but leave the finalise decision open
     /// for a second tap until [`LatchPolicy::tick`] times the window out.
     AwaitSecondTap,
+    /// A tap that never became a double-tap: abandon the recording without
+    /// transcribing — the long-standing "tap to cancel" behaviour.
+    Cancel,
 }
 
 /// Hands-free latch policy for the record key (pure logic, unit-tested).
 ///
 /// * **hold** the key → recording runs while held, finalises on release (the
 ///   long-standing hold-to-talk behaviour, unchanged),
-/// * **tap once** → the recording stays open for `double_tap_window_ms` and then
-///   finalises as before (a lone tap carries no speech, so it is discarded by
-///   the endpoint's min-speech filter either way),
+/// * **tap once** → the decision is held open for `double_tap_window_ms`; if no
+///   second tap arrives the recording is *cancelled*, exactly as a lone tap did
+///   before (the window narrows that cancel from immediate to delayed so the
+///   second tap has a chance to be seen),
 /// * **tap twice quickly** → the recording is *latched*: it keeps running after
 ///   the key is released, and the next press ends it.
 #[derive(Debug)]
@@ -145,7 +149,10 @@ impl LatchPolicy {
         if let Some(tap_at) = self.pending_tap_at {
             if now.duration_since(tap_at) >= Duration::from_millis(self.window_ms) {
                 self.pending_tap_at = None;
-                return LatchAction::Finish;
+                // The second tap never came: a lone tap cancels, which is what a
+                // tap always did. (This used to finalise, which only made sense
+                // while the listener was cancelling the first tap anyway.)
+                return LatchAction::Cancel;
             }
         }
         LatchAction::None
@@ -532,6 +539,18 @@ impl SessionDriver {
             LatchAction::Finish => vec![Effect::FinishSession],
             LatchAction::FinishAndRestart => {
                 vec![Effect::FinishSession, Effect::BeginRecording]
+            }
+            // Mirrors `on_cancel`: clear the recording flag and the latch, and
+            // name the session being abandoned so the discard lands on it rather
+            // than on whatever happens to be newest when the effect runs.
+            LatchAction::Cancel => {
+                self.mouse_latched = false;
+                self.recording = false;
+                self.latch.reset();
+                match self.open.last().map(|s| s.id) {
+                    Some(id) => vec![Effect::DiscardSession(Some(id))],
+                    None => Vec::new(),
+                }
             }
         };
         // `FinishAndRestart` closes and re-opens, so the re-open is folded last.
@@ -980,6 +999,27 @@ mod tests {
         assert_eq!(d.on_record_down(t0 + Duration::from_millis(290)), vec![]);
         assert!(d.is_recording());
         assert!(d.latched());
+    }
+
+    /// The other half of the double-tap: a *lone* tap must still cancel. The
+    /// listener no longer cancels it (it hands the tap over so a second one can
+    /// latch), so the cancel has to come from the latch window closing — and it
+    /// has to name the session it opened.
+    #[test]
+    fn a_lone_tap_cancels_the_recording_it_opened() {
+        let mut d = SessionDriver::new(&hotkey());
+        let t0 = Instant::now();
+        let id = press_and_open(&mut d, t0);
+        // A short tap: the decision is held open for the double-tap window.
+        assert_eq!(d.on_record_up(t0 + Duration::from_millis(80)), Vec::new());
+        assert!(d.is_recording(), "the tap alone must not stop the mic yet");
+        // No second tap: the window closes and the recording is cancelled.
+        assert_eq!(
+            d.on_tick(t0 + Duration::from_millis(80 + 601)),
+            vec![Effect::DiscardSession(Some(id))],
+            "a lone tap has to cancel the session it opened"
+        );
+        assert_quiet(&d);
     }
 
     /// The next press after a hands-free session ends it exactly once.
@@ -1459,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn latch_policy_single_tap_waits_for_the_window_then_finalises() {
+    fn latch_policy_single_tap_waits_for_the_window_then_cancels() {
         let mut p = LatchPolicy::new(&hotkey());
         let t0 = Instant::now();
         assert_eq!(p.press(t0, false), LatchAction::Start);
@@ -1470,10 +1510,11 @@ mod tests {
             p.tick(tap_end + Duration::from_millis(300), true),
             LatchAction::None
         );
-        // Window expired with no second tap: behave like a plain tap did before.
+        // Window expired with no second tap: a lone tap cancels, as it always did.
+        // The window only delays that cancel so the second tap can be seen.
         assert_eq!(
             p.tick(tap_end + Duration::from_millis(650), true),
-            LatchAction::Finish
+            LatchAction::Cancel
         );
         assert!(!p.is_latched());
     }
