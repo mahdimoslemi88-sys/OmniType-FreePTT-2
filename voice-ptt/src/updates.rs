@@ -280,23 +280,25 @@ pub fn open_path_in_default_app(path: &Path) {
 
 /// `cmd /C start` arguments that actually open `target`.
 ///
-/// Two rules live here, and both fail *silently* — no error, no window, nothing
-/// a user could report:
+/// Rules that live here, and how they fail:
 ///
 /// 1. `start` is a `cmd` builtin, so it needs the `cmd /C` wrapper.
 /// 2. The first argument after `start` is the window title, not the target. The
-///    empty string is not a typo: without it, a quoted first argument is eaten
-///    as the title and nothing opens. It also has to be there even for an
-///    unquoted target, or `start` opens a *window titled* after the path.
-///
-/// The target itself is quoted because `%APPDATA%` and every default profile
-/// folder contain spaces.
+///    empty string is not a typo: without it, the target is eaten as the title
+///    and nothing opens.
+/// 3. The target must **not** be pre-quoted here. `std::process::Command`
+///    already applies Windows argument escaping when it builds the child
+///    command line, so adding our own surrounding quotes would get them
+///    re-escaped into `\"...\"`. `start` then mis-parses that into a literal
+///    path wrapped in backslashes (e.g. `\https://…\`) and Windows reports
+///    "cannot find" instead of opening the URL. Letting `Command` do the
+///    escaping also handles spaces in `%APPDATA%` profile paths correctly.
 fn start_args(target: &str) -> Vec<String> {
     vec![
         "/C".to_string(),
         "start".to_string(),
         String::new(), // window title — deliberately empty
-        format!("\"{target}\""),
+        target.to_string(),
     ]
 }
 
@@ -325,14 +327,28 @@ mod tests {
             args[2].is_empty(),
             "start eats its first argument as the window title: {args:?}"
         );
-        assert_eq!(args[3], "\"C:\\Users\\Ada Lovelace\\doctor-report.txt\"");
+        assert_eq!(args[3], r"C:\Users\Ada Lovelace\doctor-report.txt");
     }
 
     #[test]
-    fn start_quotes_the_target_so_spaces_survive() {
+    fn start_does_not_pre_quote_because_command_escapes_for_us() {
+        // Pre-quoting would be re-escaped by `Command` into `\"...\"`, which
+        // `start` turns into a backslash-wrapped path — the "Windows cannot
+        // find" failure. The target must reach `Command` verbatim.
         let args = start_args(r"C:\Program Files\OmniType\doctor-report.txt");
-        assert!(args[3].starts_with('"') && args[3].ends_with('"'));
+        assert!(
+            !args[3].starts_with('"') && !args[3].ends_with('"'),
+            "target must not be pre-quoted: {args:?}"
+        );
         assert!(args[3].contains("Program Files"));
+    }
+
+    #[test]
+    fn start_args_pass_a_url_verbatim_without_manual_quoting() {
+        let url = "https://github.com/mahdimoslemi88-sys/OmniType-FreePTT-2/releases/tag/v0.6.2";
+        let args = start_args(url);
+        assert_eq!(args[3], url);
+        assert_eq!(args.len(), 4, "empty title plus target: {args:?}");
     }
 
     #[test]
